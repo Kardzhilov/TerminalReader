@@ -1,0 +1,13 @@
+[package]
+name = "tr-render"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tr-epub = { path = "../tr-epub" }
+unicode-width.workspace = true
+
+[lints]
+workspace = true

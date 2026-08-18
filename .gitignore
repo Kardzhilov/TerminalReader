@@ -1,0 +1,13 @@
+/target/
+**/*.rs.bk
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local environment files
+.env
+.env.*
+!.env.example
