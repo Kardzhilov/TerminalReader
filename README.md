@@ -30,7 +30,10 @@ cargo install --path crates/tr-tui
 ```
 
 Release artifacts for Linux (x86_64/aarch64), macOS (x86_64/aarch64), and
-Windows are built by the `Release` workflow on version tags (`v*`).
+Windows are built by the `Release` workflow on every push to `main`. The
+version starts at 1.0.0 and is bumped automatically: a commit since the last
+release mentioning `MAJOR` bumps the major version, `MINOR` bumps the minor
+version, anything else bumps the patch version.
 
 On Linux, the keyring integration uses the D-Bus Secret Service; install
 `libdbus-1-dev`/`pkg-config` when building from source and make sure a secret

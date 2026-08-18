@@ -2,15 +2,52 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  version:
+    name: Compute next version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history and tags for version computation
+      - name: Determine version bump from commit messages
+        id: next
+        run: |
+          last=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$last" ]; then
+            echo "No previous version tag; starting at 1.0.0"
+            echo "version=1.0.0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          IFS=. read -r major minor patch <<< "${last#v}"
+          log=$(git log --format=%B "$last"..HEAD)
+          if grep -q "MAJOR" <<< "$log"; then
+            major=$((major + 1)); minor=0; patch=0
+          elif grep -q "MINOR" <<< "$log"; then
+            minor=$((minor + 1)); patch=0
+          else
+            patch=$((patch + 1))
+          fi
+          echo "Last: $last -> next: $major.$minor.$patch"
+          echo "version=$major.$minor.$patch" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: version
     runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -31,7 +68,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             archive: zip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -42,24 +79,39 @@ jobs:
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          staging="terminalreader-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          staging="terminalreader-v${VERSION}-${{ matrix.target }}"
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/terminalreader" "$staging/"
-          cp README.md LICENSE* "$staging/" 2>/dev/null || cp README.md "$staging/"
+          cp README.md "$staging/"
           tar czf "$staging.tar.gz" "$staging"
-          echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
       - name: Package (windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $staging = "terminalreader-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $staging = "terminalreader-v$env:VERSION-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/terminalreader.exe" $staging
           Copy-Item README.md $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: ${{ env.ASSET }}
-          draft: true
+          name: terminalreader-v${{ env.VERSION }}-${{ matrix.target }}
+          path: terminalreader-v${{ env.VERSION }}-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Tag and publish v${{ needs.version.outputs.version }}
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
           generate_release_notes: true
+          make_latest: "true"
