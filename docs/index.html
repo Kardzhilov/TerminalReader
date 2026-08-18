@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TerminalReader — read EPUBs in your terminal, synced with your e-reader</title>
+<meta name="description" content="TerminalReader is a free, open-source EPUB reader for the terminal with KOReader-compatible progress sync. Linux, macOS, and Windows.">
+<meta property="og:title" content="TerminalReader">
+<meta property="og:description" content="Read EPUBs in your terminal. Keep your place in sync with your Kobo, Kindle, or any KOReader device.">
+<meta property="og:image" content="https://kardzhilov.github.io/TerminalReader/screenshots/reader.png">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📖</text></svg>">
+<style>
+:root{
+  --bg:#0b0e14;
+  --bg-soft:#11151f;
+  --panel:#151a26;
+  --border:#232a3a;
+  --text:#d6dce8;
+  --muted:#8b94a7;
+  --accent:#4be0c2;
+  --accent-2:#7aa2f7;
+  --glow:rgba(75,224,194,.14);
+  --mono:ui-monospace,'Cascadia Code','JetBrains Mono','Fira Code',Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--bg);color:var(--text);font-family:var(--sans);
+  line-height:1.6;-webkit-font-smoothing:antialiased;
+}
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(ellipse 60% 40% at 50% -10%,var(--glow),transparent),
+    repeating-linear-gradient(transparent 0 2px,rgba(255,255,255,.006) 2px 4px);
+}
+main,header,footer{position:relative;z-index:1}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ---- nav ---- */
+nav{
+  position:sticky;top:0;z-index:10;backdrop-filter:blur(12px);
+  background:rgba(11,14,20,.8);border-bottom:1px solid var(--border);
+}
+nav .wrap{display:flex;align-items:center;gap:24px;height:56px}
+nav .brand{font-family:var(--mono);font-weight:700;color:var(--text);font-size:15px}
+nav .brand span{color:var(--accent)}
+nav .links{margin-left:auto;display:flex;gap:20px;font-size:14px}
+nav .links a{color:var(--muted)}
+nav .links a:hover{color:var(--text);text-decoration:none}
+
+/* ---- hero ---- */
+.hero{padding:88px 0 40px;text-align:center}
+.hero h1{
+  font-size:clamp(34px,6vw,58px);line-height:1.1;font-weight:800;
+  letter-spacing:-.02em;
+}
+.hero h1 em{
+  font-style:normal;color:var(--accent);
+  text-shadow:0 0 32px var(--glow);
+}
+.hero p.tag{
+  margin:20px auto 0;max-width:640px;font-size:clamp(16px,2.2vw,19px);color:var(--muted);
+}
+.badges{display:flex;gap:8px;justify-content:center;margin-top:20px;flex-wrap:wrap}
+.badge{
+  font-family:var(--mono);font-size:12px;color:var(--muted);
+  border:1px solid var(--border);border-radius:99px;padding:4px 12px;background:var(--bg-soft);
+}
+.badge b{color:var(--accent);font-weight:600}
+
+.install{
+  margin:32px auto 0;max-width:720px;display:flex;align-items:center;gap:0;
+  background:var(--panel);border:1px solid var(--border);border-radius:10px;
+  font-family:var(--mono);font-size:13.5px;overflow:hidden;text-align:left;
+}
+.install .prompt{padding:14px 0 14px 16px;color:var(--accent);user-select:none}
+.install code{padding:14px 12px;overflow-x:auto;white-space:nowrap;flex:1;color:var(--text);scrollbar-width:none}
+.install code::-webkit-scrollbar{display:none}
+.install button{
+  border:0;border-left:1px solid var(--border);background:var(--bg-soft);color:var(--muted);
+  font-family:var(--mono);font-size:12px;padding:14px 16px;cursor:pointer;white-space:nowrap;
+}
+.install button:hover{color:var(--accent)}
+.hero .alt{margin-top:10px;font-size:13px;color:var(--muted)}
+
+.termframe{
+  margin:48px auto 0;max-width:960px;border:1px solid var(--border);border-radius:12px;
+  background:var(--panel);box-shadow:0 24px 80px rgba(0,0,0,.5),0 0 0 1px rgba(75,224,194,.05);
+  overflow:hidden;
+}
+.termframe .bar{
+  display:flex;gap:7px;padding:11px 14px;border-bottom:1px solid var(--border);background:var(--bg-soft);
+}
+.termframe .bar i{width:12px;height:12px;border-radius:50%;display:block}
+.termframe .bar i:nth-child(1){background:#ff5f57}
+.termframe .bar i:nth-child(2){background:#febc2e}
+.termframe .bar i:nth-child(3){background:#28c840}
+.termframe img{display:block;width:100%}
+
+/* ---- sections ---- */
+section{padding:72px 0}
+section h2{
+  font-size:clamp(24px,3.6vw,34px);font-weight:800;letter-spacing:-.01em;text-align:center;
+}
+section h2 .dim{color:var(--muted);font-weight:600}
+section .lead{max-width:640px;margin:14px auto 0;text-align:center;color:var(--muted)}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-top:44px}
+.card{
+  background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:24px;
+  transition:transform .15s ease,border-color .15s ease;
+}
+.card:hover{transform:translateY(-2px);border-color:#31527a}
+.card .icon{font-size:22px}
+.card h3{margin:10px 0 6px;font-size:16.5px}
+.card p{font-size:14px;color:var(--muted)}
+.card code{font-family:var(--mono);font-size:12.5px;color:var(--accent-2)}
+
+/* ---- sync steps ---- */
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-top:44px}
+.step{border-left:2px solid var(--accent);padding:4px 0 4px 20px}
+.step .n{font-family:var(--mono);color:var(--accent);font-size:13px}
+.step h3{font-size:16px;margin:6px 0}
+.step p{font-size:14px;color:var(--muted)}
+
+/* ---- screenshots ---- */
+.shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(460px,100%),1fr));gap:20px;margin-top:44px}
+.shot{border:1px solid var(--border);border-radius:12px;overflow:hidden;background:var(--panel)}
+.shot img{display:block;width:100%;transition:transform .2s ease}
+.shot:hover img{transform:scale(1.015)}
+.shot figcaption{padding:12px 16px;font-size:13px;color:var(--muted);border-top:1px solid var(--border)}
+
+/* ---- keys ---- */
+.keys{max-width:640px;margin:44px auto 0;border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.keys table{width:100%;border-collapse:collapse;font-size:14px}
+.keys td{padding:11px 18px;border-top:1px solid var(--border)}
+.keys tr:first-child td{border-top:0}
+.keys td:first-child{font-family:var(--mono);color:var(--accent);white-space:nowrap;width:1%}
+.keys td:last-child{color:var(--muted)}
+kbd{
+  font-family:var(--mono);font-size:12px;background:var(--bg-soft);
+  border:1px solid var(--border);border-bottom-width:2px;border-radius:5px;padding:1px 7px;
+}
+
+/* ---- download ---- */
+.dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-top:44px}
+.dl .card h3{display:flex;align-items:center;gap:8px}
+.dl pre{
+  margin-top:12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;
+  padding:12px 14px;
+}
+.dl pre code{font-family:var(--mono);font-size:12.5px;color:var(--text);white-space:pre-wrap;word-break:break-all}
+
+.cta{
+  margin-top:64px;text-align:center;padding:56px 24px;border-radius:16px;
+  background:linear-gradient(180deg,var(--panel),var(--bg-soft));border:1px solid var(--border);
+}
+.cta h2{font-size:clamp(22px,3vw,30px)}
+.cta .buttons{display:flex;gap:12px;justify-content:center;margin-top:24px;flex-wrap:wrap}
+.btn{
+  display:inline-block;padding:12px 26px;border-radius:9px;font-weight:600;font-size:15px;
+}
+.btn.primary{background:var(--accent);color:#06281f}
+.btn.primary:hover{filter:brightness(1.1);text-decoration:none}
+.btn.ghost{border:1px solid var(--border);color:var(--text)}
+.btn.ghost:hover{border-color:var(--accent);text-decoration:none}
+
+footer{
+  border-top:1px solid var(--border);padding:36px 0;margin-top:72px;
+  font-size:13px;color:var(--muted);
+}
+footer .wrap{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+footer a{color:var(--muted)}
+footer a:hover{color:var(--accent)}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="brand">📖 Terminal<span>Reader</span></div>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#sync">Sync</a>
+      <a href="#screenshots">Screenshots</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/Kardzhilov/TerminalReader">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero wrap">
+  <h1>Your library lives<br>in the <em>terminal</em>.</h1>
+  <p class="tag">
+    TerminalReader is a fast, keyboard-first EPUB reader for Linux, macOS, and
+    Windows — with reading progress that follows you to your Kobo, Kindle, or
+    any KOReader device.
+  </p>
+  <div class="badges">
+    <span class="badge"><b>100%</b> free &amp; open source</span>
+    <span class="badge"><b>0</b> telemetry</span>
+    <span class="badge">Rust · <b>AGPL-3.0</b></span>
+    <span class="badge">Linux · macOS · Windows</span>
+  </div>
+  <div class="install">
+    <span class="prompt">$</span>
+    <code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/Kardzhilov/TerminalReader/main/install.sh | sh</code>
+    <button onclick="copyInstall(this)">copy</button>
+  </div>
+  <p class="alt">Windows? <a href="#install">PowerShell one-liner below.</a></p>
+
+  <div class="termframe">
+    <img src="screenshots/demo.gif" alt="Animated demo: browsing a library and reading Pride and Prejudice in TerminalReader" loading="eager">
+  </div>
+</header>
+
+<main>
+<section id="features">
+  <div class="wrap">
+    <h2>Everything a reader needs. <span class="dim">Nothing it doesn't.</span></h2>
+    <p class="lead">No Electron, no accounts, no cloud lock-in. One small binary that opens instantly and gets out of the way.</p>
+    <div class="grid">
+      <div class="card">
+        <div class="icon">📐</div>
+        <h3>Typography that respects the text</h3>
+        <p>Configurable column width, full justification, and clean chapter layout. Resize your terminal mid-sentence — the word you were reading stays put.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🔄</div>
+        <h3>Syncs with your e-reader</h3>
+        <p>Speaks KOReader's kosync protocol. Read at your desk, pick up the exact paragraph on your Kobo or Kindle at night — via <code>kosync.eu</code>, the official server, or self-hosted.</p>
+      </div>
+      <div class="card">
+        <div class="icon">⚡</div>
+        <h3>Instant libraries</h3>
+        <p>Point it at a folder of EPUBs. Metadata is cached by file signature, so even large collections open in milliseconds after the first scan.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🔐</div>
+        <h3>Private by design</h3>
+        <p>Credentials go in your OS keyring — never on disk. Logs redact secrets. No analytics, no phone-home, and <code>NO_COLOR</code> is honored.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🖱️</div>
+        <h3>Keyboard first, mouse complete</h3>
+        <p>Every menu is clickable with hover highlighting; the page itself stays distraction-free. Press <code>?</code> anywhere for help.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🛠️</div>
+        <h3>Zero-maintenance</h3>
+        <p>Self-updates with one command, a built-in <code>doctor</code> that checks everything from config to live server auth, and an offline queue that syncs when you're back online.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="sync">
+  <div class="wrap">
+    <h2>One book. Every device. <span class="dim">Same paragraph.</span></h2>
+    <p class="lead">TerminalReader implements the same progress-sync protocol as KOReader, down to the document hashes and position pointers.</p>
+    <div class="steps">
+      <div class="step">
+        <span class="n">01</span>
+        <h3>Sign in once</h3>
+        <p>Create a free account on kosync.eu right from Settings — just a username and password. Or point it at your own server.</p>
+      </div>
+      <div class="step">
+        <span class="n">02</span>
+        <h3>Read anywhere</h3>
+        <p>Progress is pulled when you open a book and pushed when you close it, with configurable prompt/silent strategies in each direction.</p>
+      </div>
+      <div class="step">
+        <span class="n">03</span>
+        <h3>Never lose your place</h3>
+        <p>Offline? Progress queues on disk and syncs later. Positions map through KOReader xpointers, so devices agree on the exact paragraph.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="screenshots">
+  <div class="wrap">
+    <h2>See it in action</h2>
+    <p class="lead">Captured from the real app, reading public-domain classics from Project Gutenberg.</p>
+    <div class="shots">
+      <figure class="shot">
+        <img src="screenshots/reader.png" alt="Reader view showing justified text of Pride and Prejudice" loading="lazy">
+        <figcaption>The reader — clean columns, page position, chapter navigation.</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="screenshots/contents.png" alt="Table of contents popup with filter" loading="lazy">
+        <figcaption>Filterable table of contents.</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="screenshots/library.png" alt="Library view listing five classic books" loading="lazy">
+        <figcaption>Your library, searchable as you type.</figcaption>
+      </figure>
+      <figure class="shot">
+        <img src="screenshots/settings.png" alt="Settings screen with reading and sync options" loading="lazy">
+        <figcaption>Reading preferences and sync — every option one key (or click) away.</figcaption>
+      </figure>
+    </div>
+    <div class="keys">
+      <table>
+        <tr><td><kbd>Space</kbd></td><td>next page</td></tr>
+        <tr><td><kbd>t</kbd></td><td>table of contents</td></tr>
+        <tr><td><kbd>s</kbd> / <kbd>p</kbd></td><td>push / pull sync progress</td></tr>
+        <tr><td><kbd>?</kbd></td><td>help overlay, on every screen</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>save your place and step back</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>Install in seconds</h2>
+    <p class="lead">One command. No package manager required, nothing to configure — the first run walks you through picking a library folder.</p>
+    <div class="dl">
+      <div class="card">
+        <h3>🐧 Linux &amp; 🍎 macOS</h3>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/\
+Kardzhilov/TerminalReader/main/install.sh | sh</code></pre>
+        <p>Installs to <code>~/.local/bin</code>. x86_64 and ARM supported.</p>
+      </div>
+      <div class="card">
+        <h3>🪟 Windows</h3>
+        <pre><code>irm https://raw.githubusercontent.com/\
+Kardzhilov/TerminalReader/main/install.ps1 | iex</code></pre>
+        <p>Installs to <code>%LOCALAPPDATA%\Programs</code> and updates your PATH.</p>
+      </div>
+      <div class="card">
+        <h3>🦀 From source</h3>
+        <pre><code>git clone https://github.com/Kardzhilov/TerminalReader
+cd TerminalReader
+cargo install --path crates/tr-tui</code></pre>
+        <p>Rust 1.85+. Fully open — audit every line.</p>
+      </div>
+    </div>
+
+    <div class="cta">
+      <h2>Free forever. <span class="dim">Because reading should be.</span></h2>
+      <div class="buttons">
+        <a class="btn primary" href="https://github.com/Kardzhilov/TerminalReader/releases/latest">Download the latest release</a>
+        <a class="btn ghost" href="https://github.com/Kardzhilov/TerminalReader">Star on GitHub</a>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>📖 TerminalReader · AGPL-3.0-or-later</div>
+    <div>
+      <a href="https://github.com/Kardzhilov/TerminalReader">Source</a> ·
+      <a href="https://github.com/Kardzhilov/TerminalReader/releases">Releases</a> ·
+      <a href="https://github.com/Kardzhilov/TerminalReader/issues">Issues</a> ·
+      <a href="https://koreader.rocks/">KOReader</a> ·
+      <a href="https://kosync.eu">kosync.eu</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+function copyInstall(button){
+  navigator.clipboard.writeText(document.getElementById('install-cmd').textContent).then(()=>{
+    button.textContent='copied!';
+    setTimeout(()=>{button.textContent='copy'},1500);
+  });
+}
+</script>
+</body>
+</html>
