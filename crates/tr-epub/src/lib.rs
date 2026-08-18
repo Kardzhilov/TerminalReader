@@ -189,7 +189,10 @@ fn parse_opf(xml: &str, opf_path: &str) -> Result<ParsedOpf, EpubError> {
             }
             Event::Text(text) => {
                 if let Some(tag) = &current_text_tag {
-                    let value = text.xml_content()?.trim().to_owned();
+                    let value = text
+                        .xml_content(quick_xml::XmlVersion::Implicit1_0)?
+                        .trim()
+                        .to_owned();
                     if tag == "title" && title.is_empty() {
                         title = value;
                     } else if tag == "creator" && !value.is_empty() {
@@ -281,7 +284,7 @@ fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<Toc
             }
             Event::Text(text) => {
                 if let Some((_, label)) = &mut link {
-                    label.push_str(text.xml_content()?.trim());
+                    label.push_str(text.xml_content(quick_xml::XmlVersion::Implicit1_0)?.trim());
                 }
             }
             Event::CData(data) => {
@@ -370,7 +373,7 @@ fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
             }
             Ok(Event::Text(text)) => {
                 if let Some(element) = stack.last_mut() {
-                    if let Ok(value) = text.xml_content() {
+                    if let Ok(value) = text.xml_content(quick_xml::XmlVersion::Implicit1_0) {
                         element.text.push_str(&value);
                     }
                 }
@@ -456,7 +459,11 @@ fn attribute(
     for attribute in element.attributes().with_checks(false) {
         let attribute = attribute.map_err(quick_xml::Error::InvalidAttr)?;
         if attribute.key.as_ref() == key {
-            return Ok(Some(attribute.unescape_value()?.into_owned()));
+            return Ok(Some(
+                attribute
+                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                    .into_owned(),
+            ));
         }
     }
     Ok(None)
@@ -469,7 +476,11 @@ fn attribute_local(
     for attribute in element.attributes().with_checks(false) {
         let attribute = attribute.map_err(quick_xml::Error::InvalidAttr)?;
         if local_name(attribute.key.as_ref()).as_bytes() == key {
-            return Ok(Some(attribute.unescape_value()?.into_owned()));
+            return Ok(Some(
+                attribute
+                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                    .into_owned(),
+            ));
         }
     }
     Ok(None)

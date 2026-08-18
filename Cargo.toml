@@ -12,7 +12,8 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/example/terminalreader"
+publish = false
+repository = "https://github.com/Kardzhilov/TerminalReader"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -23,7 +24,7 @@ directories = "6.0"
 hex = "0.4"
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 md-5 = "0.10"
-quick-xml = "0.39"
+quick-xml = "0.41"
 ratatui = "0.30"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1.0", features = ["derive"] }

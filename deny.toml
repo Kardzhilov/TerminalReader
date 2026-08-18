@@ -10,20 +10,21 @@ allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
     "CDLA-Permissive-2.0",
-    "OpenSSL",
+    # This project's own crates; dependencies must stay permissive.
+    "AGPL-3.0-or-later",
 ]
-# This project itself is AGPL-3.0-or-later; dependencies must stay permissive.
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal path dependencies carry no version; only registry wildcards are real risks.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
