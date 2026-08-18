@@ -83,6 +83,7 @@ terminalreader library DIR     # list EPUBs under DIR
 terminalreader addLibrary DIR  # persist a library directory
 terminalreader hash book.epub  # print KOReader-compatible document hashes
 terminalreader doctor [book]   # verify config, state, keyring, and sync server
+terminalreader update          # self-update to the latest release (--check to only check)
 terminalreader --log-file tr.log --log-level debug   # log with redaction
 ```
 

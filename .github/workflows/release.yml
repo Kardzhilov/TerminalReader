@@ -76,6 +76,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo build --release --target ${{ matrix.target }} -p terminalreader
+        env:
+          # Baked into the binary so self-update can compare against releases.
+          TR_RELEASE_VERSION: ${{ env.VERSION }}
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         run: |

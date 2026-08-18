@@ -13,13 +13,15 @@ use tr_kosync::{Credentials, KOSyncClient, ProgressQueue, filename_md5, partial_
 mod app;
 mod sync;
 mod text_input;
+mod update;
 
 use app::App;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "terminalreader",
-    about = "A fullscreen EPUB reader for the terminal"
+    about = "A fullscreen EPUB reader for the terminal",
+    version = update::current_version()
 )]
 struct Cli {
     /// Write logs to this file (implies logging even if disabled in config).
@@ -47,6 +49,12 @@ enum Command {
     Hash { book: PathBuf },
     /// Verify local configuration, state, and optional book matching data.
     Doctor { book: Option<PathBuf> },
+    /// Check for a newer release and install it.
+    Update {
+        /// Only check; do not install.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -61,9 +69,32 @@ fn main() -> Result<()> {
         Some(Command::AddLibrary { directory }) => add_library(&directory),
         Some(Command::Hash { book }) => hash(&book),
         Some(Command::Doctor { book }) => doctor(book.as_deref()),
+        Some(Command::Update { check }) => self_update(check),
         Some(Command::Read { book }) => run_tui(Some(book)),
         None => run_tui(None),
     }
+}
+
+fn self_update(check_only: bool) -> Result<()> {
+    update::clean_stale_backup();
+    let status = update::check()?;
+    println!("Current version: {}", status.current);
+    println!("Latest release:  {}", status.latest);
+    if !status.available {
+        println!("Already up to date.");
+        return Ok(());
+    }
+    if check_only {
+        println!("Update available. Run 'terminalreader update' to install it.");
+        return Ok(());
+    }
+    println!("Downloading and installing {}…", status.latest);
+    update::apply(&status.latest)?;
+    println!(
+        "Updated to {}. Restart terminalreader to use it.",
+        status.latest
+    );
+    Ok(())
 }
 
 /// Enable file logging from CLI flags or the persisted config.

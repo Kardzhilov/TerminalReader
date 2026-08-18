@@ -10,12 +10,17 @@ rust-version.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+flate2.workspace = true
 ratatui.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+tar.workspace = true
 tr-core = { path = "../tr-core" }
 tr-epub = { path = "../tr-epub" }
 tr-kosync = { path = "../tr-kosync" }
 tr-render = { path = "../tr-render" }
 url.workspace = true
+zip.workspace = true
 
 [lints]
 workspace = true

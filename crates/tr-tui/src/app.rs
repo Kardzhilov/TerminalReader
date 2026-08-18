@@ -20,6 +20,7 @@ use tr_render::{LayoutOptions, Line, layout_with, line_for_anchor};
 use crate::{
     sync::{self, SyncController, SyncEvent},
     text_input::TextInput,
+    update::{UpdateController, UpdateEvent, current_version},
 };
 
 const MIN_WIDTH: u16 = 60;
@@ -168,6 +169,7 @@ pub struct App {
     recents: RecentsStore,
     scan_cache: ScanCache,
     sync: SyncController,
+    update: UpdateController,
     palette: Palette,
     screen: Screen,
     hit_targets: Vec<(Rect, Action)>,
@@ -200,6 +202,7 @@ impl App {
             recents: RecentsStore::load()?,
             scan_cache: ScanCache::load(),
             sync,
+            update: UpdateController::new(),
             palette: Palette::detect(),
             screen: if show_wizard {
                 Screen::Wizard(WizardScreen {
@@ -223,8 +226,10 @@ impl App {
     }
 
     pub fn run(&mut self, mut terminal: DefaultTerminal) -> Result<()> {
+        crate::update::clean_stale_backup();
         while !self.should_exit {
             self.process_sync_events();
+            self.process_update_events();
             terminal.draw(|frame| self.draw(frame))?;
             if crossterm::event::poll(Duration::from_millis(50))? {
                 let event = crossterm::event::read()?;
@@ -604,6 +609,21 @@ impl App {
                     settings.message = Some("Not signed in.".to_owned());
                 }
             }
+            KeyCode::Char('v') if !self.update.busy => {
+                self.update.check_in_background();
+                settings.message = Some("Checking for updates…".to_owned());
+            }
+            KeyCode::Char('i') => {
+                if self.update.available.is_some() {
+                    if !self.update.busy {
+                        self.update.apply_in_background();
+                        settings.message = Some("Downloading and installing update…".to_owned());
+                    }
+                } else {
+                    settings.message =
+                        Some("No update available; check first with 'v'.".to_owned());
+                }
+            }
             KeyCode::Up => settings.selection = settings.selection.saturating_sub(1),
             KeyCode::Down => {
                 settings.selection = (settings.selection + 1)
@@ -913,6 +933,7 @@ impl App {
                 "  u c         sync server / matching method",
                 "  f b t g     forward / backward / auto sync / pages",
                 "  l r o n     login / register / logout / device name",
+                "  v i         check for updates / install update",
             ]),
             Screen::Reader(_) => rows.extend([
                 "Reader",
@@ -1144,6 +1165,21 @@ impl App {
                 self.sync.queue_len()
             ));
         }
+        rows.push(String::new());
+        rows.push("Application".to_owned());
+        let update_state = if self.update.busy {
+            " — working…".to_owned()
+        } else {
+            self.update
+                .available
+                .as_ref()
+                .map(|tag| format!(" — {tag} available, press i"))
+                .unwrap_or_default()
+        };
+        rows.push(format!(
+            "  [v] Check for updates  [i] Install update — version {}{update_state}",
+            current_version()
+        ));
         rows.push(String::new());
         match &settings.mode {
             SettingsMode::AddingLibrary => {
@@ -1562,6 +1598,31 @@ impl App {
             if pages > 0 && reader.page_turns >= pages {
                 reader.page_turns = 0;
                 Self::push_progress(config, sync, reader, false);
+            }
+        }
+    }
+
+    /// Handle finished background update work.
+    fn process_update_events(&mut self) {
+        for event in self.update.poll() {
+            let message = match event {
+                UpdateEvent::Checked(Ok(status)) if status.available => format!(
+                    "Update available: {} (current {}). Press i in Settings to install.",
+                    status.latest, status.current
+                ),
+                UpdateEvent::Checked(Ok(status)) => {
+                    format!("Up to date ({}).", status.current)
+                }
+                UpdateEvent::Checked(Err(error)) => format!("Update check failed: {error}"),
+                UpdateEvent::Applied(Ok(tag)) => {
+                    format!("Updated to {tag}. Restart TerminalReader to use it.")
+                }
+                UpdateEvent::Applied(Err(error)) => format!("Update failed: {error}"),
+            };
+            logging::info(&message);
+            self.status = Some(message.clone());
+            if let Screen::Settings(settings) = &mut self.screen {
+                settings.message = Some(message);
             }
         }
     }
