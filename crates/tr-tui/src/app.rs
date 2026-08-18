@@ -25,6 +25,8 @@ use crate::{
 
 const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 16;
+const PROMPT_GO_LABEL: &str = "[Go to position]";
+const PROMPT_STAY_LABEL: &str = "[Stay here]";
 
 /// Styling that honors the `NO_COLOR` convention.
 #[derive(Debug, Clone, Copy)]
@@ -81,6 +83,7 @@ struct LibraryScreen {
     books: Vec<LibraryBook>,
     filter: TextInput,
     selection: usize,
+    top: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -155,11 +158,16 @@ enum Action {
     SettingsAdd,
     SettingsRemove,
     SettingsHome,
+    SelectLibraryDir(usize),
     ReaderContents,
     ReaderPrevious,
     ReaderNext,
     ReaderHome,
     TocSelect(usize),
+    /// Behave as if this key was pressed on the current screen.
+    Key(KeyCode),
+    /// Move the focused text input's cursor to the clicked column.
+    InputClick,
 }
 
 #[derive(Debug)]
@@ -713,8 +721,15 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.help {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.help = false;
+            }
+            return;
+        }
         if let Screen::Reader(reader) = &mut self.screen {
             if reader.sync_prompt.is_some() {
+                Self::handle_sync_prompt_mouse(reader, mouse, &mut self.sync);
                 return;
             }
             if reader.toc.is_some() {
@@ -728,13 +743,60 @@ impl App {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return;
         }
-        if let Some((_, action)) = self
+        if let Some((rect, action)) = self
             .hit_targets
             .iter()
             .find(|(rect, _)| rect.contains(Position::new(mouse.column, mouse.row)))
             .copied()
         {
-            self.activate(action);
+            match action {
+                Action::InputClick => {
+                    self.click_focused_input(mouse.column.saturating_sub(rect.x));
+                }
+                Action::Key(code) => self.handle_key(code),
+                other => self.activate(other),
+            }
+        }
+    }
+
+    /// Modal: only the prompt's buttons react; clicking outside dismisses.
+    fn handle_sync_prompt_mouse(
+        reader: &mut ReaderScreen,
+        mouse: MouseEvent,
+        sync: &mut SyncController,
+    ) {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let area = reader.sync_prompt_area();
+        let position = Position::new(mouse.column, mouse.row);
+        if !area.contains(position) {
+            reader.sync_prompt = None;
+            return;
+        }
+        let buttons_row = area.y + 5;
+        if mouse.row != buttons_row {
+            return;
+        }
+        let go_start = area.x + 1;
+        let go_end = go_start + u16::try_from(PROMPT_GO_LABEL.len()).unwrap_or(0);
+        if (go_start..go_end).contains(&mouse.column) {
+            if let Some(prompt) = reader.sync_prompt.take() {
+                reader.apply_position(&prompt.position);
+                sync.status = Some("Position synced from server.".to_owned());
+            }
+        } else {
+            reader.sync_prompt = None;
+        }
+    }
+
+    /// Route a click at `offset` columns into whichever input has focus.
+    fn click_focused_input(&mut self, offset: u16) {
+        match &mut self.screen {
+            Screen::Wizard(wizard) => wizard.input.click(offset),
+            Screen::Library(library) => library.filter.click(offset),
+            Screen::Settings(settings) => settings.input.click(offset),
+            Screen::Home(_) | Screen::Reader(_) => {}
         }
     }
 
@@ -762,25 +824,20 @@ impl App {
                         .min(Self::filtered_books(library).len().saturating_sub(1));
                     true
                 }
-                MouseEventKind::Down(MouseButton::Left) if mouse.row == 1 => {
-                    library.filter.click(mouse.column.saturating_sub(9));
+                _ => false,
+            },
+            Screen::Settings(settings) => match mouse.kind {
+                MouseEventKind::ScrollUp if settings.mode == SettingsMode::Browse => {
+                    settings.selection = settings.selection.saturating_sub(1);
+                    true
+                }
+                MouseEventKind::ScrollDown if settings.mode == SettingsMode::Browse => {
+                    settings.selection = (settings.selection + 1)
+                        .min(self.config.library.book_dirs.len().saturating_sub(1));
                     true
                 }
                 _ => false,
             },
-            Screen::Settings(settings) => {
-                let directory_rows =
-                    u16::try_from(self.config.library.book_dirs.len()).unwrap_or(u16::MAX);
-                if settings.mode == SettingsMode::Browse
-                    && mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                    && mouse.row >= 2
-                    && mouse.row < directory_rows + 2
-                {
-                    settings.selection = usize::from(mouse.row - 2);
-                    return true;
-                }
-                false
-            }
             Screen::Reader(_) | Screen::Wizard(_) => false,
         }
     }
@@ -856,6 +913,13 @@ impl App {
                     reader.select_filtered_toc(index);
                 }
             }
+            Action::SelectLibraryDir(index) => {
+                if let Screen::Settings(settings) = &mut self.screen {
+                    settings.selection = index;
+                }
+            }
+            Action::Key(code) => self.handle_key(code),
+            Action::InputClick => {}
         }
     }
 
@@ -889,10 +953,14 @@ impl App {
             "Choose a folder that contains your EPUB files.".to_owned(),
             "It will be scanned recursively when you open it.".to_owned(),
             String::new(),
-            wizard.input.render("Directory: "),
-            String::new(),
-            "Enter: save | Esc: skip for now (add libraries in Settings later)".to_owned(),
         ];
+        self.push_input_row(area, &mut rows, &wizard.input, "Directory: ");
+        rows.push(String::new());
+        self.push_hint_row(
+            area,
+            &mut rows,
+            "Enter: save | Esc: skip for now (add libraries in Settings later)",
+        );
         if let Some(message) = &wizard.message {
             rows.push(String::new());
             rows.push(message.clone());
@@ -973,53 +1041,64 @@ impl App {
 
     fn draw_home(&mut self, frame: &mut Frame, home: &mut HomeScreen) {
         let area = frame.area();
-        let mut rows = Vec::new();
-        let mut index = 0;
-        if let Some(recent) = self
+        let continue_row = self
             .recents
             .most_recent()
             .filter(|recent| recent.path.exists())
-        {
-            rows.push("Continue reading".to_owned());
-            rows.push(Self::selectable_row(
-                home.selection,
-                index,
-                &format!(
+            .map(|recent| {
+                format!(
                     "{} — ch. {}/{}",
                     recent.title,
                     recent.last_chapter + 1,
                     recent.spine_count
-                ),
-            ));
+                )
+            });
+        let recent_rows: Vec<String> = self
+            .recents
+            .list()
+            .iter()
+            .map(|recent| {
+                let missing = if recent.path.exists() {
+                    ""
+                } else {
+                    " (missing)"
+                };
+                format!("{}{}", recent.title, missing)
+            })
+            .collect();
+        let dir_rows: Vec<String> = self
+            .config
+            .library
+            .book_dirs
+            .iter()
+            .map(|directory| directory.display().to_string())
+            .collect();
+
+        let mut rows = Vec::new();
+        let mut index = 0;
+        if let Some(text) = continue_row {
+            rows.push("Continue reading".to_owned());
+            self.register_row(area, rows.len(), Action::HomeOpen(index));
+            rows.push(Self::selectable_row(home.selection, index, &text));
             index += 1;
         } else {
             rows.push("Open a library or run terminalreader read <file>".to_owned());
         }
         rows.push(String::new());
         rows.push("Recent".to_owned());
-        for recent in self.recents.list() {
-            let missing = if recent.path.exists() {
-                ""
-            } else {
-                " (missing)"
-            };
-            rows.push(Self::selectable_row(
-                home.selection,
-                index,
-                &format!("{}{}", recent.title, missing),
-            ));
+        for text in &recent_rows {
+            self.register_row(area, rows.len(), Action::HomeOpen(index));
+            rows.push(Self::selectable_row(home.selection, index, text));
             index += 1;
         }
         rows.push(String::new());
         rows.push("Libraries".to_owned());
-        for directory in &self.config.library.book_dirs {
-            rows.push(Self::selectable_row(
-                home.selection,
-                index,
-                &directory.display().to_string(),
-            ));
+        for text in &dir_rows {
+            self.register_row(area, rows.len(), Action::HomeOpen(index));
+            rows.push(Self::selectable_row(home.selection, index, text));
             index += 1;
         }
+        self.register_row(area, rows.len(), Action::HomeOpen(index));
         rows.push(Self::selectable_row(
             home.selection,
             index,
@@ -1048,7 +1127,6 @@ impl App {
                 ("[Quit]", Action::HomeQuit),
             ],
         );
-        self.register_home_rows(area, home.selection);
     }
 
     fn draw_library(&mut self, frame: &mut Frame, library: &mut LibraryScreen) {
@@ -1058,26 +1136,23 @@ impl App {
             .cloned()
             .collect::<Vec<_>>();
         library.selection = library.selection.min(books.len().saturating_sub(1));
+        let visible = usize::from(area.height.saturating_sub(5)).max(1);
+        // Keep the selection inside the visible window.
+        if library.selection < library.top {
+            library.top = library.selection;
+        } else if library.selection >= library.top + visible {
+            library.top = library.selection + 1 - visible;
+        }
+        library.top = library.top.min(books.len().saturating_sub(1));
         let mut rows = vec![library.filter.render("Search: "), String::new()];
-        for (index, book) in books
-            .iter()
-            .take(usize::from(area.height.saturating_sub(5)))
-            .enumerate()
-        {
+        self.register_input_row(area, 0, "Search: ");
+        for (index, book) in books.iter().enumerate().skip(library.top).take(visible) {
             let prefix = if index == library.selection { ">" } else { " " };
+            self.register_row(area, rows.len(), Action::LibraryOpen(index));
             rows.push(format!(
                 "{prefix} {} — {}",
                 book.metadata.title,
                 book.metadata.authors.join(", ")
-            ));
-            self.hit_targets.push((
-                Rect::new(
-                    1,
-                    u16::try_from(index + 3).unwrap_or(0),
-                    area.width.saturating_sub(2),
-                    1,
-                ),
-                Action::LibraryOpen(index),
             ));
         }
         if books.is_empty() {
@@ -1091,23 +1166,69 @@ impl App {
         self.register_footer(area, " [Home] ", &[("[Home]", Action::LibraryHome)]);
     }
 
+    /// Render a text input row and make its value area clickable.
+    fn push_input_row(
+        &mut self,
+        area: Rect,
+        rows: &mut Vec<String>,
+        input: &TextInput,
+        label: &str,
+    ) {
+        self.register_input_row(area, rows.len(), label);
+        rows.push(input.render(label));
+    }
+
+    /// Render a modal hint row with clickable Enter/Esc segments.
+    fn push_hint_row(&mut self, area: Rect, rows: &mut Vec<String>, hint: &str) {
+        self.register_row_labels(
+            area,
+            rows.len(),
+            hint,
+            &[
+                ("Enter:", Action::Key(KeyCode::Enter)),
+                ("Esc:", Action::Key(KeyCode::Esc)),
+            ],
+        );
+        rows.push(hint.to_owned());
+    }
+
     #[allow(clippy::too_many_lines)]
     fn draw_settings(&mut self, frame: &mut Frame, settings: &mut SettingsScreen) {
         let area = frame.area();
-        let mut rows = vec!["Libraries  (a: add, d: remove)".to_owned()];
-        if self.config.library.book_dirs.is_empty() {
+        let dir_rows: Vec<String> = self
+            .config
+            .library
+            .book_dirs
+            .iter()
+            .map(|directory| directory.display().to_string())
+            .collect();
+        let mut rows: Vec<String> = Vec::new();
+        let header = "Libraries  (a: add, d: remove)".to_owned();
+        self.register_row_labels(
+            area,
+            rows.len(),
+            &header,
+            &[
+                ("a: add", Action::Key(KeyCode::Char('a'))),
+                ("d: remove", Action::Key(KeyCode::Char('d'))),
+            ],
+        );
+        rows.push(header);
+        if dir_rows.is_empty() {
             rows.push("  (none configured)".to_owned());
         }
-        for (index, directory) in self.config.library.book_dirs.iter().enumerate() {
+        for (index, directory) in dir_rows.iter().enumerate() {
             let prefix = if index == settings.selection {
                 ">"
             } else {
                 " "
             };
-            rows.push(format!("{prefix} {}", directory.display()));
+            self.register_row(area, rows.len(), Action::SelectLibraryDir(index));
+            rows.push(format!("{prefix} {directory}"));
         }
         rows.push(String::new());
         rows.push("Reading".to_owned());
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('w')));
         rows.push(format!(
             "  [w] Max width: {}",
             self.config
@@ -1115,42 +1236,76 @@ impl App {
                 .max_width
                 .map_or("full".to_owned(), |width| width.to_string())
         ));
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('j')));
         rows.push(format!(
             "  [j] Justify: {}",
             on_off(self.config.reading.justify)
         ));
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('m')));
         rows.push(format!(
             "  [m] ASCII mode: {}",
             on_off(self.config.reading.ascii_only)
         ));
         rows.push(String::new());
         rows.push("Progress sync (KOReader-compatible)".to_owned());
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('u')));
         rows.push(format!("  [u] Server: {}", self.config.sync.server_url));
         let account = match (&self.config.sync.username, self.sync.logged_in()) {
             (Some(username), true) => format!("{username} (signed in)"),
             (Some(username), false) => format!("{username} (keyring locked or signed out)"),
             (None, _) => "not signed in".to_owned(),
         };
-        rows.push(format!(
-            "  [l] Login  [r] Register  [o] Logout — account: {account}"
-        ));
+        let account_row = format!("  [l] Login  [r] Register  [o] Logout — account: {account}");
+        self.register_row_labels(
+            area,
+            rows.len(),
+            &account_row,
+            &[
+                ("[l]", Action::Key(KeyCode::Char('l'))),
+                ("[r]", Action::Key(KeyCode::Char('r'))),
+                ("[o]", Action::Key(KeyCode::Char('o'))),
+            ],
+        );
+        rows.push(account_row);
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('c')));
         rows.push(format!(
             "  [c] Matching: {}",
             matching_label(self.config.sync.matching)
         ));
-        rows.push(format!(
+        let strategies_row = format!(
             "  [f] Forward: {}   [b] Backward: {}",
             self.config.sync.sync_forward.label(),
             self.config.sync.sync_backward.label()
-        ));
-        rows.push(format!(
+        );
+        self.register_row_labels(
+            area,
+            rows.len(),
+            &strategies_row,
+            &[
+                ("[f]", Action::Key(KeyCode::Char('f'))),
+                ("[b]", Action::Key(KeyCode::Char('b'))),
+            ],
+        );
+        rows.push(strategies_row);
+        let cadence_row = format!(
             "  [t] Auto sync: {}   [g] Push every: {}",
             on_off(self.config.sync.auto_sync),
             self.config
                 .sync
                 .pages_before_update
                 .map_or("off".to_owned(), |pages| format!("{pages} pages"))
-        ));
+        );
+        self.register_row_labels(
+            area,
+            rows.len(),
+            &cadence_row,
+            &[
+                ("[t]", Action::Key(KeyCode::Char('t'))),
+                ("[g]", Action::Key(KeyCode::Char('g'))),
+            ],
+        );
+        rows.push(cadence_row);
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('n')));
         rows.push(format!(
             "  [n] Device: {}",
             self.config
@@ -1176,34 +1331,58 @@ impl App {
                 .map(|tag| format!(" — {tag} available, press i"))
                 .unwrap_or_default()
         };
-        rows.push(format!(
+        let update_row = format!(
             "  [v] Check for updates  [i] Install update — version {}{update_state}",
             current_version()
-        ));
+        );
+        self.register_row_labels(
+            area,
+            rows.len(),
+            &update_row,
+            &[
+                ("[v]", Action::Key(KeyCode::Char('v'))),
+                ("[i]", Action::Key(KeyCode::Char('i'))),
+            ],
+        );
+        rows.push(update_row);
         rows.push(String::new());
         match &settings.mode {
             SettingsMode::AddingLibrary => {
-                rows.push(settings.input.render("Add directory: "));
-                rows.push("Enter: save | Esc: cancel".to_owned());
+                self.push_input_row(area, &mut rows, &settings.input, "Add directory: ");
+                self.push_hint_row(area, &mut rows, "Enter: save | Esc: cancel");
             }
             SettingsMode::ConfirmRemove => {
-                rows.push("Remove selected library? Enter: confirm | Esc: cancel".to_owned());
+                self.push_hint_row(
+                    area,
+                    &mut rows,
+                    "Remove selected library? Enter: confirm | Esc: cancel",
+                );
             }
             SettingsMode::EditWidth => {
-                rows.push(settings.input.render("Max width (empty = full): "));
-                rows.push("Enter: save | Esc: cancel".to_owned());
+                self.push_input_row(
+                    area,
+                    &mut rows,
+                    &settings.input,
+                    "Max width (empty = full): ",
+                );
+                self.push_hint_row(area, &mut rows, "Enter: save | Esc: cancel");
             }
             SettingsMode::EditServer => {
-                rows.push(settings.input.render("Server URL: "));
-                rows.push("Enter: save | Esc: cancel".to_owned());
+                self.push_input_row(area, &mut rows, &settings.input, "Server URL: ");
+                self.push_hint_row(area, &mut rows, "Enter: save | Esc: cancel");
             }
             SettingsMode::EditPages => {
-                rows.push(settings.input.render("Pages between pushes (0 = off): "));
-                rows.push("Enter: save | Esc: cancel".to_owned());
+                self.push_input_row(
+                    area,
+                    &mut rows,
+                    &settings.input,
+                    "Pages between pushes (0 = off): ",
+                );
+                self.push_hint_row(area, &mut rows, "Enter: save | Esc: cancel");
             }
             SettingsMode::EditDevice => {
-                rows.push(settings.input.render("Device name: "));
-                rows.push("Enter: save | Esc: cancel".to_owned());
+                self.push_input_row(area, &mut rows, &settings.input, "Device name: ");
+                self.push_hint_row(area, &mut rows, "Enter: save | Esc: cancel");
             }
             SettingsMode::LoginUser { register } => {
                 let label = if *register {
@@ -1211,12 +1390,13 @@ impl App {
                 } else {
                     "Login — username: "
                 };
-                rows.push(settings.input.render(label));
-                rows.push("Enter: next | Esc: cancel".to_owned());
+                self.push_input_row(area, &mut rows, &settings.input, label);
+                self.push_hint_row(area, &mut rows, "Enter: next | Esc: cancel");
             }
             SettingsMode::LoginPass { username, .. } => {
-                rows.push(settings.input.render(&format!("Password for {username}: ")));
-                rows.push("Enter: sign in | Esc: cancel".to_owned());
+                let label = format!("Password for {username}: ");
+                self.push_input_row(area, &mut rows, &settings.input, &label);
+                self.push_hint_row(area, &mut rows, "Enter: sign in | Esc: cancel");
             }
             SettingsMode::Browse => {}
         }
@@ -1298,15 +1478,7 @@ impl App {
         let Some(prompt) = &reader.sync_prompt else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(8).clamp(40, 64);
-        let height = 7;
-        let popup = Rect::new(
-            (area.width.saturating_sub(width)) / 2,
-            (area.height.saturating_sub(height)) / 2,
-            width,
-            height,
-        );
+        let popup = reader.sync_prompt_area();
         let direction = if prompt.remote_percent > prompt.local_percent {
             "ahead of"
         } else {
@@ -1322,7 +1494,7 @@ impl App {
                 prompt.local_percent * 100.0
             ),
             String::new(),
-            "Enter: go to synced position | Esc: stay here".to_owned(),
+            format!("{PROMPT_GO_LABEL}  {PROMPT_STAY_LABEL}  (Enter / Esc)"),
         ];
         let widget = Paragraph::new(rows.join("\n")).block(
             TuiBlock::default()
@@ -1372,53 +1544,6 @@ impl App {
         format!("{marker} {text}")
     }
 
-    fn register_home_rows(&mut self, area: Rect, selection: usize) {
-        let mut action_index = 0_usize;
-        let mut row = if self
-            .recents
-            .most_recent()
-            .is_some_and(|recent| recent.path.exists())
-        {
-            2
-        } else {
-            0
-        };
-        if self
-            .recents
-            .most_recent()
-            .is_some_and(|recent| recent.path.exists())
-        {
-            self.hit_targets.push((
-                Rect::new(1, row, area.width.saturating_sub(2), 1),
-                Action::HomeOpen(action_index),
-            ));
-            action_index += 1;
-        }
-        row += 3;
-        for _ in self.recents.list() {
-            self.hit_targets.push((
-                Rect::new(1, row, area.width.saturating_sub(2), 1),
-                Action::HomeOpen(action_index),
-            ));
-            row += 1;
-            action_index += 1;
-        }
-        row += 2;
-        for _ in &self.config.library.book_dirs {
-            self.hit_targets.push((
-                Rect::new(1, row, area.width.saturating_sub(2), 1),
-                Action::HomeOpen(action_index),
-            ));
-            row += 1;
-            action_index += 1;
-        }
-        self.hit_targets.push((
-            Rect::new(1, row, area.width.saturating_sub(2), 1),
-            Action::HomeOpen(action_index),
-        ));
-        let _ = selection;
-    }
-
     fn register_footer(&mut self, area: Rect, footer: &str, actions: &[(&str, Action)]) {
         let row = area.y + area.height.saturating_sub(1);
         for (label, action) in actions {
@@ -1434,6 +1559,68 @@ impl App {
                 ));
             }
         }
+    }
+
+    /// Screen row (0-based content row inside `area`'s border) → y coordinate,
+    /// or `None` when the row is clipped by the border.
+    fn content_row_y(area: Rect, row_index: usize) -> Option<u16> {
+        let y = area.y + 1 + u16::try_from(row_index).ok()?;
+        (y < area.y + area.height.saturating_sub(1)).then_some(y)
+    }
+
+    /// Make an entire content row clickable.
+    fn register_row(&mut self, area: Rect, row_index: usize, action: Action) {
+        if let Some(y) = Self::content_row_y(area, row_index) {
+            self.hit_targets.push((
+                Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1),
+                action,
+            ));
+        }
+    }
+
+    /// Make each label (and the text following it, up to the next label)
+    /// clickable. Labels must appear before any non-ASCII text in the row.
+    fn register_row_labels(
+        &mut self,
+        area: Rect,
+        row_index: usize,
+        text: &str,
+        labels: &[(&str, Action)],
+    ) {
+        let Some(y) = Self::content_row_y(area, row_index) else {
+            return;
+        };
+        let mut starts: Vec<(usize, Action)> = labels
+            .iter()
+            .filter_map(|(label, action)| text.find(label).map(|index| (index, *action)))
+            .collect();
+        starts.sort_by_key(|(index, _)| *index);
+        for (position, (start, action)) in starts.iter().enumerate() {
+            let end = starts
+                .get(position + 1)
+                .map_or(text.len(), |(next, _)| *next);
+            self.hit_targets.push((
+                Rect::new(
+                    area.x + 1 + u16::try_from(*start).unwrap_or(0),
+                    y,
+                    u16::try_from(end - start).unwrap_or(0),
+                    1,
+                ),
+                *action,
+            ));
+        }
+    }
+
+    /// Make the value area of a rendered text input clickable for cursor moves.
+    fn register_input_row(&mut self, area: Rect, row_index: usize, label: &str) {
+        let Some(y) = Self::content_row_y(area, row_index) else {
+            return;
+        };
+        let label_width = u16::try_from(label.chars().count()).unwrap_or(0);
+        let x = area.x + 1 + label_width;
+        let width = (area.x + area.width.saturating_sub(1)).saturating_sub(x);
+        self.hit_targets
+            .push((Rect::new(x, y, width, 1), Action::InputClick));
     }
 
     fn home_item_count(&self) -> usize {
@@ -1484,6 +1671,7 @@ impl App {
                 books,
                 filter: TextInput::default(),
                 selection: 0,
+                top: 0,
             }));
             return;
         }
@@ -2052,6 +2240,16 @@ impl ReaderScreen {
     fn toc_area(&self) -> Rect {
         let width = self.width.saturating_sub(8).clamp(30, 60);
         let height = self.height.saturating_sub(6).clamp(6, 24);
+        Rect::new(
+            (self.width.saturating_sub(width)) / 2,
+            (self.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        )
+    }
+    fn sync_prompt_area(&self) -> Rect {
+        let width = self.width.saturating_sub(8).clamp(40, 64);
+        let height = 7;
         Rect::new(
             (self.width.saturating_sub(width)) / 2,
             (self.height.saturating_sub(height)) / 2,
