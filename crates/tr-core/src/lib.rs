@@ -162,7 +162,7 @@ pub struct SyncConfig {
 }
 
 fn default_sync_server() -> String {
-    "https://sync.koreader.rocks".to_owned()
+    "https://kosync.eu".to_owned()
 }
 
 fn default_sync_backward() -> SyncStrategy {
@@ -608,7 +608,7 @@ mod tests {
     fn legacy_config_defaults_new_sections() -> Result<(), CoreError> {
         let parsed: Config = toml::from_str("schema_version = 1\n[library]\nbook_dirs = []\n")?;
         assert_eq!(parsed.reading.max_width, Some(100));
-        assert_eq!(parsed.sync.server_url, "https://sync.koreader.rocks");
+        assert_eq!(parsed.sync.server_url, "https://kosync.eu");
         assert_eq!(parsed.sync.sync_backward, SyncStrategy::Disable);
         assert!(parsed.sync.auto_sync);
         assert!(!parsed.logging.enabled);

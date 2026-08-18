@@ -34,7 +34,7 @@ pub enum SyncEvent {
     },
     Pull {
         document: String,
-        result: Result<ProgressRecord, String>,
+        result: Result<Option<ProgressRecord>, String>,
         manual: bool,
     },
 }

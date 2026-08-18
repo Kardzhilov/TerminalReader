@@ -1650,7 +1650,14 @@ impl App {
                     if let Screen::Reader(reader) = &mut screen {
                         if reader.document_digest.as_deref() == Some(document.as_str()) {
                             match result {
-                                Ok(record) => self.apply_pull(reader, &record, manual),
+                                Ok(Some(record)) => self.apply_pull(reader, &record, manual),
+                                Ok(None) => {
+                                    if manual {
+                                        self.sync.status = Some(
+                                            "Server has no position for this book yet.".to_owned(),
+                                        );
+                                    }
+                                }
                                 Err(error) => {
                                     logging::warn(&format!("sync pull failed: {error}"));
                                     self.sync.status = Some(format!("Pull failed: {error}"));

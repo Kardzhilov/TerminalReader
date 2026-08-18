@@ -60,7 +60,10 @@ fn live_round_trip_push_then_pull() {
     };
     client.push(&update).expect("push failed");
 
-    let record = client.pull(&document).expect("pull failed");
+    let record = client
+        .pull(&document)
+        .expect("pull failed")
+        .expect("document missing on server after push");
     assert_eq!(record.progress.as_deref(), Some(update.progress.as_str()));
     let percentage = record.percentage.expect("percentage missing");
     assert!((percentage - update.percentage).abs() < 1e-9);

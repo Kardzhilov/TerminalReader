@@ -143,12 +143,17 @@ impl KOSyncClient {
         parse_progress_response(response, &[StatusCode::OK, StatusCode::ACCEPTED])
     }
 
-    pub fn pull(&self, document: &str) -> Result<ProgressRecord, SyncError> {
+    /// Fetch the server's progress record; `Ok(None)` when the document has
+    /// never been synced (servers answer 404 for unknown documents).
+    pub fn pull(&self, document: &str) -> Result<Option<ProgressRecord>, SyncError> {
         let response = self
             .authenticated_client(PROGRESS_TIMEOUT)?
             .get(self.endpoint(&format!("syncs/progress/{document}"))?)
             .send()?;
-        parse_progress_response(response, &[StatusCode::OK])
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        parse_progress_response(response, &[StatusCode::OK]).map(Some)
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, SyncError> {
