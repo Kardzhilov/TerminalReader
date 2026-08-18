@@ -1,78 +1,90 @@
-# TerminalReader
+<div align="center">
 
-A fullscreen EPUB reader for the terminal, with KOReader-compatible reading
-progress sync (kosync protocol — works with kosync.eu, sync.koreader.rocks,
-and self-hosted servers).
+# 📖 TerminalReader
 
-## Features
+**A fullscreen EPUB reader for your terminal, with KOReader-compatible progress sync.**
 
-- Fullscreen TUI reader (ratatui) with mouse support, TOC popup, and
-  reflow-stable positions across terminal resizes
-- Library directories with a metadata scan cache (keyed by path/size/mtime)
-- First-run wizard for choosing an initial library directory
-- Reading preferences: max content width, full justification, ASCII-only mode
-- `NO_COLOR` respected; help overlay on `?` / `F1`
-- KOReader progress sync:
-  - binary (partial MD5) and filename document matching
-  - xpointer ↔ reader position mapping with percentage fallback
-  - automatic pull on open; prompt/silent/disabled forward/backward strategies
-  - push on close/quit, page-count interval pushes, manual push (`s`) / pull (`p`)
-  - 25-second debounce, visible sync status, persistent offline queue
-  - credentials in the OS keyring (Secret Service / Keychain / Credential Manager)
-- Optional file logging with secret redaction (`--log-file`, `[logging]` config)
+[![CI](https://github.com/Kardzhilov/TerminalReader/actions/workflows/ci.yml/badge.svg)](https://github.com/Kardzhilov/TerminalReader/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Kardzhilov/TerminalReader?logo=github)](https://github.com/Kardzhilov/TerminalReader/releases/latest)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust)](rust-toolchain.toml)
 
-## Install
+Read your books where you live: the terminal. Keep your place in sync with your
+Kobo, Kindle, or any [KOReader](https://koreader.rocks/) device through
+[kosync.eu](https://kosync.eu), the official KOReader server, or your own.
 
-### Install script (Linux/macOS)
+![TerminalReader demo](docs/screenshots/demo.gif)
 
-Downloads the latest release binary for your platform and installs it to
-`~/.local/bin`:
+</div>
+
+---
+
+## Screenshots
+
+|                     Reading *Pride and Prejudice*                      |                    Table of contents                     |
+| :--------------------------------------------------------------------: | :------------------------------------------------------: |
+|                 ![Reader view](docs/screenshots/reader.png)             | ![Table of contents](docs/screenshots/contents.png)       |
+|                            **Your library**                             |                       **Settings**                        |
+|                 ![Library view](docs/screenshots/library.png)           |      ![Settings view](docs/screenshots/settings.png)      |
+
+<sub>Screenshots show public-domain books from
+[Project Gutenberg](https://www.gutenberg.org/).</sub>
+
+## Highlights
+
+📚 **A proper reading experience** — clean typography with configurable column
+width, full justification, and an ASCII-only mode; positions stay anchored to
+the word you were reading across any terminal resize.
+
+🔄 **KOReader progress sync** — the full kosync protocol: binary (partial-MD5)
+and filename document matching, xpointer ↔ position mapping with percentage
+fallback, automatic pull on open with prompt/silent/disabled strategies in each
+direction, push on close and per-page-interval, a 25-second debounce, visible
+sync status, and a persistent offline queue that drains when you're back online.
+
+🔐 **Credentials done right** — only the derived userkey is stored, in your OS
+keyring (Secret Service / Keychain / Credential Manager). Never on disk, and
+redacted from logs.
+
+🖱️ **Keyboard first, mouse complete** — every menu is fully clickable with
+hover highlighting, while the reading surface itself stays distraction-free.
+
+⚡ **Fast libraries** — recursive scanning with a metadata cache keyed by
+path/size/mtime; big collections open instantly after the first scan.
+
+🛠️ **Batteries included** — first-run wizard, help overlay (`?`), `NO_COLOR`
+support, self-update (`terminalreader update`), a `doctor` command that checks
+everything from config to live server auth, and optional logging with secret
+redaction.
+
+## Installation
+
+**Linux / macOS** — installs the latest release to `~/.local/bin`
+(override with `TR_INSTALL_DIR`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Kardzhilov/TerminalReader/main/install.sh | sh
 ```
 
-Set `TR_INSTALL_DIR` to install somewhere else:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/Kardzhilov/TerminalReader/main/install.sh | TR_INSTALL_DIR=/usr/local/bin sh
-```
-
-Prefer to read before you run? Download it first:
-
-```sh
-curl -fsSL -O https://raw.githubusercontent.com/Kardzhilov/TerminalReader/main/install.sh
-less install.sh && sh install.sh
-```
-
-### Install script Windows
-
-Windows (PowerShell) — installs to `%LOCALAPPDATA%\Programs\TerminalReader`
-(override with `$env:TR_INSTALL_DIR`) and adds it to your user `PATH`:
+**Windows (PowerShell)** — installs to `%LOCALAPPDATA%\Programs\TerminalReader`
+and adds it to your user `PATH`:
 
 ```powershell
 irm https://raw.githubusercontent.com/Kardzhilov/TerminalReader/main/install.ps1 | iex
 ```
 
-Or install manually: download the `.zip` from the
-[latest release](https://github.com/Kardzhilov/TerminalReader/releases/latest)
-and put `terminalreader.exe` on your `PATH`.
-
-### From source (Rust 1.85+)
+**From source** (Rust 1.85+; on Linux install `libdbus-1-dev` and `pkg-config`
+first):
 
 ```sh
 cargo install --path crates/tr-tui
 ```
 
-Release artifacts for Linux (x86_64/aarch64), macOS (x86_64/aarch64), and
-Windows are built by the `Release` workflow on every push to `main`. The
-version starts at 1.0.0 and is bumped automatically: a commit since the last
-release mentioning `MAJOR` bumps the major version, `MINOR` bumps the minor
-version, anything else bumps the patch version.
-
-On Linux, the keyring integration uses the D-Bus Secret Service; install
-`libdbus-1-dev`/`pkg-config` when building from source and make sure a secret
-service (GNOME Keyring, KWallet, keepassxc) is running.
+Prefer manual installs? Grab an archive for Linux (x86_64/aarch64), macOS
+(x86_64/aarch64), or Windows from the
+[latest release](https://github.com/Kardzhilov/TerminalReader/releases/latest).
+Releases are cut automatically on every push to `main`; a commit mentioning
+`MAJOR` or `MINOR` bumps that component, anything else is a patch.
 
 ## Usage
 
@@ -83,27 +95,58 @@ terminalreader library DIR     # list EPUBs under DIR
 terminalreader addLibrary DIR  # persist a library directory
 terminalreader hash book.epub  # print KOReader-compatible document hashes
 terminalreader doctor [book]   # verify config, state, keyring, and sync server
-terminalreader update          # self-update to the latest release (--check to only check)
-terminalreader --log-file tr.log --log-level debug   # log with redaction
+terminalreader update          # self-update (--check to only check)
 ```
 
-Configuration lives at the platform config dir (Linux:
-`~/.config/terminalreader/config.toml`), state (positions, recents, scan
-cache, sync queue) at the platform state dir.
+### Keys
 
-### Sync setup
+| Context  | Key                 | Action                                    |
+| -------- | ------------------- | ----------------------------------------- |
+| Anywhere | `?` / `F1`          | Help overlay                              |
+| Home     | `Enter` / `s` / `q` | Open selection / settings / quit          |
+| Reader   | `Space` `PgDn` `→`  | Next page                                 |
+| Reader   | `PgUp` `←`          | Previous page                             |
+| Reader   | `[` / `]`           | Previous / next chapter                   |
+| Reader   | `t`                 | Table of contents (type to filter)        |
+| Reader   | `s` / `p`           | Push / pull sync progress now             |
+| Reader   | `Esc` / `q`         | Save position and go home / quit          |
 
-Settings screen (`s` from home): set the server with `u` (e.g.
-`https://kosync.eu`), then `l` to log in or `r` to register. Only the derived
-userkey (MD5, per the kosync protocol) is stored — in the OS keyring, never
-on disk. The matching method (`c`) must match your other devices; KOReader's
-default is binary.
+Everything is also mouse-clickable, with hover highlighting; in the reader the
+mouse only operates the bottom bar, never the page.
 
-## Verification
+## Progress sync
 
-Automated: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D
-warnings`, `cargo test --workspace` (CI runs these on Linux/macOS/Windows,
-plus cargo-deny and cargo-audit).
+Open Settings (`s`), then:
+
+1. `u` — set the server (default: `https://kosync.eu`)
+2. `l` to log in, or `r` to register a new account
+3. `c` — pick the document matching method; **binary** (the KOReader default)
+   syncs identical files, **filename** syncs by name. This must match your
+   other devices.
+
+Forward/backward sync strategies (`f`/`b`), auto-sync (`t`), and page-interval
+pushes (`g`) mirror KOReader's Progress sync plugin. Failed pushes are queued
+on disk and retried automatically — even across restarts.
+
+## Configuration
+
+| What                                      | Where (Linux)                            |
+| ----------------------------------------- | ---------------------------------------- |
+| Config (TOML: library, reading, sync)     | `~/.config/terminalreader/config.toml`   |
+| State (positions, recents, cache, queue)  | `~/.local/state/terminalreader/`         |
+| Credentials (userkey only)                | OS keyring                               |
+| Logs (opt-in via `--log-file`/config)     | wherever you point them                  |
+
+macOS and Windows use the equivalent platform directories.
+
+## Development
+
+```sh
+cargo test --workspace                                   # unit tests
+cargo clippy --workspace --all-targets -- -D warnings    # lints (pedantic)
+cargo +nightly fuzz run epub_open                        # fuzz the EPUB parser
+cargo +nightly fuzz run xpointer_parse                   # fuzz progress strings
+```
 
 Live server round-trip tests (opt-in, never run in CI):
 
@@ -113,14 +156,17 @@ TR_SYNC_TEST_USER=user TR_SYNC_TEST_PASSWORD=pass \
 cargo test -p tr-kosync --test live -- --ignored
 ```
 
-Fuzzing (requires nightly + `cargo install cargo-fuzz`):
+Regenerate the README screenshots (uses [vhs](https://github.com/charmbracelet/vhs)
+and public-domain EPUBs):
 
 ```sh
-cargo +nightly fuzz run epub_open      # EPUB container/OPF/XHTML parsing
-cargo +nightly fuzz run xpointer_parse # KOReader progress strings
+cargo build --release -p terminalreader
+sh docs/make-demo-library.sh
+vhs docs/demo.tape
 ```
 
-### Manual verification checklist (Linux/macOS)
+<details>
+<summary><b>Manual verification checklist (Linux/macOS)</b></summary>
 
 - [ ] First run shows the wizard; Enter adds the directory, Esc skips, and the
       wizard does not reappear on the next start
@@ -135,7 +181,10 @@ cargo +nightly fuzz run xpointer_parse # KOReader progress strings
 - [ ] `--log-file` writes logs and never contains the userkey/password
 - [ ] Doctor reports config, libraries, keyring, queue, and server auth
 
-### Sync interoperability checklist (real server + KOReader device)
+</details>
+
+<details>
+<summary><b>Sync interoperability checklist (real server + KOReader device)</b></summary>
 
 - [ ] Register + login against kosync.eu (or self-hosted) from Settings
 - [ ] `terminalreader hash book.epub` matches the document id shown by the
@@ -147,6 +196,16 @@ cargo +nightly fuzz run xpointer_parse # KOReader progress strings
 - [ ] Disable networking, turn pages, quit: queue persists; next start with
       network, the queue drains (doctor shows 0 pending)
 
+</details>
+
+## Acknowledgements
+
+- [KOReader](https://koreader.rocks/) for the sync protocol and inspiration
+- [kosync.eu](https://kosync.eu) for the free community sync server
+- [Project Gutenberg](https://www.gutenberg.org/) for the public-domain books
+  in the screenshots
+- [ratatui](https://ratatui.rs/) for the TUI framework
+
 ## License
 
-AGPL-3.0-or-later
+[AGPL-3.0-or-later](LICENSE)
