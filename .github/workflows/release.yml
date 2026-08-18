@@ -82,7 +82,7 @@ jobs:
           staging="terminalreader-v${VERSION}-${{ matrix.target }}"
           mkdir "$staging"
           cp "target/${{ matrix.target }}/release/terminalreader" "$staging/"
-          cp README.md "$staging/"
+          cp README.md LICENSE "$staging/"
           tar czf "$staging.tar.gz" "$staging"
       - name: Package (windows)
         if: matrix.archive == 'zip'
@@ -91,7 +91,7 @@ jobs:
           $staging = "terminalreader-v$env:VERSION-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/terminalreader.exe" $staging
-          Copy-Item README.md $staging
+          Copy-Item README.md, LICENSE $staging
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
       - uses: actions/upload-artifact@v4
         with:
