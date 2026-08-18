@@ -1,5 +1,14 @@
-/target/
+target/
 **/*.rs.bk
+
+# Fuzzing outputs (fuzz/ is its own cargo workspace)
+fuzz/Cargo.lock
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
+# Test books
+/*.epub
 
 # Editor and operating system files
 .vscode/
