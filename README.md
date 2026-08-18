@@ -23,7 +23,42 @@ and self-hosted servers).
 
 ## Install
 
-From source (Rust 1.85+):
+### Install script (Linux/macOS)
+
+Downloads the latest release binary for your platform and installs it to
+`~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Kardzhilov/TerminalReader/main/install.sh | sh
+```
+
+Set `TR_INSTALL_DIR` to install somewhere else:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Kardzhilov/TerminalReader/main/install.sh | TR_INSTALL_DIR=/usr/local/bin sh
+```
+
+Prefer to read before you run? Download it first:
+
+```sh
+curl -fsSL -O https://raw.githubusercontent.com/Kardzhilov/TerminalReader/main/install.sh
+less install.sh && sh install.sh
+```
+
+### Install script Windows
+
+Windows (PowerShell) — installs to `%LOCALAPPDATA%\Programs\TerminalReader`
+(override with `$env:TR_INSTALL_DIR`) and adds it to your user `PATH`:
+
+```powershell
+irm https://raw.githubusercontent.com/Kardzhilov/TerminalReader/main/install.ps1 | iex
+```
+
+Or install manually: download the `.zip` from the
+[latest release](https://github.com/Kardzhilov/TerminalReader/releases/latest)
+and put `terminalreader.exe` on your `PATH`.
+
+### From source (Rust 1.85+)
 
 ```sh
 cargo install --path crates/tr-tui
