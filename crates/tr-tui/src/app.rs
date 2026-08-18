@@ -6,7 +6,7 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
-    text::Line as UiLine,
+    text::{Line as UiLine, Span, Text},
     widgets::{Block as TuiBlock, Borders, Clear, Paragraph},
 };
 use tr_core::{
@@ -53,6 +53,14 @@ impl Palette {
             Style::new().fg(Color::Yellow)
         } else {
             Style::new().add_modifier(Modifier::ITALIC)
+        }
+    }
+
+    fn hover(self) -> Style {
+        if self.color {
+            Style::new().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::new().add_modifier(Modifier::REVERSED)
         }
     }
 }
@@ -181,6 +189,7 @@ pub struct App {
     palette: Palette,
     screen: Screen,
     hit_targets: Vec<(Rect, Action)>,
+    hover: Option<Position>,
     status: Option<String>,
     help: bool,
     should_exit: bool,
@@ -221,6 +230,7 @@ impl App {
                 Screen::Home(HomeScreen::default())
             },
             hit_targets: Vec::new(),
+            hover: None,
             status: None,
             help: false,
             should_exit: false,
@@ -252,7 +262,12 @@ impl App {
     fn handle_event(&mut self, event: &Event) {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key.code),
-            Event::Mouse(mouse) => self.handle_mouse(*mouse),
+            Event::Mouse(mouse) => {
+                self.hover = Some(Position::new(mouse.column, mouse.row));
+                self.handle_mouse(*mouse);
+                // Keys apply transitions in handle_key; clicks need it too.
+                self.apply_screen_transition();
+            }
             Event::Resize(_, _) => {
                 if let Screen::Reader(reader) = &mut self.screen {
                     reader.invalidate_layout();
@@ -969,7 +984,10 @@ impl App {
             .borders(Borders::ALL)
             .title(" First-run setup ")
             .title_style(self.palette.title());
-        frame.render_widget(Paragraph::new(rows.join("\n")).block(block), area);
+        frame.render_widget(
+            Paragraph::new(self.styled_rows(area, rows)).block(block),
+            area,
+        );
     }
 
     fn draw_help(frame: &mut Frame, screen: &Screen) {
@@ -1106,19 +1124,6 @@ impl App {
         ));
         home.selection = home.selection.min(index);
         let footer = " [Settings] [Quit]  Enter: open | arrows: move | ?: help | q: quit ";
-        let mut block = TuiBlock::default()
-            .borders(Borders::ALL)
-            .title(" TerminalReader ")
-            .title_style(self.palette.title())
-            .title_bottom(footer);
-        if let Some(status) = self.status_line() {
-            block = block.title_bottom(
-                UiLine::from(format!(" {status} "))
-                    .style(self.palette.status())
-                    .right_aligned(),
-            );
-        }
-        frame.render_widget(Paragraph::new(rows.join("\n")).block(block), area);
         self.register_footer(
             area,
             footer,
@@ -1126,6 +1131,22 @@ impl App {
                 ("[Settings]", Action::HomeSettings),
                 ("[Quit]", Action::HomeQuit),
             ],
+        );
+        let mut block = TuiBlock::default()
+            .borders(Borders::ALL)
+            .title(" TerminalReader ")
+            .title_style(self.palette.title())
+            .title_bottom(self.styled_footer(area, footer));
+        if let Some(status) = self.status_line() {
+            block = block.title_bottom(
+                UiLine::from(format!(" {status} "))
+                    .style(self.palette.status())
+                    .right_aligned(),
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(self.styled_rows(area, rows)).block(block),
+            area,
         );
     }
 
@@ -1158,12 +1179,17 @@ impl App {
         if books.is_empty() {
             rows.push("No matching EPUBs.".to_owned());
         }
+        let footer = " [Home]  type: filter | Enter: open | Esc: home ";
+        self.register_footer(area, footer, &[("[Home]", Action::LibraryHome)]);
         let block = TuiBlock::default()
             .borders(Borders::ALL)
             .title(format!(" Library: {} ", library.directory.display()))
-            .title_bottom(" [Home]  type: filter | Enter: open | Esc: home ");
-        frame.render_widget(Paragraph::new(rows.join("\n")).block(block), area);
-        self.register_footer(area, " [Home] ", &[("[Home]", Action::LibraryHome)]);
+            .title_style(self.palette.title())
+            .title_bottom(self.styled_footer(area, footer));
+        frame.render_widget(
+            Paragraph::new(self.styled_rows(area, rows)).block(block),
+            area,
+        );
     }
 
     /// Render a text input row and make its value area clickable.
@@ -1406,20 +1432,24 @@ impl App {
         if let Some(status) = &self.sync.status {
             rows.push(format!("Sync: {status}"));
         }
-        let block = TuiBlock::default()
-            .borders(Borders::ALL)
-            .title(" Settings ")
-            .title_style(self.palette.title())
-            .title_bottom(" [Add] [Remove] [Home]  keys in brackets | ?: help | Esc: home ");
-        frame.render_widget(Paragraph::new(rows.join("\n")).block(block), area);
+        let footer = " [Add] [Remove] [Home]  keys in brackets | ?: help | Esc: home ";
         self.register_footer(
             area,
-            " [Add] [Remove] [Home] ",
+            footer,
             &[
                 ("[Add]", Action::SettingsAdd),
                 ("[Remove]", Action::SettingsRemove),
                 ("[Home]", Action::SettingsHome),
             ],
+        );
+        let block = TuiBlock::default()
+            .borders(Borders::ALL)
+            .title(" Settings ")
+            .title_style(self.palette.title())
+            .title_bottom(self.styled_footer(area, footer));
+        frame.render_widget(
+            Paragraph::new(self.styled_rows(area, rows)).block(block),
+            area,
         );
     }
 
@@ -1435,6 +1465,16 @@ impl App {
         let footer = format!(
             " [Contents] [Previous] [Next] [Home]  [/] chapter | ?: help | page {page}/{count} "
         );
+        self.register_footer(
+            area,
+            &footer,
+            &[
+                ("[Contents]", Action::ReaderContents),
+                ("[Previous]", Action::ReaderPrevious),
+                ("[Next]", Action::ReaderNext),
+                ("[Home]", Action::ReaderHome),
+            ],
+        );
         let mut block = TuiBlock::default()
             .borders(Borders::ALL)
             .title(format!(
@@ -1444,7 +1484,7 @@ impl App {
                 reader.book.spine.len()
             ))
             .title_style(self.palette.title())
-            .title_bottom(footer.clone());
+            .title_bottom(self.styled_footer(area, &footer));
         if let Some(status) = self.status_line() {
             block = block.title_bottom(
                 UiLine::from(format!(" {status} "))
@@ -1456,25 +1496,15 @@ impl App {
             Paragraph::new(reader.visible_lines().join("\n")).block(block),
             area,
         );
-        self.register_footer(
-            area,
-            &footer,
-            &[
-                ("[Contents]", Action::ReaderContents),
-                ("[Previous]", Action::ReaderPrevious),
-                ("[Next]", Action::ReaderNext),
-                ("[Home]", Action::ReaderHome),
-            ],
-        );
         if reader.toc.is_some() {
             self.draw_reader_toc(frame, reader);
         }
         if reader.sync_prompt.is_some() {
-            Self::draw_sync_prompt(frame, reader);
+            self.draw_sync_prompt(frame, reader);
         }
     }
 
-    fn draw_sync_prompt(frame: &mut Frame, reader: &ReaderScreen) {
+    fn draw_sync_prompt(&self, frame: &mut Frame, reader: &ReaderScreen) {
         let Some(prompt) = &reader.sync_prompt else {
             return;
         };
@@ -1485,18 +1515,47 @@ impl App {
             "behind"
         };
         let device = prompt.device.as_deref().unwrap_or("another device");
-        let rows = [
-            format!("{device} is {direction} this device."),
-            String::new(),
-            format!(
+        let buttons_y = popup.y + 5;
+        let hovered = |start: u16, length: usize| {
+            self.hover.is_some_and(|hover| {
+                hover.y == buttons_y
+                    && hover.x >= start
+                    && hover.x < start + u16::try_from(length).unwrap_or(0)
+            })
+        };
+        let go_x = popup.x + 1;
+        let stay_x = go_x + u16::try_from(PROMPT_GO_LABEL.len() + 2).unwrap_or(0);
+        let style_for = |is_hovered: bool| {
+            if is_hovered {
+                self.palette.hover()
+            } else {
+                Style::new()
+            }
+        };
+        let buttons = UiLine::from(vec![
+            Span::styled(
+                PROMPT_GO_LABEL,
+                style_for(hovered(go_x, PROMPT_GO_LABEL.len())),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                PROMPT_STAY_LABEL,
+                style_for(hovered(stay_x, PROMPT_STAY_LABEL.len())),
+            ),
+            Span::raw("  (Enter / Esc)"),
+        ]);
+        let text = Text::from(vec![
+            UiLine::from(format!("{device} is {direction} this device.")),
+            UiLine::from(""),
+            UiLine::from(format!(
                 "Server: {:.1}%   Here: {:.1}%",
                 prompt.remote_percent * 100.0,
                 prompt.local_percent * 100.0
-            ),
-            String::new(),
-            format!("{PROMPT_GO_LABEL}  {PROMPT_STAY_LABEL}  (Enter / Esc)"),
-        ];
-        let widget = Paragraph::new(rows.join("\n")).block(
+            )),
+            UiLine::from(""),
+            buttons,
+        ]);
+        let widget = Paragraph::new(text).block(
             TuiBlock::default()
                 .borders(Borders::ALL)
                 .title(" Sync position "),
@@ -1524,7 +1583,7 @@ impl App {
                 Action::TocSelect(index),
             ));
         }
-        let popup = Paragraph::new(rows.join("\n"))
+        let popup = Paragraph::new(self.styled_rows(area, rows))
             .block(TuiBlock::default().borders(Borders::ALL).title(format!(
                 " Chapters ({}/{}) — type to filter, Esc to close ",
                 entries.len(),
@@ -1542,6 +1601,63 @@ impl App {
             " "
         };
         format!("{marker} {text}")
+    }
+
+    /// Byte range of the registered target under the mouse on row `y`,
+    /// relative to text starting at column `x_origin`.
+    fn hovered_range(&self, y: u16, x_origin: u16) -> Option<(usize, usize)> {
+        let hover = self.hover?;
+        if hover.y != y {
+            return None;
+        }
+        let (rect, _) = self
+            .hit_targets
+            .iter()
+            .find(|(rect, _)| rect.contains(hover))?;
+        if rect.y != y {
+            return None;
+        }
+        let start = usize::from(rect.x.saturating_sub(x_origin));
+        Some((start, start + usize::from(rect.width)))
+    }
+
+    /// Highlight the hovered clickable segment of a rendered line.
+    fn styled_line(&self, text: String, y: u16, x_origin: u16) -> UiLine<'static> {
+        let Some((start, end)) = self.hovered_range(y, x_origin) else {
+            return UiLine::from(text);
+        };
+        let end = end.min(text.len());
+        if start >= end {
+            return UiLine::from(text);
+        }
+        match (text.get(..start), text.get(start..end), text.get(end..)) {
+            (Some(prefix), Some(target), Some(suffix)) => UiLine::from(vec![
+                Span::raw(prefix.to_owned()),
+                Span::styled(target.to_owned(), self.palette.hover()),
+                Span::raw(suffix.to_owned()),
+            ]),
+            // Hover range not on a char boundary; skip the highlight.
+            _ => UiLine::from(text),
+        }
+    }
+
+    /// Convert content rows into text with hover highlighting applied.
+    fn styled_rows(&self, area: Rect, rows: Vec<String>) -> Text<'static> {
+        let lines: Vec<UiLine<'static>> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let y = area.y + 1 + u16::try_from(index).unwrap_or(u16::MAX);
+                self.styled_line(row, y, area.x + 1)
+            })
+            .collect();
+        Text::from(lines)
+    }
+
+    /// Bottom-title footer with hover highlighting.
+    fn styled_footer(&self, area: Rect, footer: &str) -> UiLine<'static> {
+        let y = area.y + area.height.saturating_sub(1);
+        self.styled_line(footer.to_owned(), y, area.x + 1)
     }
 
     fn register_footer(&mut self, area: Rect, footer: &str, actions: &[(&str, Action)]) {
