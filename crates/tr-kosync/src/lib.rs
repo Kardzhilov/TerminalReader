@@ -1,8 +1,10 @@
 //! `KOReader` kosync document matching, HTTP protocol client, and offline queue.
 
+pub mod xpointer;
+
 use std::{
     collections::VecDeque,
-    fs::File,
+    fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -74,10 +76,20 @@ pub struct ProgressRecord {
     pub timestamp: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credentials {
     pub username: String,
     pub userkey: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("userkey", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -193,8 +205,10 @@ pub fn partial_md5(path: &Path) -> Result<String, SyncError> {
     let mut hasher = Md5::new();
     let mut buffer = [0_u8; 1024];
     for exponent in -1_i32..=10 {
+        // KOReader's `lshift(1024, -2)` wraps to 0 in LuaJIT's 32-bit shift,
+        // so the first sample is the file's first kibibyte.
         let offset = if exponent < 0 {
-            1024_u64 >> 2
+            0
         } else {
             1024_u64 << (2 * exponent)
         };
@@ -214,6 +228,19 @@ pub fn partial_md5(path: &Path) -> Result<String, SyncError> {
 pub fn filename_md5(path: &Path) -> Option<String> {
     path.file_name()
         .map(|name| hex::encode(Md5::digest(name.to_string_lossy().as_bytes())))
+}
+
+/// Document identifier for the configured matching method.
+pub fn document_digest(path: &Path, method: ChecksumMethod) -> Result<String, SyncError> {
+    match method {
+        ChecksumMethod::Binary => partial_md5(path),
+        ChecksumMethod::Filename => filename_md5(path).ok_or_else(|| {
+            SyncError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "document path has no file name",
+            ))
+        }),
+    }
 }
 
 fn read_up_to(reader: &mut File, buffer: &mut [u8]) -> Result<usize, SyncError> {
@@ -244,6 +271,34 @@ pub struct QueuedProgress {
 }
 
 impl ProgressQueue {
+    /// Load the persisted queue; missing or corrupt files yield an empty queue.
+    #[must_use]
+    pub fn load(path: &Path) -> Self {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), SyncError> {
+        let temporary = path.with_extension("tmp");
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| SyncError::Io(std::io::Error::other(error)))?;
+        fs::write(&temporary, bytes)?;
+        fs::rename(temporary, path)?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     pub fn push(&mut self, update: ProgressUpdate) {
         self.expire();
         self.items
@@ -315,14 +370,95 @@ mod tests {
         assert_eq!(queue.items().front().expect("entry").update.progress, "2");
     }
 
-    #[test]
-    fn digest_reads_exponentially_spaced_samples() -> Result<(), SyncError> {
-        let path = std::env::temp_dir().join("terminalreader-partial-md5-test.bin");
+    fn temp_file(name: &str, contents: &[u8]) -> Result<std::path::PathBuf, SyncError> {
+        let path =
+            std::env::temp_dir().join(format!("terminalreader-{}-{name}", std::process::id()));
         let mut file = File::create(&path)?;
-        file.write_all(&vec![b'x'; 5000])?;
-        drop(file);
-        assert!(!partial_md5(&path)?.is_empty());
+        file.write_all(contents)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn digest_matches_koreader_partial_md5() -> Result<(), SyncError> {
+        // Reference layout: MD5 over 1 KiB samples at offsets 0, 1024,
+        // 4096, ..., stopping at the first empty read.
+        let contents: Vec<u8> = (0..6000_u32)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0))
+            .collect();
+        let path = temp_file("digest-vector.bin", &contents)?;
+        let mut hasher = Md5::new();
+        for offset in [0_usize, 1024, 4096] {
+            let end = (offset + 1024).min(contents.len());
+            if let Some(sample) = contents.get(offset..end) {
+                hasher.update(sample);
+            }
+        }
+        let expected = hex::encode(hasher.finalize());
+        assert_eq!(partial_md5(&path)?, expected);
         std::fs::remove_file(path)?;
         Ok(())
+    }
+
+    #[test]
+    fn digest_includes_first_kibibyte() -> Result<(), SyncError> {
+        let mut contents = vec![b'x'; 5000];
+        let first = temp_file("digest-first-a.bin", &contents)?;
+        if let Some(byte) = contents.first_mut() {
+            *byte = b'y';
+        }
+        let second = temp_file("digest-first-b.bin", &contents)?;
+        assert_ne!(partial_md5(&first)?, partial_md5(&second)?);
+        std::fs::remove_file(first)?;
+        std::fs::remove_file(second)?;
+        Ok(())
+    }
+
+    #[test]
+    fn digest_selection_follows_checksum_method() -> Result<(), SyncError> {
+        let path = temp_file("digest-method.epub", &[b'x'; 3000])?;
+        assert_eq!(
+            document_digest(&path, ChecksumMethod::Binary)?,
+            partial_md5(&path)?
+        );
+        assert_eq!(
+            Some(document_digest(&path, ChecksumMethod::Filename)?),
+            filename_md5(&path)
+        );
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn queue_persists_across_load_and_save() -> Result<(), SyncError> {
+        let path = std::env::temp_dir().join(format!(
+            "terminalreader-{}-queue-roundtrip.json",
+            std::process::id()
+        ));
+        let mut queue = ProgressQueue::default();
+        queue.push(update("doc-a"));
+        queue.push(update("doc-b"));
+        queue.save(&path)?;
+        let restored = ProgressQueue::load(&path);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored
+                .items()
+                .front()
+                .map(|item| item.update.document.as_str()),
+            Some("doc-a")
+        );
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn debug_output_redacts_userkey() {
+        let credentials = Credentials {
+            username: "reader".to_owned(),
+            userkey: "deadbeef".to_owned(),
+        };
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains("deadbeef"));
+        assert!(debug.contains("[redacted]"));
     }
 }

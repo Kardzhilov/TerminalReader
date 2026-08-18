@@ -6,6 +6,7 @@ use crossterm::event::KeyCode;
 pub struct TextInput {
     value: String,
     cursor: usize,
+    masked: bool,
     blink_epoch: Instant,
 }
 
@@ -16,7 +17,17 @@ impl TextInput {
         Self {
             value,
             cursor,
+            masked: false,
             blink_epoch: Instant::now(),
+        }
+    }
+
+    /// Input that renders every character as `*` (for passwords).
+    #[must_use]
+    pub fn masked() -> Self {
+        Self {
+            masked: true,
+            ..Self::new(String::new())
         }
     }
 
@@ -77,7 +88,13 @@ impl TextInput {
         } else {
             " "
         };
-        format!("{label}{before}{caret}{after}")
+        if self.masked {
+            let before = "*".repeat(before.chars().count());
+            let after = "*".repeat(after.chars().count());
+            format!("{label}{before}{caret}{after}")
+        } else {
+            format!("{label}{before}{caret}{after}")
+        }
     }
 
     fn delete(&mut self, forward: bool) -> bool {

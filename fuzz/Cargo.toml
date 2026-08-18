@@ -1,0 +1,31 @@
+[package]
+name = "terminalreader-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+tr-epub = { path = "../crates/tr-epub" }
+tr-kosync = { path = "../crates/tr-kosync" }
+
+[[bin]]
+name = "epub_open"
+path = "fuzz_targets/epub_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xpointer_parse"
+path = "fuzz_targets/xpointer_parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -6,11 +6,12 @@ use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
 };
-use tr_core::{Config, PositionStore, RecentsStore, scan_library};
+use tr_core::{Config, PositionStore, RecentsStore, ScanCache, logging, scan_library_cached};
 use tr_epub::EpubBook;
-use tr_kosync::{filename_md5, partial_md5};
+use tr_kosync::{Credentials, KOSyncClient, ProgressQueue, filename_md5, partial_md5};
 
 mod app;
+mod sync;
 mod text_input;
 
 use app::App;
@@ -21,6 +22,12 @@ use app::App;
     about = "A fullscreen EPUB reader for the terminal"
 )]
 struct Cli {
+    /// Write logs to this file (implies logging even if disabled in config).
+    #[arg(long, global = true)]
+    log_file: Option<PathBuf>,
+    /// Log level: error, warn, info, or debug.
+    #[arg(long, global = true)]
+    log_level: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -44,6 +51,7 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_logging(cli.log_file, cli.log_level.as_deref());
     match cli.command {
         Some(Command::Dump { book }) => dump(&book),
         Some(Command::Library { directory }) => {
@@ -55,6 +63,24 @@ fn main() -> Result<()> {
         Some(Command::Doctor { book }) => doctor(book.as_deref()),
         Some(Command::Read { book }) => run_tui(Some(book)),
         None => run_tui(None),
+    }
+}
+
+/// Enable file logging from CLI flags or the persisted config.
+fn init_logging(cli_file: Option<PathBuf>, cli_level: Option<&str>) {
+    let config = Config::load().unwrap_or_default();
+    let enabled = cli_file.is_some() || config.logging.enabled;
+    if !enabled {
+        return;
+    }
+    let level = cli_level
+        .map(str::to_owned)
+        .or(config.logging.level)
+        .unwrap_or_else(|| "info".to_owned());
+    let path = cli_file.or(config.logging.file);
+    match logging::init(path, logging::Level::parse(&level)) {
+        Ok(path) => logging::info(&format!("logging started at {}", path.display())),
+        Err(error) => eprintln!("warning: could not open log file: {error}"),
     }
 }
 
@@ -91,13 +117,17 @@ fn dump(path: &Path) -> Result<()> {
 }
 
 fn library(directory: &Path) {
-    for book in scan_library(directory) {
+    let mut cache = ScanCache::load();
+    for book in scan_library_cached(directory, &mut cache) {
         println!(
             "{}\t{}\t{}",
             book.metadata.title,
             book.metadata.authors.join(", "),
             book.path.display()
         );
+    }
+    if let Err(error) = cache.save() {
+        eprintln!("warning: could not save scan cache: {error}");
     }
 }
 
@@ -135,11 +165,59 @@ fn doctor(book: Option<&Path>) -> Result<()> {
             println!("Library: {status} ({})", directory.display());
         }
     }
+    doctor_sync(&config);
     if let Some(book) = book {
         println!("Book: {}", if book.is_file() { "OK" } else { "missing" });
         if book.is_file() {
             hash(book)?;
+            let method = sync::checksum_method(config.sync.matching);
+            if let Ok(digest) = tr_kosync::document_digest(book, method) {
+                println!("Sync document id ({:?}): {digest}", config.sync.matching);
+            }
         }
     }
     Ok(())
+}
+
+fn doctor_sync(config: &Config) {
+    match url::Url::parse(&config.sync.server_url) {
+        Ok(_) => println!("Sync server URL: OK ({})", config.sync.server_url),
+        Err(error) => {
+            println!("Sync server URL: INVALID ({error})");
+            return;
+        }
+    }
+    let queue_len =
+        tr_core::state_file("sync_queue.json").map_or(0, |path| ProgressQueue::load(&path).len());
+    println!("Sync queue: {queue_len} pending");
+    let Some(username) = &config.sync.username else {
+        println!("Sync account: not configured");
+        return;
+    };
+    println!("Sync account: {username}");
+    let userkey = match tr_core::credentials::load_userkey(&config.sync.server_url, username) {
+        Ok(Some(userkey)) => {
+            println!("Sync credentials: found in keyring");
+            userkey
+        }
+        Ok(None) => {
+            println!("Sync credentials: MISSING from keyring (sign in again)");
+            return;
+        }
+        Err(error) => {
+            println!("Sync credentials: keyring unavailable ({error})");
+            return;
+        }
+    };
+    let client = KOSyncClient::new(
+        &config.sync.server_url,
+        Credentials {
+            username: username.clone(),
+            userkey,
+        },
+    );
+    match client.and_then(|client| client.authorize()) {
+        Ok(()) => println!("Sync server: reachable, authentication OK"),
+        Err(error) => println!("Sync server: FAILED ({error})"),
+    }
 }
