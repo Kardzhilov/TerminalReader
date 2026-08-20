@@ -154,6 +154,8 @@ struct ReaderScreen {
     document_digest: Option<String>,
     page_turns: u32,
     sync_prompt: Option<SyncPrompt>,
+    /// Open the next laid-out chapter at its last page (backward page turn).
+    open_at_end: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2121,6 +2123,7 @@ impl ReaderScreen {
             document_digest: None,
             page_turns: 0,
             sync_prompt: None,
+            open_at_end: false,
         }
     }
 
@@ -2153,8 +2156,15 @@ impl ReaderScreen {
         } else {
             self.lines = layout_with(&self.blocks, width, options);
         }
-        self.top_line = line_for_anchor(&self.lines, self.anchor.0, self.anchor.1);
-        self.clamp_top();
+        if self.open_at_end {
+            self.open_at_end = false;
+            let step = self.content_height();
+            self.top_line = self.lines.len().saturating_sub(1) / step * step;
+            self.update_anchor();
+        } else {
+            self.top_line = line_for_anchor(&self.lines, self.anchor.0, self.anchor.1);
+            self.clamp_top();
+        }
     }
 
     fn invalidate_layout(&mut self) {
@@ -2166,6 +2176,7 @@ impl ReaderScreen {
         self.blocks.clear();
         self.source_paths.clear();
         self.blocks_loaded = false;
+        self.open_at_end = false;
         self.invalidate_layout();
     }
     fn content_height(&self) -> usize {
@@ -2211,6 +2222,12 @@ impl ReaderScreen {
         if self.top_line > 0 {
             self.top_line = self.top_line.saturating_sub(self.content_height());
             self.update_anchor();
+        } else if self.chapter_index > 0 {
+            self.chapter_index -= 1;
+            self.top_line = 0;
+            self.anchor = (0, 0);
+            self.invalidate_chapter();
+            self.open_at_end = true;
         }
     }
     fn next_chapter(&mut self) {
