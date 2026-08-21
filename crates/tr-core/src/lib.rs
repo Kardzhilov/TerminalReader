@@ -155,6 +155,9 @@ pub struct SyncConfig {
     /// Push after this many page turns; `None` disables interval pushes.
     #[serde(default)]
     pub pages_before_update: Option<u32>,
+    /// Push after this many minutes of reading; `None` disables timed pushes.
+    #[serde(default)]
+    pub minutes_before_update: Option<u32>,
     #[serde(default)]
     pub device_name: Option<String>,
     #[serde(default)]
@@ -183,6 +186,7 @@ impl Default for SyncConfig {
             sync_backward: default_sync_backward(),
             auto_sync: true,
             pages_before_update: None,
+            minutes_before_update: None,
             device_name: None,
             device_id: None,
         }
@@ -585,6 +589,7 @@ mod tests {
                 sync_backward: SyncStrategy::Disable,
                 auto_sync: false,
                 pages_before_update: Some(10),
+                minutes_before_update: Some(5),
                 device_name: Some("laptop".to_owned()),
                 device_id: Some("abc123".to_owned()),
             },
@@ -601,6 +606,7 @@ mod tests {
         assert_eq!(parsed.sync.matching, MatchingMethod::Filename);
         assert_eq!(parsed.sync.sync_forward, SyncStrategy::Silent);
         assert_eq!(parsed.sync.pages_before_update, Some(10));
+        assert_eq!(parsed.sync.minutes_before_update, Some(5));
         Ok(())
     }
 

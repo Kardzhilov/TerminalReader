@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf, time::Duration};
+use std::{
+    env,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
@@ -103,6 +107,7 @@ enum SettingsMode {
     EditWidth,
     EditServer,
     EditPages,
+    EditMinutes,
     EditDevice,
     LoginUser {
         register: bool,
@@ -153,6 +158,10 @@ struct ReaderScreen {
     toc: Option<TocState>,
     document_digest: Option<String>,
     page_turns: u32,
+    /// When the last push happened, for the timed-push interval.
+    last_push: Instant,
+    /// Progress string of the last push, to skip timed pushes when idle.
+    last_pushed_progress: Option<String>,
     sync_prompt: Option<SyncPrompt>,
     /// Open the next laid-out chapter at its last page (backward page turn).
     open_at_end: bool,
@@ -250,6 +259,7 @@ impl App {
         while !self.should_exit {
             self.process_sync_events();
             self.process_update_events();
+            self.maybe_timed_push();
             terminal.draw(|frame| self.draw(frame))?;
             if crossterm::event::poll(Duration::from_millis(50))? {
                 let event = crossterm::event::read()?;
@@ -444,6 +454,19 @@ impl App {
                     Ok(format!("Pushing every {pages} pages."))
                 });
             }
+            SettingsMode::EditMinutes => {
+                self.handle_settings_edit(settings, key, SettingsMode::EditMinutes, |app, value| {
+                    if value.is_empty() || value == "0" {
+                        app.config.sync.minutes_before_update = None;
+                        return Ok("Timed pushes disabled.".to_owned());
+                    }
+                    let minutes: u32 = value
+                        .parse()
+                        .map_err(|_| "Enter minutes, 0, or leave empty.".to_owned())?;
+                    app.config.sync.minutes_before_update = Some(minutes);
+                    Ok(format!("Pushing every {minutes} minutes."))
+                });
+            }
             SettingsMode::EditDevice => {
                 self.handle_settings_edit(settings, key, SettingsMode::EditDevice, |app, value| {
                     app.config.sync.device_name = (!value.is_empty()).then(|| value.to_owned());
@@ -603,6 +626,16 @@ impl App {
                     .map(|pages| pages.to_string())
                     .unwrap_or_default();
                 settings.mode = SettingsMode::EditPages;
+                settings.input = TextInput::new(current);
+            }
+            KeyCode::Char('e') => {
+                let current = self
+                    .config
+                    .sync
+                    .minutes_before_update
+                    .map(|minutes| minutes.to_string())
+                    .unwrap_or_default();
+                settings.mode = SettingsMode::EditMinutes;
                 settings.input = TextInput::new(current);
             }
             KeyCode::Char('n') => {
@@ -1019,7 +1052,8 @@ impl App {
                 "  a/d         add / remove library",
                 "  w j m       max width / justify / ASCII mode",
                 "  u c         sync server / matching method",
-                "  f b t g     forward / backward / auto sync / pages",
+                "  f b t       forward / backward / auto sync",
+                "  g e         push every N pages / N minutes",
                 "  l r o n     login / register / logout / device name",
                 "  v i         check for updates / install update",
             ]),
@@ -1258,7 +1292,7 @@ impl App {
         rows.push("Reading".to_owned());
         self.register_row(area, rows.len(), Action::Key(KeyCode::Char('w')));
         rows.push(format!(
-            "  [w] Max width: {}",
+            "  [w] Max width: {} — widest text column, in characters",
             self.config
                 .reading
                 .max_width
@@ -1266,12 +1300,12 @@ impl App {
         ));
         self.register_row(area, rows.len(), Action::Key(KeyCode::Char('j')));
         rows.push(format!(
-            "  [j] Justify: {}",
+            "  [j] Justify: {} — stretch lines so both margins are even",
             on_off(self.config.reading.justify)
         ));
         self.register_row(area, rows.len(), Action::Key(KeyCode::Char('m')));
         rows.push(format!(
-            "  [m] ASCII mode: {}",
+            "  [m] ASCII mode: {} — swap curly quotes/dashes for plain ones",
             on_off(self.config.reading.ascii_only)
         ));
         rows.push(String::new());
@@ -1297,11 +1331,11 @@ impl App {
         rows.push(account_row);
         self.register_row(area, rows.len(), Action::Key(KeyCode::Char('c')));
         rows.push(format!(
-            "  [c] Matching: {}",
+            "  [c] Matching: {} — how books are identified on the server",
             matching_label(self.config.sync.matching)
         ));
         let strategies_row = format!(
-            "  [f] Forward: {}   [b] Backward: {}",
+            "  [f] Forward: {}   [b] Backward: {} — when the server is ahead / behind",
             self.config.sync.sync_forward.label(),
             self.config.sync.sync_backward.label()
         );
@@ -1315,21 +1349,29 @@ impl App {
             ],
         );
         rows.push(strategies_row);
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('t')));
+        rows.push(format!(
+            "  [t] Auto sync: {} — pull position on open, push on close and quit",
+            on_off(self.config.sync.auto_sync)
+        ));
         let cadence_row = format!(
-            "  [t] Auto sync: {}   [g] Push every: {}",
-            on_off(self.config.sync.auto_sync),
+            "  [g] Push every: {}   [e] Push every: {} — also push while reading",
             self.config
                 .sync
                 .pages_before_update
-                .map_or("off".to_owned(), |pages| format!("{pages} pages"))
+                .map_or("off".to_owned(), |pages| format!("{pages} pages")),
+            self.config
+                .sync
+                .minutes_before_update
+                .map_or("off".to_owned(), |minutes| format!("{minutes} min"))
         );
         self.register_row_labels(
             area,
             rows.len(),
             &cadence_row,
             &[
-                ("[t]", Action::Key(KeyCode::Char('t'))),
                 ("[g]", Action::Key(KeyCode::Char('g'))),
+                ("[e]", Action::Key(KeyCode::Char('e'))),
             ],
         );
         rows.push(cadence_row);
@@ -1405,6 +1447,15 @@ impl App {
                     &mut rows,
                     &settings.input,
                     "Pages between pushes (0 = off): ",
+                );
+                self.push_hint_row(area, &mut rows, "Enter: save | Esc: cancel");
+            }
+            SettingsMode::EditMinutes => {
+                self.push_input_row(
+                    area,
+                    &mut rows,
+                    &settings.input,
+                    "Minutes between pushes (0 = off): ",
                 );
                 self.push_hint_row(area, &mut rows, "Enter: save | Esc: cancel");
             }
@@ -1882,6 +1933,8 @@ impl App {
             return;
         };
         let (progress, percentage) = reader.progress_payload();
+        reader.last_push = Instant::now();
+        reader.last_pushed_progress = Some(progress.clone());
         let update = ProgressUpdate {
             document,
             metadata: None,
@@ -1906,6 +1959,30 @@ impl App {
                 Self::push_progress(config, sync, reader, false);
             }
         }
+    }
+
+    /// Push on a timer so progress isn't lost when the app never exits
+    /// cleanly (laptop lid closed, terminal killed, …).
+    fn maybe_timed_push(&mut self) {
+        let Some(minutes) = self.config.sync.minutes_before_update else {
+            return;
+        };
+        let Screen::Reader(reader) = &mut self.screen else {
+            return;
+        };
+        if minutes == 0
+            || reader.document_digest.is_none()
+            || reader.last_push.elapsed() < Duration::from_secs(u64::from(minutes) * 60)
+        {
+            return;
+        }
+        let (progress, _) = reader.progress_payload();
+        if reader.last_pushed_progress.as_deref() == Some(progress.as_str()) {
+            // Nothing new to report; restart the timer.
+            reader.last_push = Instant::now();
+            return;
+        }
+        Self::push_progress(&self.config, &mut self.sync, reader, false);
     }
 
     /// Handle finished background update work.
@@ -2085,8 +2162,8 @@ fn on_off(value: bool) -> &'static str {
 
 fn matching_label(matching: tr_core::MatchingMethod) -> &'static str {
     match matching {
-        tr_core::MatchingMethod::Binary => "binary (identical files)",
-        tr_core::MatchingMethod::Filename => "filename",
+        tr_core::MatchingMethod::Binary => "binary (identical file)",
+        tr_core::MatchingMethod::Filename => "filename (same file name)",
     }
 }
 
@@ -2122,6 +2199,8 @@ impl ReaderScreen {
             toc: None,
             document_digest: None,
             page_turns: 0,
+            last_push: Instant::now(),
+            last_pushed_progress: None,
             sync_prompt: None,
             open_at_end: false,
         }
