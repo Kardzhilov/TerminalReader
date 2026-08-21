@@ -2,6 +2,10 @@
 #   brew install vhs && cargo build --release -p terminalreader
 #   sh docs/make-demo-library.sh   (downloads public-domain EPUBs)
 #   vhs docs/demo.tape
+# Or with Docker (works on Windows too):
+#   docker run --rm -v "$PWD:/work" -w /work --entrypoint bash \
+#     ghcr.io/charmbracelet/vhs -c 'sh docs/make-demo-library.sh && vhs docs/demo.tape'
+#   (build a Linux binary into target/release first, e.g. with a rust container)
 
 Output docs/screenshots/demo.gif
 
@@ -70,6 +74,16 @@ Type "s"
 Sleep 1.5s
 Screenshot docs/screenshots/settings.png
 Sleep 1s
+
+# Cycle theme presets: gruvbox -> gruvbox-light -> dracula
+Type "h"
+Sleep 1s
+Screenshot docs/screenshots/themes.png
+Sleep 500ms
+Type "h"
+Sleep 1s
+Type "h"
+Sleep 1.5s
 
 Escape
 Sleep 500ms

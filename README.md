@@ -26,6 +26,8 @@ Kobo, Kindle, or any [KOReader](https://koreader.rocks/) device through
 |                 ![Reader view](docs/screenshots/reader.png)             | ![Table of contents](docs/screenshots/contents.png)       |
 |                            **Your library**                             |                       **Settings**                        |
 |                 ![Library view](docs/screenshots/library.png)           |      ![Settings view](docs/screenshots/settings.png)      |
+|                     **Theme presets (gruvbox)**                          |                                                            |
+|              ![Theme presets](docs/screenshots/themes.png)               |                                                            |
 
 <sub>Screenshots show public-domain books from
 [Project Gutenberg](https://www.gutenberg.org/).</sub>
