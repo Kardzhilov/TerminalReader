@@ -47,7 +47,8 @@ pub struct SyncController {
     queue: ProgressQueue,
     queue_path: Option<PathBuf>,
     last_call: Option<Instant>,
-    deferred: Option<ProgressUpdate>,
+    /// Debounced pushes awaiting the window, at most one per document.
+    deferred: Vec<ProgressUpdate>,
     in_flight: usize,
     pub status: Option<String>,
 }
@@ -68,7 +69,7 @@ impl SyncController {
             queue,
             queue_path,
             last_call: None,
-            deferred: None,
+            deferred: Vec::new(),
             in_flight: 0,
             status: None,
         }
@@ -129,7 +130,7 @@ impl SyncController {
     }
 
     /// Push progress; automatic pushes within the debounce window are
-    /// deferred and coalesced, manual pushes go out immediately.
+    /// deferred and coalesced per document, manual pushes go out immediately.
     pub fn push(&mut self, config: &SyncConfig, update: ProgressUpdate, manual: bool) {
         let Some(credentials) = self.credentials.clone() else {
             if manual {
@@ -140,11 +141,21 @@ impl SyncController {
         if !manual {
             let debounced = self.last_call.is_some_and(|last| last.elapsed() < DEBOUNCE);
             if debounced {
-                self.deferred = Some(update);
+                self.defer(update);
                 return;
             }
         }
+        // This update supersedes anything deferred for the same document.
+        self.deferred
+            .retain(|existing| existing.document != update.document);
         self.spawn_push(&config.server_url, credentials, update, manual);
+    }
+
+    /// Coalesce a debounced push, keeping the newest update per document.
+    fn defer(&mut self, update: ProgressUpdate) {
+        self.deferred
+            .retain(|existing| existing.document != update.document);
+        self.deferred.push(update);
     }
 
     /// Pull the server's progress record for `document` in the background.
@@ -203,13 +214,11 @@ impl SyncController {
     /// Returns events the app must act on (auth outcomes and pull results);
     /// push bookkeeping — status, offline queue, drain — is handled here.
     pub fn poll(&mut self, config: &SyncConfig) -> Vec<SyncEvent> {
-        if let Some(update) = self.deferred.take() {
-            let expired = self.last_call.is_none_or(|last| last.elapsed() >= DEBOUNCE);
-            if expired {
-                self.push(config, update, false);
-            } else {
-                self.deferred = Some(update);
-            }
+        let expired = self.last_call.is_none_or(|last| last.elapsed() >= DEBOUNCE);
+        if expired && !self.deferred.is_empty() {
+            // One per window; the rest go out on later polls.
+            let update = self.deferred.remove(0);
+            self.push(config, update, false);
         }
         let mut events = Vec::new();
         while let Ok(event) = self.rx.try_recv() {
@@ -291,12 +300,12 @@ impl SyncController {
         }
     }
 
-    /// Send any deferred push immediately and wait briefly for in-flight
+    /// Send any deferred pushes immediately and wait briefly for in-flight
     /// calls, so push-on-quit completes before the process exits.
     pub fn flush(&mut self, config: &SyncConfig, timeout: Duration) {
-        if let Some(update) = self.deferred.take() {
-            if let Some(credentials) = self.credentials.clone() {
-                self.spawn_push(&config.server_url, credentials, update, false);
+        if let Some(credentials) = self.credentials.clone() {
+            for update in std::mem::take(&mut self.deferred) {
+                self.spawn_push(&config.server_url, credentials.clone(), update, false);
             }
         }
         let deadline = Instant::now() + timeout;

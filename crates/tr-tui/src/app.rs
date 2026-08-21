@@ -210,7 +210,7 @@ pub struct App {
 impl App {
     pub fn new(initial_book: Option<PathBuf>) -> Result<Self> {
         let first_run = !Config::exists();
-        let config = Config::load()?;
+        let (config, config_backup) = Config::load_or_backup()?;
         let mut sync = SyncController::new();
         if let Some(username) = &config.sync.username {
             match credentials::load_userkey(&config.sync.server_url, username) {
@@ -247,6 +247,12 @@ impl App {
             should_exit: false,
             next_screen: None,
         };
+        if let Some(backup) = config_backup {
+            app.status = Some(format!(
+                "Config file was invalid and was reset; backup: {}",
+                backup.display()
+            ));
+        }
         if let Some(path) = initial_book {
             app.open_book(path)?;
             app.apply_screen_transition();
@@ -2154,8 +2160,9 @@ impl App {
             self.sync.status = Some("Could not map the synced position.".to_owned());
             return;
         };
+        // Manual pulls always show the prompt so `p` never jumps unasked.
         let strategy = if manual {
-            SyncStrategy::Silent
+            SyncStrategy::Prompt
         } else if forward {
             self.config.sync.sync_forward
         } else {

@@ -36,9 +36,22 @@ pub struct SavedPosition {
     pub char_offset: usize,
 }
 
+/// Newest saved positions kept on disk; the stalest are evicted beyond this.
+const MAX_POSITIONS: usize = 500;
+
+/// A saved position plus bookkeeping that only the store cares about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPosition {
+    #[serde(flatten)]
+    position: SavedPosition,
+    /// Unix time of the last save.
+    #[serde(default)]
+    updated: u64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PositionStore {
-    positions: HashMap<PathBuf, SavedPosition>,
+    positions: HashMap<PathBuf, StoredPosition>,
 }
 
 impl PositionStore {
@@ -52,7 +65,10 @@ impl PositionStore {
 
     #[must_use]
     pub fn get(&self, path: &Path) -> SavedPosition {
-        self.positions.get(path).cloned().unwrap_or_default()
+        self.positions
+            .get(path)
+            .map(|stored| stored.position.clone())
+            .unwrap_or_default()
     }
 
     pub fn save_position(
@@ -60,7 +76,24 @@ impl PositionStore {
         path: PathBuf,
         position: SavedPosition,
     ) -> Result<(), CoreError> {
-        self.positions.insert(path, position);
+        self.positions.insert(
+            path,
+            StoredPosition {
+                position,
+                updated: unix_timestamp(),
+            },
+        );
+        while self.positions.len() > MAX_POSITIONS {
+            let Some(stalest) = self
+                .positions
+                .iter()
+                .min_by_key(|(_, stored)| stored.updated)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.positions.remove(&stalest);
+        }
         let destination = state_file("positions.json")?;
         write_json_atomic(&destination, self)?;
         Ok(())
@@ -248,6 +281,22 @@ impl Config {
             return Ok(Self::default());
         }
         Ok(toml::from_str(&fs::read_to_string(path)?)?)
+    }
+
+    /// Load the config; a corrupt file is renamed to `config.toml.bad` and
+    /// replaced with defaults so the app can still start.
+    pub fn load_or_backup() -> Result<(Self, Option<PathBuf>), CoreError> {
+        match Self::load() {
+            Ok(config) => Ok((config, None)),
+            Err(CoreError::TomlDe(_)) => {
+                let path = config_file("config.toml")?;
+                let backup = path.with_extension("toml.bad");
+                let _ = fs::remove_file(&backup);
+                fs::rename(&path, &backup)?;
+                Ok((Self::default(), Some(backup)))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn save(&self) -> Result<(), CoreError> {
@@ -618,6 +667,19 @@ mod tests {
         assert_eq!(parsed.sync.sync_backward, SyncStrategy::Disable);
         assert!(parsed.sync.auto_sync);
         assert!(!parsed.logging.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn position_store_reads_legacy_entries() -> Result<(), CoreError> {
+        // Pre-timestamp entry with the old `block_line` field name.
+        let json =
+            r#"{"positions":{"C:/b.epub":{"chapter_index":2,"block_index":3,"block_line":4}}}"#;
+        let store: PositionStore = serde_json::from_str(json)?;
+        let position = store.get(Path::new("C:/b.epub"));
+        assert_eq!(position.chapter_index, 2);
+        assert_eq!(position.block_index, 3);
+        assert_eq!(position.char_offset, 4);
         Ok(())
     }
 
