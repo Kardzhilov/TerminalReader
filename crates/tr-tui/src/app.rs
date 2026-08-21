@@ -214,10 +214,14 @@ impl App {
         let mut sync = SyncController::new();
         if let Some(username) = &config.sync.username {
             match credentials::load_userkey(&config.sync.server_url, username) {
-                Ok(Some(userkey)) => sync.set_credentials(Some(Credentials {
-                    username: username.clone(),
-                    userkey,
-                })),
+                Ok(Some(userkey)) => {
+                    sync.set_credentials(Some(Credentials {
+                        username: username.clone(),
+                        userkey,
+                    }));
+                    // Retry pushes queued while offline in a previous session.
+                    sync.drain_next(&config.sync);
+                }
                 Ok(None) => logging::warn("sync account configured but keyring has no userkey"),
                 Err(error) => logging::warn(&format!("keyring unavailable: {error}")),
             }

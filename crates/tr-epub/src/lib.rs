@@ -388,7 +388,12 @@ fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
             Ok(Event::End(_)) => {
                 if let Some(element) = stack.pop() {
                     sibling_counts.pop();
-                    let text = normalize_text(&element.text);
+                    // <pre> is the one element where whitespace is meaningful.
+                    let text = if element.name == "pre" {
+                        normalize_pre_text(&element.text)
+                    } else {
+                        normalize_text(&element.text)
+                    };
                     if let Some(block) = block_for_element(&element.name, text, element.alt) {
                         blocks.push(SourcedBlock {
                             block,
@@ -452,6 +457,18 @@ fn normalize_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Keep line structure and indentation, only trimming surrounding blank lines.
+fn normalize_pre_text(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    while lines.first().is_some_and(|line| line.is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 fn attribute(
     element: &quick_xml::events::BytesStart<'_>,
     key: &[u8],
@@ -498,8 +515,29 @@ fn resolve_path(opf_path: &str, href: &str) -> String {
     let base = Path::new(opf_path)
         .parent()
         .unwrap_or_else(|| Path::new(""));
-    let path = base.join(href);
+    // Hrefs are URLs (spaces become %20), ZIP entry names are raw.
+    let path = base.join(percent_decode(href));
     normalize_archive_path(&path)
+}
+
+fn percent_decode(href: &str) -> String {
+    let mut out = Vec::with_capacity(href.len());
+    let mut rest = href.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            if let Some(value) = tail
+                .get(..2)
+                .and_then(|hex| u8::from_str_radix(&String::from_utf8_lossy(hex), 16).ok())
+            {
+                out.push(value);
+                rest = tail.get(2..).unwrap_or_default();
+                continue;
+            }
+        }
+        out.push(byte);
+        rest = tail;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn normalize_archive_path(path: &Path) -> String {
@@ -550,6 +588,33 @@ mod tests {
             resolve_path("OPS/package.opf", "Text/chapter.xhtml"),
             "OPS/Text/chapter.xhtml"
         );
+    }
+
+    #[test]
+    fn resolve_path_decodes_percent_escapes() {
+        assert_eq!(
+            resolve_path("OPS/package.opf", "Text/chapter%20one%20%26%20two.xhtml"),
+            "OPS/Text/chapter one & two.xhtml"
+        );
+        // Malformed escapes pass through verbatim.
+        assert_eq!(resolve_path("", "Text/100%25.xhtml"), "Text/100%.xhtml");
+        assert_eq!(resolve_path("", "Text/50%.xhtml"), "Text/50%.xhtml");
+    }
+
+    #[test]
+    fn pre_blocks_keep_line_structure() {
+        let blocks = parse_chapter(
+            "<html><body><pre>\nfn main() {\n    run();\n}\n</pre><p>After\nthe code.</p></body></html>",
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0].block,
+            Block::Code(text) if text == "fn main() {\n    run();\n}"
+        ));
+        assert!(matches!(
+            &blocks[1].block,
+            Block::Paragraph(text) if text == "After the code."
+        ));
     }
 
     #[test]
