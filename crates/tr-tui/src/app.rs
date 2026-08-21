@@ -1,6 +1,6 @@
 use std::{
-    env,
-    path::PathBuf,
+    env, fs,
+    path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,8 +14,8 @@ use ratatui::{
     widgets::{Block as TuiBlock, Borders, Clear, Paragraph},
 };
 use tr_core::{
-    Config, LibraryBook, PositionStore, RecentBook, RecentsStore, SavedPosition, ScanCache,
-    SyncStrategy, credentials, logging, scan_library_cached,
+    Bookmark, BookmarkStore, Config, LibraryBook, PositionStore, RecentBook, RecentsStore,
+    SavedPosition, ScanCache, StatsStore, SyncStrategy, credentials, logging, scan_library_cached,
 };
 use tr_epub::EpubBook;
 use tr_kosync::{Credentials, ProgressRecord, ProgressUpdate, xpointer::XPointer};
@@ -34,21 +34,27 @@ const STATUS_TTL: Duration = Duration::from_secs(5);
 const PROMPT_GO_LABEL: &str = "[Go to position]";
 const PROMPT_STAY_LABEL: &str = "[Stay here]";
 
-/// Styling that honors the `NO_COLOR` convention.
+/// Styling that honors the `NO_COLOR` convention and the theme config.
 #[derive(Debug, Clone, Copy)]
 struct Palette {
     color: bool,
+    accent: Color,
+    light: bool,
 }
 
 impl Palette {
-    fn detect() -> Self {
+    fn detect(theme: &tr_core::ThemeConfig) -> Self {
         let no_color = env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-        Self { color: !no_color }
+        Self {
+            color: !no_color,
+            accent: accent_color(&theme.accent),
+            light: theme.light,
+        }
     }
 
     fn title(self) -> Style {
         if self.color {
-            Style::new().fg(Color::Cyan)
+            Style::new().fg(self.accent)
         } else {
             Style::new()
         }
@@ -56,7 +62,8 @@ impl Palette {
 
     fn status(self) -> Style {
         if self.color {
-            Style::new().fg(Color::Yellow)
+            // Yellow is unreadable on light backgrounds.
+            Style::new().fg(if self.light { Color::Blue } else { Color::Yellow })
         } else {
             Style::new().add_modifier(Modifier::ITALIC)
         }
@@ -64,7 +71,7 @@ impl Palette {
 
     fn hover(self) -> Style {
         if self.color {
-            Style::new().fg(Color::Black).bg(Color::Cyan)
+            Style::new().fg(Color::Black).bg(self.accent)
         } else {
             Style::new().add_modifier(Modifier::REVERSED)
         }
@@ -72,7 +79,7 @@ impl Palette {
 
     fn heading(self) -> Style {
         if self.color {
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::new().fg(self.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::new().add_modifier(Modifier::BOLD)
         }
@@ -80,7 +87,7 @@ impl Palette {
 
     fn dim(self) -> Style {
         if self.color {
-            Style::new().fg(Color::DarkGray)
+            Style::new().fg(if self.light { Color::Gray } else { Color::DarkGray })
         } else {
             Style::new().add_modifier(Modifier::DIM)
         }
@@ -92,6 +99,20 @@ impl Palette {
         } else {
             Style::new().add_modifier(Modifier::DIM)
         }
+    }
+}
+
+/// Map a configured accent color name to a terminal color.
+fn accent_color(name: &str) -> Color {
+    match name.to_ascii_lowercase().as_str() {
+        "blue" => Color::Blue,
+        "green" => Color::Green,
+        "magenta" => Color::Magenta,
+        "red" => Color::Red,
+        "yellow" => Color::Yellow,
+        "white" => Color::White,
+        "gray" | "grey" => Color::Gray,
+        _ => Color::Cyan,
     }
 }
 
@@ -117,7 +138,7 @@ struct WizardScreen {
 
 #[derive(Debug)]
 struct LibraryScreen {
-    directory: PathBuf,
+    title: String,
     books: Vec<LibraryBook>,
     filter: TextInput,
     selection: usize,
@@ -163,6 +184,13 @@ struct TocState {
     top: usize,
 }
 
+/// Selection state of the bookmarks popup.
+#[derive(Debug, Default)]
+struct BookmarkState {
+    selection: usize,
+    top: usize,
+}
+
 /// A pulled server position awaiting the user's decision.
 #[derive(Debug, Clone)]
 struct SyncPrompt {
@@ -195,6 +223,17 @@ struct ReaderScreen {
     sync_prompt: Option<SyncPrompt>,
     /// Open the next laid-out chapter at its last page (backward page turn).
     open_at_end: bool,
+    /// In-book search input popup, when open.
+    search: Option<TextInput>,
+    /// Positions of all matches from the last search.
+    search_matches: Vec<SavedPosition>,
+    search_index: usize,
+    /// Bookmarks popup, when open.
+    bookmarks_open: Option<BookmarkState>,
+    /// Start of the current reading session, for statistics.
+    session_start: Instant,
+    /// Pages turned this session, for statistics.
+    session_pages: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -213,6 +252,8 @@ enum Action {
     ReaderNext,
     ReaderHome,
     TocSelect(usize),
+    /// Open the image of this block index in the system viewer.
+    OpenImage(usize),
     /// Behave as if this key was pressed on the current screen.
     Key(KeyCode),
     /// Move the focused text input's cursor to the clicked column.
@@ -225,9 +266,13 @@ pub struct App {
     positions: PositionStore,
     recents: RecentsStore,
     scan_cache: ScanCache,
+    bookmarks: BookmarkStore,
+    stats: StatsStore,
     sync: SyncController,
     update: UpdateController,
     palette: Palette,
+    /// Never touch the network; sync is fully disabled.
+    offline: bool,
     screen: Screen,
     hit_targets: Vec<(Rect, Action)>,
     hover: Option<Position>,
@@ -242,11 +287,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(initial_book: Option<PathBuf>) -> Result<Self> {
+    pub fn new(initial_book: Option<PathBuf>, offline: bool) -> Result<Self> {
         let first_run = !Config::exists();
         let (config, config_backup) = Config::load_or_backup()?;
         let mut sync = SyncController::new();
-        if let Some(username) = &config.sync.username {
+        if offline {
+            // Leave the controller signed out so nothing touches the network.
+        } else if let Some(username) = &config.sync.username {
             match credentials::load_userkey(&config.sync.server_url, username) {
                 Ok(Some(userkey)) => {
                     sync.set_credentials(Some(Credentials {
@@ -262,14 +309,18 @@ impl App {
         }
         let show_wizard =
             first_run && config.library.book_dirs.is_empty() && initial_book.is_none();
+        let palette = Palette::detect(&config.theme);
         let mut app = Self {
             config,
             positions: PositionStore::load()?,
             recents: RecentsStore::load()?,
             scan_cache: ScanCache::load(),
+            bookmarks: BookmarkStore::load()?,
+            stats: StatsStore::load()?,
             sync,
             update: UpdateController::new(),
-            palette: Palette::detect(),
+            palette,
+            offline,
             screen: if show_wizard {
                 Screen::Wizard(WizardScreen {
                     input: TextInput::new(default_library_suggestion()),
@@ -292,6 +343,8 @@ impl App {
                 "Config file was invalid and was reset; backup: {}",
                 backup.display()
             ));
+        } else if offline {
+            app.status = Some("Offline mode — sync is disabled.".to_owned());
         }
         if let Some(path) = initial_book {
             app.open_book(path)?;
@@ -761,6 +814,14 @@ impl App {
             }
             return;
         }
+        if reader.search.is_some() {
+            self.handle_search_key(reader, key);
+            return;
+        }
+        if reader.bookmarks_open.is_some() {
+            self.handle_bookmarks_key(reader, key);
+            return;
+        }
         if reader.toc.is_some() {
             match key {
                 KeyCode::Esc => reader.toc = None,
@@ -789,21 +850,7 @@ impl App {
             return;
         }
         match key {
-            KeyCode::Char('q') => {
-                self.leave_reader(reader);
-                self.should_exit = true;
-            }
             KeyCode::Esc => self.leave_reader(reader),
-            KeyCode::Char('t') => reader.open_toc(),
-            KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('s') => Self::push_progress(&self.config, &mut self.sync, reader, true),
-            KeyCode::Char('p') => {
-                if let Some(document) = reader.document_digest.clone() {
-                    self.sync.pull(&self.config.sync, document, true);
-                } else {
-                    self.sync.status = Some("Not signed in.".to_owned());
-                }
-            }
             KeyCode::Char(' ') | KeyCode::PageDown | KeyCode::Right => {
                 reader.next_page();
                 Self::note_page_turn(&self.config, &mut self.sync, reader);
@@ -812,9 +859,223 @@ impl App {
                 reader.previous_page();
                 Self::note_page_turn(&self.config, &mut self.sync, reader);
             }
-            KeyCode::Char(']') => reader.next_chapter(),
-            KeyCode::Char('[') => reader.previous_chapter(),
+            KeyCode::Char(character) => self.handle_reader_char(reader, character),
             _ => {}
+        }
+    }
+
+    /// Dispatch a reader character key through the configurable bindings.
+    fn handle_reader_char(&mut self, reader: &mut ReaderScreen, character: char) {
+        let keys = reader_keys(&self.config.keys);
+        if character == keys.quit {
+            self.leave_reader(reader);
+            self.should_exit = true;
+        } else if character == keys.contents {
+            reader.open_toc();
+        } else if character == '?' {
+            self.help = true;
+        } else if character == keys.search {
+            reader.search = Some(TextInput::default());
+        } else if character == keys.next_match {
+            self.goto_match(reader, true);
+        } else if character == keys.previous_match {
+            self.goto_match(reader, false);
+        } else if character == keys.bookmark_add {
+            self.add_bookmark(reader);
+        } else if character == keys.bookmarks {
+            reader.bookmarks_open = Some(BookmarkState::default());
+        } else if character == keys.sync_push {
+            if self.offline {
+                self.status = Some("Offline mode — sync is disabled.".to_owned());
+            } else {
+                Self::push_progress(&self.config, &mut self.sync, reader, true);
+            }
+        } else if character == keys.sync_pull {
+            if self.offline {
+                self.status = Some("Offline mode — sync is disabled.".to_owned());
+            } else if let Some(document) = reader.document_digest.clone() {
+                self.sync.pull(&self.config.sync, document, true);
+            } else {
+                self.sync.status = Some("Not signed in.".to_owned());
+            }
+        } else if character == keys.sync_toggle {
+            self.toggle_sync_exclusion(reader);
+        } else if character == ']' {
+            reader.next_chapter();
+        } else if character == '[' {
+            reader.previous_chapter();
+        }
+    }
+
+    /// Keys for the search input popup.
+    fn handle_search_key(&mut self, reader: &mut ReaderScreen, key: KeyCode) {
+        match key {
+            KeyCode::Esc => reader.search = None,
+            KeyCode::Enter => {
+                let query = reader
+                    .search
+                    .as_ref()
+                    .map(|input| input.value().trim().to_owned())
+                    .unwrap_or_default();
+                reader.search = None;
+                if !query.is_empty() {
+                    self.run_reader_search(reader, &query);
+                }
+            }
+            _ => {
+                if let Some(input) = &mut reader.search {
+                    let _ = input.handle_key(key);
+                }
+            }
+        }
+    }
+
+    /// Search all chapters and jump to the first match after the current spot.
+    fn run_reader_search(&mut self, reader: &mut ReaderScreen, query: &str) {
+        reader.run_search(query);
+        if reader.search_matches.is_empty() {
+            self.status = Some(format!("No matches for \"{query}\"."));
+            return;
+        }
+        let current = (reader.chapter_index, reader.anchor.0, reader.anchor.1);
+        let start = reader
+            .search_matches
+            .iter()
+            .position(|hit| (hit.chapter_index, hit.block_index, hit.char_offset) > current)
+            .unwrap_or(0);
+        reader.search_index = start;
+        if let Some(position) = reader.search_matches.get(start).cloned() {
+            reader.apply_position(&position);
+        }
+        self.status = Some(format!(
+            "Match {}/{} for \"{query}\" — n/N to move",
+            start + 1,
+            reader.search_matches.len()
+        ));
+    }
+
+    /// Jump to the next or previous search match, wrapping around.
+    fn goto_match(&mut self, reader: &mut ReaderScreen, forward: bool) {
+        let count = reader.search_matches.len();
+        if count == 0 {
+            self.status = Some("No search matches — press / to search.".to_owned());
+            return;
+        }
+        reader.search_index = if forward {
+            (reader.search_index + 1) % count
+        } else {
+            (reader.search_index + count - 1) % count
+        };
+        if let Some(position) = reader.search_matches.get(reader.search_index).cloned() {
+            reader.apply_position(&position);
+        }
+        self.status = Some(format!("Match {}/{}", reader.search_index + 1, count));
+    }
+
+    /// Bookmark the current reading position.
+    fn add_bookmark(&mut self, reader: &mut ReaderScreen) {
+        let chapter_label = reader.chapter_label().map_or_else(
+            || format!("Chapter {}", reader.chapter_index + 1),
+            str::to_owned,
+        );
+        let snippet: String = reader
+            .lines
+            .get(reader.top_line..)
+            .and_then(|rest| rest.iter().find(|line| !line.is_separator()))
+            .map(|line| line.text.trim().chars().take(40).collect())
+            .unwrap_or_default();
+        let label = if snippet.is_empty() {
+            chapter_label
+        } else {
+            format!("{chapter_label} — {snippet}")
+        };
+        let bookmark = Bookmark {
+            chapter_index: reader.chapter_index,
+            block_index: reader.anchor.0,
+            char_offset: reader.anchor.1,
+            label,
+            created: 0,
+        };
+        self.status = Some(match self.bookmarks.add(&reader.path, bookmark) {
+            Ok(()) => "Bookmark added.".to_owned(),
+            Err(error) => format!("Could not save bookmark: {error}"),
+        });
+    }
+
+    /// Keys for the bookmarks popup.
+    fn handle_bookmarks_key(&mut self, reader: &mut ReaderScreen, key: KeyCode) {
+        let count = self.bookmarks.list(&reader.path).len();
+        match key {
+            KeyCode::Esc => reader.bookmarks_open = None,
+            KeyCode::Up => {
+                if let Some(state) = &mut reader.bookmarks_open {
+                    state.selection = state.selection.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(state) = &mut reader.bookmarks_open {
+                    state.selection = (state.selection + 1).min(count.saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                let selection = reader
+                    .bookmarks_open
+                    .as_ref()
+                    .map_or(0, |state| state.selection);
+                if let Some(bookmark) = self.bookmarks.list(&reader.path).get(selection) {
+                    let position = SavedPosition {
+                        chapter_index: bookmark.chapter_index,
+                        block_index: bookmark.block_index,
+                        char_offset: bookmark.char_offset,
+                    };
+                    reader.bookmarks_open = None;
+                    reader.apply_position(&position);
+                }
+            }
+            KeyCode::Delete | KeyCode::Char('d') => {
+                let selection = reader
+                    .bookmarks_open
+                    .as_ref()
+                    .map_or(0, |state| state.selection);
+                match self.bookmarks.remove(&reader.path, selection) {
+                    Ok(true) => {
+                        if let Some(state) = &mut reader.bookmarks_open {
+                            state.selection = state.selection.saturating_sub(1);
+                        }
+                        self.status = Some("Bookmark removed.".to_owned());
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.status = Some(format!("Could not update bookmarks: {error}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Toggle this book on or off the sync exclusion list.
+    fn toggle_sync_exclusion(&mut self, reader: &mut ReaderScreen) {
+        let path = reader.path.clone();
+        if let Some(index) = self
+            .config
+            .sync
+            .excluded_books
+            .iter()
+            .position(|excluded| excluded == &path)
+        {
+            self.config.sync.excluded_books.remove(index);
+            if self.sync.logged_in() {
+                match sync::digest_for(&path, self.config.sync.matching) {
+                    Ok(document) => reader.document_digest = Some(document),
+                    Err(error) => logging::warn(&format!("could not hash document: {error}")),
+                }
+            }
+            self.status = Some(self.save_config_with("Sync enabled for this book.".to_owned()));
+        } else {
+            self.config.sync.excluded_books.push(path);
+            reader.document_digest = None;
+            self.status = Some(self.save_config_with("Sync disabled for this book.".to_owned()));
         }
     }
 
@@ -828,6 +1089,57 @@ impl App {
         if let Screen::Reader(reader) = &mut self.screen {
             if reader.sync_prompt.is_some() {
                 Self::handle_sync_prompt_mouse(reader, mouse, &mut self.sync);
+                return;
+            }
+            if reader.search.is_some() {
+                if matches!(mouse.kind, MouseEventKind::Down(_))
+                    && !reader
+                        .search_area()
+                        .contains(Position::new(mouse.column, mouse.row))
+                {
+                    reader.search = None;
+                }
+                return;
+            }
+            if reader.bookmarks_open.is_some() {
+                let area = reader.toc_area();
+                let count = self.bookmarks.list(&reader.path).len();
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        if let Some(state) = &mut reader.bookmarks_open {
+                            state.selection = state.selection.saturating_sub(1);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if let Some(state) = &mut reader.bookmarks_open {
+                            state.selection = (state.selection + 1).min(count.saturating_sub(1));
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let position = Position::new(mouse.column, mouse.row);
+                        if !area.contains(position) {
+                            reader.bookmarks_open = None;
+                        } else if mouse.row > area.y
+                            && mouse.row < area.y + area.height.saturating_sub(1)
+                        {
+                            let top = reader
+                                .bookmarks_open
+                                .as_ref()
+                                .map_or(0, |state| state.top);
+                            let index = top + usize::from(mouse.row - area.y - 1);
+                            if let Some(bookmark) = self.bookmarks.list(&reader.path).get(index) {
+                                let position = SavedPosition {
+                                    chapter_index: bookmark.chapter_index,
+                                    block_index: bookmark.block_index,
+                                    char_offset: bookmark.char_offset,
+                                };
+                                reader.bookmarks_open = None;
+                                reader.apply_position(&position);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 return;
             }
             if reader.toc.is_some() {
@@ -992,6 +1304,7 @@ impl App {
                     if self.config.sync.auto_sync {
                         Self::push_progress(&self.config, &mut self.sync, reader, false);
                     }
+                    Self::record_session(&mut self.stats, &mut self.status, reader);
                     let position = reader.position();
                     let recent = RecentBook {
                         path: reader.path.clone(),
@@ -1009,6 +1322,12 @@ impl App {
             Action::TocSelect(index) => {
                 if let Screen::Reader(reader) = &mut self.screen {
                     reader.select_filtered_toc(index);
+                }
+            }
+            Action::OpenImage(block) => {
+                if let Screen::Reader(reader) = &mut self.screen {
+                    let message = open_reader_image(reader, block);
+                    self.status = Some(message);
                 }
             }
             Action::SelectLibraryDir(index) => {
@@ -1038,7 +1357,7 @@ impl App {
             Screen::Wizard(wizard) => self.draw_wizard(frame, wizard),
         }
         if self.help {
-            Self::draw_help(frame, &screen);
+            self.draw_help(frame, &screen);
         }
         self.screen = screen;
     }
@@ -1074,55 +1393,83 @@ impl App {
         );
     }
 
-    fn draw_help(frame: &mut Frame, screen: &Screen) {
+    fn draw_help(&self, frame: &mut Frame, screen: &Screen) {
         let area = frame.area();
-        let mut rows: Vec<&str> = vec![
-            "Global",
-            "  F1 / ?      toggle this help",
-            "  Esc         back / close",
-            "",
+        let mut rows: Vec<String> = vec![
+            "Global".to_owned(),
+            "  F1 / ?      toggle this help".to_owned(),
+            "  Esc         back / close".to_owned(),
+            String::new(),
         ];
         match screen {
-            Screen::Home(_) => rows.extend([
-                "Home",
-                "  arrows      move selection",
-                "  Enter       open selection",
-                "  Del         remove selection from Recent",
-                "  s           settings",
-                "  q           quit",
-            ]),
-            Screen::Library(_) => rows.extend([
-                "Library",
-                "  type        filter books",
-                "  arrows      move selection",
-                "  Enter       open book",
-            ]),
-            Screen::Settings(_) => rows.extend([
-                "Settings",
-                "  a/d         add / remove library",
-                "  w j m       max width / justify / ASCII mode",
-                "  u c         sync server / matching method",
-                "  f b t       forward / backward / auto sync",
-                "  g e         push every N pages / N minutes",
-                "  l r o n     login / register / logout / device name",
-                "  v i         check for updates / install update",
-            ]),
-            Screen::Reader(_) => rows.extend([
-                "Reader",
-                "  Space PgDn →   next page",
-                "  PgUp ←         previous page",
-                "  [ ]            previous / next chapter",
-                "  t              table of contents",
-                "  s              push progress now",
-                "  p              pull progress now",
-                "  Esc            save and go home",
-                "  q              save and quit",
-            ]),
-            Screen::Wizard(_) => rows.extend([
-                "Setup",
-                "  Enter       save library directory",
-                "  Esc         skip",
-            ]),
+            Screen::Home(_) => rows.extend(
+                [
+                    "Home",
+                    "  arrows      move selection",
+                    "  Enter       open selection",
+                    "  Del         remove selection from Recent",
+                    "  s           settings",
+                    "  q           quit",
+                ]
+                .map(String::from),
+            ),
+            Screen::Library(_) => rows.extend(
+                [
+                    "Library",
+                    "  type        filter books",
+                    "  arrows      move selection",
+                    "  Enter       open book",
+                ]
+                .map(String::from),
+            ),
+            Screen::Settings(_) => rows.extend(
+                [
+                    "Settings",
+                    "  a/d         add / remove library",
+                    "  w j m       max width / justify / ASCII mode",
+                    "  u c         sync server / matching method",
+                    "  f b t       forward / backward / auto sync",
+                    "  g e         push every N pages / N minutes",
+                    "  l r o n     login / register / logout / device name",
+                    "  v i         check for updates / install update",
+                ]
+                .map(String::from),
+            ),
+            Screen::Reader(_) => {
+                let keys = reader_keys(&self.config.keys);
+                rows.extend([
+                    "Reader".to_owned(),
+                    "  Space PgDn →   next page".to_owned(),
+                    "  PgUp ←         previous page".to_owned(),
+                    "  [ ]            previous / next chapter".to_owned(),
+                    format!("  {}              table of contents", keys.contents),
+                    format!("  {}              search in this book", keys.search),
+                    format!(
+                        "  {} / {}          next / previous match",
+                        keys.next_match, keys.previous_match
+                    ),
+                    format!(
+                        "  {} / {}          add bookmark / show bookmarks",
+                        keys.bookmark_add, keys.bookmarks
+                    ),
+                    format!(
+                        "  {} {}            push / pull progress now",
+                        keys.sync_push, keys.sync_pull
+                    ),
+                    format!("  {}              toggle sync for this book", keys.sync_toggle),
+                    "  click image    open image in system viewer".to_owned(),
+                    "  Esc            save and go home".to_owned(),
+                    format!("  {}              save and quit", keys.quit),
+                ]);
+            }
+            Screen::Wizard(_) => rows.extend(
+                [
+                    "Setup",
+                    "  Enter       save library directory",
+                    "  Esc         skip",
+                ]
+                .map(String::from),
+            ),
         }
         let width = area.width.saturating_sub(8).clamp(44, 60);
         let height = u16::try_from(rows.len() + 2)
@@ -1143,6 +1490,7 @@ impl App {
         frame.render_widget(widget, popup);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn draw_home(&mut self, frame: &mut Frame, home: &mut HomeScreen) {
         let area = frame.area();
         let continue_row = self
@@ -1150,8 +1498,14 @@ impl App {
             .most_recent()
             .filter(|recent| recent.path.exists())
             .map(|recent| {
+                let stats = self.stats.get(&recent.path);
+                let read = if stats.seconds > 0 {
+                    format!(" — {} read", format_duration(stats.seconds))
+                } else {
+                    String::new()
+                };
                 format!(
-                    "{} — ch. {}/{}",
+                    "{} — ch. {}/{}{read}",
                     recent.title,
                     recent.last_chapter + 1,
                     recent.spine_count
@@ -1194,6 +1548,15 @@ impl App {
         }
         rows.push(String::new());
         rows.push("Libraries".to_owned());
+        if self.config.library.book_dirs.len() > 1 {
+            self.register_row(area, rows.len(), Action::HomeOpen(index));
+            rows.push(Self::selectable_row(
+                home.selection,
+                index,
+                &format!("All books ({} libraries)", self.config.library.book_dirs.len()),
+            ));
+            index += 1;
+        }
         for text in &dir_rows {
             self.register_row(area, rows.len(), Action::HomeOpen(index));
             rows.push(Self::selectable_row(home.selection, index, text));
@@ -1269,7 +1632,7 @@ impl App {
         self.register_footer(area, footer, &[("[Home]", Action::LibraryHome)]);
         let block = TuiBlock::default()
             .borders(Borders::ALL)
-            .title(format!(" Library: {} ", library.directory.display()))
+            .title(format!(" Library: {} ", library.title))
             .title_style(self.palette.title())
             .title_bottom(self.styled_footer(area, footer));
         frame.render_widget(
@@ -1568,12 +1931,16 @@ impl App {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     fn draw_reader(&mut self, frame: &mut Frame, reader: &mut ReaderScreen) {
         let area = frame.area();
         let options = LayoutOptions {
             ascii_only: self.config.reading.ascii_only,
             justify: self.config.reading.justify,
             max_width: self.config.reading.max_width,
+            line_spacing: self.config.reading.line_spacing,
+            paragraph_spacing: self.config.reading.paragraph_spacing,
+            indent: self.config.reading.indent,
         };
         reader.ensure_layout(area.width, area.height, options);
         let (page, count) = reader.page_numbers();
@@ -1645,13 +2012,86 @@ impl App {
                 UiLine::from(line.text.clone()).style(style)
             })
             .collect();
+        // Image boxes with a source are clickable: open in the system viewer.
+        for (row, line) in reader.visible_lines().iter().enumerate() {
+            if !line.atomic {
+                continue;
+            }
+            if let Some(tr_epub::Block::Image { href: Some(_), .. }) =
+                reader.blocks.get(line.block)
+            {
+                if let Some(y) = self.content_row_y(area, row) {
+                    self.hit_targets.push((
+                        Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1),
+                        Action::OpenImage(line.block),
+                    ));
+                }
+            }
+        }
         frame.render_widget(Paragraph::new(Text::from(content)).block(block), area);
         if reader.toc.is_some() {
             self.draw_reader_toc(frame, reader);
         }
+        if reader.search.is_some() {
+            Self::draw_search(frame, reader);
+        }
+        if reader.bookmarks_open.is_some() {
+            self.draw_bookmarks(frame, reader);
+        }
         if reader.sync_prompt.is_some() {
             self.draw_sync_prompt(frame, reader);
         }
+    }
+
+    fn draw_search(frame: &mut Frame, reader: &ReaderScreen) {
+        let Some(input) = &reader.search else { return };
+        let area = reader.search_area();
+        let text = format!(
+            "{}\nEnter: search all chapters | Esc: close",
+            input.render("Find: ")
+        );
+        let widget = Paragraph::new(text).block(
+            TuiBlock::default()
+                .borders(Borders::ALL)
+                .title(" Search "),
+        );
+        frame.render_widget(Clear, area);
+        frame.render_widget(widget, area);
+    }
+
+    fn draw_bookmarks(&mut self, frame: &mut Frame, reader: &mut ReaderScreen) {
+        let area = reader.toc_area();
+        let entries = self.bookmarks.list(&reader.path);
+        let visible = usize::from(area.height.saturating_sub(2)).max(1);
+        let Some(state) = &mut reader.bookmarks_open else {
+            return;
+        };
+        state.selection = state.selection.min(entries.len().saturating_sub(1));
+        if state.selection < state.top {
+            state.top = state.selection;
+        } else if state.selection >= state.top + visible {
+            state.top = state.selection + 1 - visible;
+        }
+        let mut rows = Vec::new();
+        if entries.is_empty() {
+            rows.push("No bookmarks yet — press m in the reader to add one.".to_owned());
+        }
+        for (index, bookmark) in entries.iter().enumerate().skip(state.top).take(visible) {
+            let marker = if index == state.selection { '>' } else { ' ' };
+            rows.push(format!(
+                "{marker} ch. {:>3}  {}",
+                bookmark.chapter_index + 1,
+                bookmark.label
+            ));
+        }
+        let widget = Paragraph::new(rows.join("\n")).block(
+            TuiBlock::default().borders(Borders::ALL).title(format!(
+                " Bookmarks ({}) — Enter: go, d: delete, Esc: close ",
+                entries.len()
+            )),
+        );
+        frame.render_widget(Clear, area);
+        frame.render_widget(widget, area);
     }
 
     fn draw_sync_prompt(&self, frame: &mut Frame, reader: &ReaderScreen) {
@@ -1907,6 +2347,7 @@ impl App {
                 .most_recent()
                 .is_some_and(|recent| recent.path.exists()),
         ) + self.recents.list().len()
+            + usize::from(self.config.library.book_dirs.len() > 1)
             + self.config.library.book_dirs.len()
             + 1
     }
@@ -1934,6 +2375,13 @@ impl App {
             return;
         }
         cursor += self.recents.list().len();
+        if self.config.library.book_dirs.len() > 1 {
+            if index == cursor {
+                self.open_aggregated_library();
+                return;
+            }
+            cursor += 1;
+        }
         if let Some(directory) = self
             .config
             .library
@@ -1946,7 +2394,7 @@ impl App {
                 logging::warn(&format!("could not save scan cache: {error}"));
             }
             self.next_screen = Some(Screen::Library(LibraryScreen {
-                directory,
+                title: directory.display().to_string(),
                 books,
                 filter: TextInput::default(),
                 selection: 0,
@@ -1957,6 +2405,28 @@ impl App {
         self.next_screen = Some(Screen::Settings(SettingsScreen {
             mode: SettingsMode::AddingLibrary,
             ..SettingsScreen::default()
+        }));
+    }
+
+    /// One merged, deduplicated, title-sorted list across all book dirs.
+    fn open_aggregated_library(&mut self) {
+        let directories = self.config.library.book_dirs.clone();
+        let mut books = Vec::new();
+        for directory in &directories {
+            books.extend(scan_library_cached(directory, &mut self.scan_cache));
+        }
+        if let Err(error) = self.scan_cache.save() {
+            logging::warn(&format!("could not save scan cache: {error}"));
+        }
+        books.sort_by(|left, right| left.path.cmp(&right.path));
+        books.dedup_by(|left, right| left.path == right.path);
+        books.sort_by(|left, right| left.metadata.title.cmp(&right.metadata.title));
+        self.next_screen = Some(Screen::Library(LibraryScreen {
+            title: format!("All books ({} libraries)", directories.len()),
+            books,
+            filter: TextInput::default(),
+            selection: 0,
+            top: 0,
         }));
     }
 
@@ -2018,7 +2488,10 @@ impl App {
         };
         self.recents.touch(recent)?;
         let mut reader = ReaderScreen::new(path, book, &position);
-        if self.sync.logged_in() {
+        let excluded = self.config.sync.excluded_books.contains(&reader.path);
+        if excluded {
+            self.status = Some("Sync is disabled for this book — press x to enable.".to_owned());
+        } else if self.sync.logged_in() {
             match sync::digest_for(&reader.path, self.config.sync.matching) {
                 Ok(document) => {
                     reader.document_digest = Some(document.clone());
@@ -2037,6 +2510,7 @@ impl App {
         if self.config.sync.auto_sync {
             Self::push_progress(&self.config, &mut self.sync, reader, false);
         }
+        Self::record_session(&mut self.stats, &mut self.status, reader);
         let position = reader.position();
         let recent = RecentBook {
             path: reader.path.clone(),
@@ -2108,12 +2582,35 @@ impl App {
     /// Count a page turn and push when the configured interval is reached.
     fn note_page_turn(config: &Config, sync: &mut SyncController, reader: &mut ReaderScreen) {
         reader.page_turns += 1;
+        reader.session_pages += 1;
         if let Some(pages) = config.sync.pages_before_update {
             if pages > 0 && reader.page_turns >= pages {
                 reader.page_turns = 0;
                 Self::push_progress(config, sync, reader, false);
             }
         }
+    }
+
+    /// Add the finished session to the book's reading statistics.
+    fn record_session(
+        stats: &mut StatsStore,
+        footer_status: &mut Option<String>,
+        reader: &mut ReaderScreen,
+    ) {
+        let seconds = reader.session_start.elapsed().as_secs();
+        let pages = std::mem::take(&mut reader.session_pages);
+        reader.session_start = Instant::now();
+        if pages == 0 && seconds < 30 {
+            return;
+        }
+        if let Err(error) = stats.record(&reader.path, seconds, pages) {
+            logging::warn(&format!("could not save reading stats: {error}"));
+            return;
+        }
+        *footer_status = Some(format!(
+            "Read {} this session ({pages} pages).",
+            format_duration(seconds)
+        ));
     }
 
     /// Push on a timer so progress isn't lost when the app never exits
@@ -2316,6 +2813,129 @@ fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
+/// The reader's character keys with config overrides applied.
+struct ReaderKeys {
+    contents: char,
+    search: char,
+    next_match: char,
+    previous_match: char,
+    bookmark_add: char,
+    bookmarks: char,
+    sync_push: char,
+    sync_pull: char,
+    sync_toggle: char,
+    quit: char,
+}
+
+fn reader_keys(keys: &tr_core::KeyBindings) -> ReaderKeys {
+    ReaderKeys {
+        contents: keys.contents.unwrap_or('t'),
+        search: keys.search.unwrap_or('/'),
+        next_match: keys.next_match.unwrap_or('n'),
+        previous_match: keys.previous_match.unwrap_or('N'),
+        bookmark_add: keys.bookmark_add.unwrap_or('m'),
+        bookmarks: keys.bookmarks.unwrap_or('M'),
+        sync_push: keys.sync_push.unwrap_or('s'),
+        sync_pull: keys.sync_pull.unwrap_or('p'),
+        sync_toggle: keys.sync_toggle.unwrap_or('x'),
+        quit: keys.quit.unwrap_or('q'),
+    }
+}
+
+/// Human-readable reading duration: "under a minute", "N min", "N h M min".
+fn format_duration(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    match minutes {
+        0 => "under a minute".to_owned(),
+        1..=59 => format!("{minutes} min"),
+        _ => format!("{} h {} min", minutes / 60, minutes % 60),
+    }
+}
+
+/// Byte offsets of case-insensitive occurrences of `query` in `text`.
+///
+/// Compares char-by-char so offsets stay valid even when lowercasing
+/// changes byte lengths.
+fn find_matches(text: &str, query: &str) -> Vec<usize> {
+    let query_chars: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if query_chars.is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for (offset, _) in text.char_indices() {
+        let mut haystack = text
+            .get(offset..)
+            .unwrap_or_default()
+            .chars()
+            .flat_map(char::to_lowercase);
+        if query_chars
+            .iter()
+            .all(|&expected| haystack.next() == Some(expected))
+        {
+            found.push(offset);
+        }
+    }
+    found
+}
+
+/// Extract the clicked image to a temp file and open it with the OS default
+/// handler for its file type. Returns a status message.
+fn open_reader_image(reader: &mut ReaderScreen, block: usize) -> String {
+    let href = match reader.blocks.get(block) {
+        Some(tr_epub::Block::Image {
+            href: Some(href), ..
+        }) => href.clone(),
+        _ => return "Image has no source to open.".to_owned(),
+    };
+    let (archive_path, bytes) = match reader.book.resource_bytes(reader.chapter_index, &href) {
+        Ok(resource) => resource,
+        Err(error) => return format!("Could not read image: {error}"),
+    };
+    let name = sanitize_file_name(archive_path.rsplit('/').next().unwrap_or("image"));
+    let directory = env::temp_dir().join("terminalreader");
+    if let Err(error) = fs::create_dir_all(&directory) {
+        return format!("Could not create temp folder: {error}");
+    }
+    let target = directory.join(&name);
+    if let Err(error) = fs::write(&target, bytes) {
+        return format!("Could not write image: {error}");
+    }
+    match open_with_system_viewer(&target) {
+        Ok(()) => format!("Opened {name} in the system viewer."),
+        Err(error) => format!("Could not open the system viewer: {error}"),
+    }
+}
+
+/// Keep only safe filename characters, preserving the extension so the OS
+/// picks the right viewer.
+fn sanitize_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+        .collect();
+    if cleaned.trim_matches('.').is_empty() {
+        "image.bin".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// Open a file with the platform's default application, detached.
+fn open_with_system_viewer(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let program = "xdg-open";
+    std::process::Command::new(program)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+}
+
 /// One Recent list row: title — authors — ch. x/y — 2 days ago (missing).
 fn recent_row(recent: &RecentBook) -> String {
     let authors = if recent.authors.is_empty() {
@@ -2398,6 +3018,12 @@ impl ReaderScreen {
             last_pushed_progress: None,
             sync_prompt: None,
             open_at_end: false,
+            search: None,
+            search_matches: Vec::new(),
+            search_index: 0,
+            bookmarks_open: None,
+            session_start: Instant::now(),
+            session_pages: 0,
         }
     }
 
@@ -2668,6 +3294,42 @@ impl ReaderScreen {
             width,
             height,
         )
+    }
+    fn search_area(&self) -> Rect {
+        let width = self.width.saturating_sub(8).clamp(30, 50);
+        let height = 4;
+        Rect::new(
+            (self.width.saturating_sub(width)) / 2,
+            (self.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        )
+    }
+    /// Collect case-insensitive matches for `query` across all chapters.
+    fn run_search(&mut self, query: &str) {
+        const MATCH_CAP: usize = 250;
+        self.search_matches.clear();
+        self.search_index = 0;
+        'chapters: for chapter_index in 0..self.book.spine.len() {
+            let Ok(blocks) = self.book.chapter_blocks(chapter_index) else {
+                continue;
+            };
+            for (block_index, sourced) in blocks.iter().enumerate() {
+                let Some(text) = sync::block_text(&sourced.block) else {
+                    continue;
+                };
+                for char_offset in find_matches(text, query) {
+                    self.search_matches.push(SavedPosition {
+                        chapter_index,
+                        block_index,
+                        char_offset,
+                    });
+                    if self.search_matches.len() >= MATCH_CAP {
+                        break 'chapters;
+                    }
+                }
+            }
+        }
     }
     fn toc_visible_rows(&self) -> usize {
         usize::from(self.toc_area().height.saturating_sub(3)).max(1)

@@ -58,7 +58,10 @@ pub enum Block {
     Quote(String),
     Code(String),
     Rule,
-    Image { alt: Option<String> },
+    Image {
+        alt: Option<String>,
+        href: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,12 +86,20 @@ impl EpubBook {
         let opf_path = parse_rootfile(&container)?.ok_or(EpubError::Missing("OPF rootfile"))?;
         let opf = read_entry(&mut archive, &opf_path)?;
         let parsed = parse_opf(&opf, &opf_path)?;
-        let toc = if let Some(nav_path) = &parsed.nav_path {
+        let mut toc = if let Some(nav_path) = &parsed.nav_path {
             let nav = read_entry(&mut archive, nav_path)?;
             parse_nav(&nav, nav_path, &parsed.spine)?
         } else {
             Vec::new()
         };
+        // EPUB 2 fallback: books without a nav document ship an NCX instead.
+        if toc.is_empty() {
+            if let Some(ncx_path) = &parsed.ncx_path {
+                if let Ok(ncx) = read_entry(&mut archive, ncx_path) {
+                    toc = parse_ncx(&ncx, ncx_path, &parsed.spine)?;
+                }
+            }
+        }
 
         Ok(Self {
             archive,
@@ -108,13 +119,35 @@ impl EpubBook {
         let chapter = read_entry(&mut self.archive, &path)?;
         Ok(parse_chapter(&chapter))
     }
+
+    /// Read a resource referenced from a chapter (e.g. an image `src`),
+    /// returning its archive path and raw bytes.
+    pub fn resource_bytes(
+        &mut self,
+        chapter_index: usize,
+        href: &str,
+    ) -> Result<(String, Vec<u8>), EpubError> {
+        let chapter_path = self
+            .spine
+            .get(chapter_index)
+            .ok_or(EpubError::Missing("spine item"))?
+            .path
+            .clone();
+        let path = resolve_path(&chapter_path, href);
+        let bytes = read_entry_bytes(&mut self.archive, &path)?;
+        Ok((path, bytes))
+    }
 }
 
 fn read_entry(archive: &mut ZipArchive<File>, path: &str) -> Result<String, EpubError> {
+    Ok(String::from_utf8(read_entry_bytes(archive, path)?)?)
+}
+
+fn read_entry_bytes(archive: &mut ZipArchive<File>, path: &str) -> Result<Vec<u8>, EpubError> {
     let mut entry = archive.by_name(path)?;
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes)?;
-    Ok(String::from_utf8(bytes)?)
+    Ok(bytes)
 }
 
 fn parse_rootfile(xml: &str) -> Result<Option<String>, EpubError> {
@@ -143,6 +176,7 @@ struct ParsedOpf {
     metadata: BookMetadata,
     spine: Vec<SpineItem>,
     nav_path: Option<String>,
+    ncx_path: Option<String>,
 }
 
 fn parse_opf(xml: &str, opf_path: &str) -> Result<ParsedOpf, EpubError> {
@@ -151,6 +185,7 @@ fn parse_opf(xml: &str, opf_path: &str) -> Result<ParsedOpf, EpubError> {
     let mut buf = Vec::new();
     let mut manifest = HashMap::new();
     let mut nav_path = None;
+    let mut ncx_path = None;
     let mut spine_refs = Vec::new();
     let mut title = String::new();
     let mut authors = Vec::new();
@@ -164,7 +199,13 @@ fn parse_opf(xml: &str, opf_path: &str) -> Result<ParsedOpf, EpubError> {
                     current_text_tag = Some(name.clone());
                 }
                 if name == "item" {
-                    record_manifest_item(&element, opf_path, &mut manifest, &mut nav_path)?;
+                    record_manifest_item(
+                        &element,
+                        opf_path,
+                        &mut manifest,
+                        &mut nav_path,
+                        &mut ncx_path,
+                    )?;
                 }
                 if name == "itemref" {
                     let idref = attribute(&element, b"idref")?;
@@ -177,7 +218,13 @@ fn parse_opf(xml: &str, opf_path: &str) -> Result<ParsedOpf, EpubError> {
             Event::Empty(element) => {
                 let name = local_name(element.name().as_ref());
                 if name == "item" {
-                    record_manifest_item(&element, opf_path, &mut manifest, &mut nav_path)?;
+                    record_manifest_item(
+                        &element,
+                        opf_path,
+                        &mut manifest,
+                        &mut nav_path,
+                        &mut ncx_path,
+                    )?;
                 }
                 if name == "itemref" {
                     let idref = attribute(&element, b"idref")?;
@@ -233,6 +280,7 @@ fn parse_opf(xml: &str, opf_path: &str) -> Result<ParsedOpf, EpubError> {
         },
         spine,
         nav_path,
+        ncx_path,
     })
 }
 
@@ -241,6 +289,7 @@ fn record_manifest_item(
     opf_path: &str,
     manifest: &mut HashMap<String, String>,
     nav_path: &mut Option<String>,
+    ncx_path: &mut Option<String>,
 ) -> Result<(), EpubError> {
     let (Some(id), Some(href)) = (attribute(element, b"id")?, attribute(element, b"href")?) else {
         return Ok(());
@@ -253,8 +302,75 @@ fn record_manifest_item(
     }) {
         *nav_path = Some(path.clone());
     }
+    if attribute(element, b"media-type")?.as_deref() == Some("application/x-dtbncx+xml") {
+        *ncx_path = Some(path.clone());
+    }
     manifest.insert(id, path);
     Ok(())
+}
+
+/// Parse an EPUB 2 NCX document (`navMap` > `navPoint` > `navLabel`/`content`).
+fn parse_ncx(xml: &str, ncx_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEntry>, EpubError> {
+    let mut reader = Reader::from_reader(Cursor::new(xml));
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_nav_map = false;
+    let mut in_label = false;
+    let mut label = String::new();
+    let mut pending_label = None::<String>;
+    let mut entries = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(element) => match local_name(element.name().as_ref()).as_str() {
+                "navmap" => in_nav_map = true,
+                "navlabel" if in_nav_map => {
+                    in_label = true;
+                    label.clear();
+                }
+                _ => {}
+            },
+            Event::Text(text) => {
+                if in_label {
+                    label.push_str(text.xml_content(quick_xml::XmlVersion::Implicit1_0)?.trim());
+                }
+            }
+            Event::CData(data) => {
+                if in_label {
+                    label.push_str(&String::from_utf8_lossy(&data.into_inner()));
+                }
+            }
+            Event::Empty(element) => {
+                if in_nav_map && local_name(element.name().as_ref()) == "content" {
+                    if let (Some(label), Some(src)) =
+                        (pending_label.take(), attribute(&element, b"src")?)
+                    {
+                        let target =
+                            resolve_path(ncx_path, src.split('#').next().unwrap_or_default());
+                        if let Some(spine_index) =
+                            spine.iter().position(|item| item.path == target)
+                        {
+                            if !label.is_empty() {
+                                entries.push(TocEntry { label, spine_index });
+                            }
+                        }
+                    }
+                }
+            }
+            Event::End(element) => match local_name(element.name().as_ref()).as_str() {
+                "navmap" => in_nav_map = false,
+                "navlabel" if in_label => {
+                    in_label = false;
+                    pending_label = Some(normalize_text(&label));
+                }
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(entries)
 }
 
 fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEntry>, EpubError> {
@@ -339,16 +455,22 @@ fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
                     *count += 1;
                     *count
                 });
-                let alt = if name == "img" {
-                    attribute(&element, b"alt").ok().flatten()
+                let (alt, href) = if name == "img" {
+                    (
+                        attribute(&element, b"alt").ok().flatten(),
+                        attribute(&element, b"src").ok().flatten(),
+                    )
+                } else if name == "image" {
+                    (None, attribute_local(&element, b"href").ok().flatten())
                 } else {
-                    None
+                    (None, None)
                 };
                 stack.push(ElementState {
                     name,
                     ordinal,
                     text: String::new(),
                     alt,
+                    href,
                 });
                 sibling_counts.push(HashMap::new());
             }
@@ -356,8 +478,13 @@ fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
                 let name = local_name(element.name().as_ref());
                 if name == "img" || name == "image" || name == "svg" {
                     let alt = attribute(&element, b"alt").ok().flatten();
+                    let href = if name == "img" {
+                        attribute(&element, b"src").ok().flatten()
+                    } else {
+                        attribute_local(&element, b"href").ok().flatten()
+                    };
                     blocks.push(SourcedBlock {
-                        block: Block::Image { alt },
+                        block: Block::Image { alt, href },
                         source_path: source_path(&stack, &name, 1),
                     });
                 } else if name == "hr" {
@@ -394,7 +521,9 @@ fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
                     } else {
                         normalize_text(&element.text)
                     };
-                    if let Some(block) = block_for_element(&element.name, text, element.alt) {
+                    if let Some(block) =
+                        block_for_element(&element.name, text, element.alt, element.href)
+                    {
                         blocks.push(SourcedBlock {
                             block,
                             source_path: source_path(&stack, &element.name, element.ordinal),
@@ -418,9 +547,15 @@ struct ElementState {
     ordinal: usize,
     text: String,
     alt: Option<String>,
+    href: Option<String>,
 }
 
-fn block_for_element(name: &str, text: String, alt: Option<String>) -> Option<Block> {
+fn block_for_element(
+    name: &str,
+    text: String,
+    alt: Option<String>,
+    href: Option<String>,
+) -> Option<Block> {
     match name {
         "p" | "li" | "td" | "figcaption" if !text.is_empty() => Some(Block::Paragraph(text)),
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" if !text.is_empty() => {
@@ -434,7 +569,7 @@ fn block_for_element(name: &str, text: String, alt: Option<String>) -> Option<Bl
         "pre" if !text.is_empty() => Some(Block::Code(text)),
         "hr" => Some(Block::Rule),
         // svg is only handled as Event::Empty; a non-empty <svg> defers to its inner <image>
-        "img" | "image" => Some(Block::Image { alt }),
+        "img" | "image" => Some(Block::Image { alt, href }),
         _ => None,
     }
 }
@@ -642,5 +777,57 @@ mod tests {
         assert_eq!(toc[1].spine_index, 1);
         assert_eq!(toc[1].label, "The Time I Fought 30 Snakes");
         Ok(())
+    }
+
+    #[test]
+    fn parses_epub2_ncx_titles() -> Result<(), EpubError> {
+        let spine = vec![
+            SpineItem {
+                path: "OPS/Text/one.xhtml".to_owned(),
+                linear: true,
+            },
+            SpineItem {
+                path: "OPS/Text/two.xhtml".to_owned(),
+                linear: true,
+            },
+        ];
+        let ncx = r#"<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+            <navMap>
+                <navPoint id="n1" playOrder="1">
+                    <navLabel><text>First Steps</text></navLabel>
+                    <content src="Text/one.xhtml"/>
+                    <navPoint id="n2" playOrder="2">
+                        <navLabel><text>Nested Finale</text></navLabel>
+                        <content src="Text/two.xhtml#part"/>
+                    </navPoint>
+                </navPoint>
+            </navMap>
+        </ncx>"#;
+
+        let toc = parse_ncx(ncx, "OPS/toc.ncx", &spine)?;
+        assert_eq!(toc.len(), 2);
+        assert_eq!(toc[0].label, "First Steps");
+        assert_eq!(toc[0].spine_index, 0);
+        assert_eq!(toc[1].label, "Nested Finale");
+        assert_eq!(toc[1].spine_index, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn image_blocks_capture_href() {
+        let blocks = parse_chapter(
+            "<html><body><img src='../Images/map.png' alt='Map'/><svg><image xlink:href='cover.jpg'/></svg></body></html>",
+        );
+        let hrefs: Vec<Option<&str>> = blocks
+            .iter()
+            .filter_map(|block| match &block.block {
+                Block::Image { href, .. } => Some(href.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            hrefs,
+            vec![Some("../Images/map.png"), Some("cover.jpg")]
+        );
     }
 }

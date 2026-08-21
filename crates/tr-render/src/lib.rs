@@ -26,13 +26,32 @@ impl Line {
 }
 
 /// Layout preferences beyond the terminal width.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct LayoutOptions {
     pub ascii_only: bool,
     /// Pad spaces between words so paragraph lines fill the content width.
     pub justify: bool,
     /// Cap on content width in columns, independent of the terminal width.
     pub max_width: Option<u16>,
+    /// Rows per text line: 1 = single spacing, 2 = double spacing.
+    pub line_spacing: u16,
+    /// Blank rows between blocks.
+    pub paragraph_spacing: u16,
+    /// First-line paragraph indent in columns.
+    pub indent: u16,
+}
+
+impl Default for LayoutOptions {
+    fn default() -> Self {
+        Self {
+            ascii_only: false,
+            justify: false,
+            max_width: None,
+            line_spacing: 1,
+            paragraph_spacing: 1,
+            indent: 0,
+        }
+    }
 }
 
 /// Lay a chapter out as a flat list of wrapped lines for the given width.
@@ -55,35 +74,87 @@ pub fn layout_with(blocks: &[Block], width: u16, options: LayoutOptions) -> Vec<
     let content_width = options
         .max_width
         .map_or(terminal_width, |cap| terminal_width.min(usize::from(cap)));
+    let line_spacing = usize::from(options.line_spacing.clamp(1, 3));
+    let paragraph_spacing = usize::from(options.paragraph_spacing.min(3));
+    let indent = usize::from(options.indent.min(8)).min(content_width.saturating_sub(10));
     let mut lines = Vec::new();
     for (index, block) in blocks.iter().enumerate() {
-        let mut rendered = render_block(block, content_width, options.ascii_only);
-        if options.justify {
-            justify_lines(block, &mut rendered, content_width);
-        }
+        let rendered = if indent > 0 && matches!(block, Block::Paragraph(_)) {
+            render_indented_paragraph(block, content_width, indent, options.justify)
+        } else {
+            let mut rendered = render_block(block, content_width, options.ascii_only);
+            if options.justify {
+                justify_lines(block, &mut rendered, content_width);
+            }
+            rendered
+        };
         if rendered.is_empty() {
             continue;
         }
         if !lines.is_empty() {
             // Keyed to the previous block so anchor ordering stays monotonic.
-            lines.push(Line {
-                text: String::new(),
-                block: index.saturating_sub(1),
-                char_offset: SEPARATOR_OFFSET,
-                atomic: false,
-            });
+            for _ in 0..paragraph_spacing {
+                lines.push(Line {
+                    text: String::new(),
+                    block: index.saturating_sub(1),
+                    char_offset: SEPARATOR_OFFSET,
+                    atomic: false,
+                });
+            }
         }
         let atomic = matches!(block, Block::Image { .. });
-        for (text, char_offset) in rendered {
+        let last = rendered.len().saturating_sub(1);
+        for (line_index, (text, char_offset)) in rendered.into_iter().enumerate() {
             lines.push(Line {
                 text,
                 block: index,
                 char_offset,
                 atomic,
             });
+            if !atomic && line_index != last {
+                for _ in 1..line_spacing {
+                    lines.push(Line {
+                        text: String::new(),
+                        block: index,
+                        char_offset: SEPARATOR_OFFSET,
+                        atomic: false,
+                    });
+                }
+            }
         }
     }
     lines
+}
+
+/// Wrap a paragraph with a first-line indent, justifying before the indent
+/// is prepended so first-word byte offsets stay valid reflow anchors.
+fn render_indented_paragraph(
+    block: &Block,
+    width: usize,
+    indent: usize,
+    justify: bool,
+) -> Vec<(String, usize)> {
+    let Block::Paragraph(text) = block else {
+        return Vec::new();
+    };
+    let mut rendered = wrap_indent(text, width.saturating_sub(indent), width);
+    if justify {
+        let last = rendered.len().saturating_sub(1);
+        for (line_index, (line, _)) in rendered.iter_mut().enumerate() {
+            if line_index != last {
+                let target = if line_index == 0 {
+                    width.saturating_sub(indent)
+                } else {
+                    width
+                };
+                *line = justify_line(line, target);
+            }
+        }
+    }
+    if let Some((first, _)) = rendered.first_mut() {
+        first.insert_str(0, &" ".repeat(indent));
+    }
+    rendered
 }
 
 /// Index of the line containing the (block, char-offset) anchor, for any width.
@@ -130,7 +201,7 @@ pub fn render_block(block: &Block, width: usize, ascii_only: bool) -> Vec<(Strin
             },
             0,
         )],
-        Block::Image { alt } => image_box(alt.as_deref(), width, ascii_only)
+        Block::Image { alt, .. } => image_box(alt.as_deref(), width, ascii_only)
             .into_iter()
             .map(|line| (line, 0))
             .collect(),
@@ -222,6 +293,11 @@ fn center(text: &str, width: usize, vertical: char) -> String {
 }
 
 fn wrap(text: &str, width: usize) -> Vec<(String, usize)> {
+    wrap_indent(text, width, width)
+}
+
+/// Wrap where the first line may have a different target width.
+fn wrap_indent(text: &str, first_width: usize, width: usize) -> Vec<(String, usize)> {
     let mut lines = Vec::new();
     let mut current = String::new();
     let mut current_offset = 0;
@@ -233,9 +309,10 @@ fn wrap(text: &str, width: usize) -> Vec<(String, usize)> {
             .and_then(|rest| rest.find(word))
             .map_or(search, |found| search + found);
         search = word_offset + word.len();
+        let target = if lines.is_empty() { first_width } else { width };
         let separator = usize::from(!current.is_empty());
         if UnicodeWidthStr::width(current.as_str()) + separator + UnicodeWidthStr::width(word)
-            > width
+            > target
             && !current.is_empty()
         {
             lines.push((current, current_offset));
@@ -374,7 +451,7 @@ mod tests {
             LayoutOptions {
                 ascii_only: true,
                 justify: true,
-                max_width: None,
+                ..LayoutOptions::default()
             },
         );
         assert_eq!(plain.len(), justified.len());
@@ -391,5 +468,62 @@ mod tests {
             .filter(|line| UnicodeWidthStr::width(line.text.as_str()) == 76)
             .count();
         assert!(full > 0, "expected some fully justified lines");
+    }
+
+    #[test]
+    fn typography_options_space_and_indent() {
+        let blocks = sample_blocks();
+        let styled = layout_with(
+            &blocks,
+            80,
+            LayoutOptions {
+                ascii_only: true,
+                line_spacing: 2,
+                paragraph_spacing: 2,
+                indent: 4,
+                ..LayoutOptions::default()
+            },
+        );
+        // First line of every paragraph carries the indent.
+        let first = styled.iter().find(|line| !line.is_separator()).unwrap();
+        assert!(first.text.starts_with("    "));
+        assert_eq!(first.char_offset, 0, "indent must not move the anchor");
+        // Double spacing: a separator between consecutive lines of one block.
+        let second_content = styled
+            .iter()
+            .position(|line| !line.is_separator() && line.char_offset > 0)
+            .unwrap();
+        assert!(styled[second_content - 1].is_separator());
+        // Two blank rows between blocks.
+        let block_gap = styled
+            .windows(2)
+            .filter(|pair| pair[0].is_separator() && pair[1].is_separator())
+            .count();
+        assert!(block_gap > 0, "expected double paragraph spacing");
+        // Anchors still resolve to their own line.
+        for (index, line) in styled.iter().enumerate() {
+            if line.is_separator() {
+                continue;
+            }
+            assert_eq!(
+                line_for_anchor(&styled, line.block, line.char_offset),
+                index
+            );
+        }
+    }
+
+    #[test]
+    fn zero_paragraph_spacing_removes_block_gaps() {
+        let blocks = sample_blocks();
+        let dense = layout_with(
+            &blocks,
+            80,
+            LayoutOptions {
+                ascii_only: true,
+                paragraph_spacing: 0,
+                ..LayoutOptions::default()
+            },
+        );
+        assert!(dense.iter().all(|line| !line.is_separator()));
     }
 }

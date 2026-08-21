@@ -30,6 +30,9 @@ struct Cli {
     /// Log level: error, warn, info, or debug.
     #[arg(long, global = true)]
     log_level: Option<String>,
+    /// Disable all progress syncing for this run.
+    #[arg(long, global = true)]
+    offline: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -70,8 +73,8 @@ fn main() -> Result<()> {
         Some(Command::Hash { book }) => hash(&book),
         Some(Command::Doctor { book }) => doctor(book.as_deref()),
         Some(Command::Update { check }) => self_update(check),
-        Some(Command::Read { book }) => run_tui(Some(book)),
-        None => run_tui(None),
+        Some(Command::Read { book }) => run_tui(Some(book), cli.offline),
+        None => run_tui(None, cli.offline),
     }
 }
 
@@ -115,11 +118,11 @@ fn init_logging(cli_file: Option<PathBuf>, cli_level: Option<&str>) {
     }
 }
 
-fn run_tui(initial_book: Option<PathBuf>) -> Result<()> {
+fn run_tui(initial_book: Option<PathBuf>, offline: bool) -> Result<()> {
     let terminal = ratatui::init();
     let mouse_result = execute!(std::io::stdout(), EnableMouseCapture);
     let result = match mouse_result {
-        Ok(()) => App::new(initial_book).and_then(|mut app| app.run(terminal)),
+        Ok(()) => App::new(initial_book, offline).and_then(|mut app| app.run(terminal)),
         Err(error) => Err(error.into()),
     };
     let mouse_result = execute!(std::io::stdout(), DisableMouseCapture);

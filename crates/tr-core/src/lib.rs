@@ -118,6 +118,23 @@ pub struct ReadingConfig {
     /// Restrict decorations to ASCII characters.
     #[serde(default)]
     pub ascii_only: bool,
+    /// Rows per text line: 1 = single spacing, 2 = double spacing.
+    #[serde(default = "default_line_spacing")]
+    pub line_spacing: u16,
+    /// Blank rows between blocks (0-3).
+    #[serde(default = "default_paragraph_spacing")]
+    pub paragraph_spacing: u16,
+    /// First-line paragraph indent in columns (0-8).
+    #[serde(default)]
+    pub indent: u16,
+}
+
+fn default_line_spacing() -> u16 {
+    1
+}
+
+fn default_paragraph_spacing() -> u16 {
+    1
 }
 
 impl Default for ReadingConfig {
@@ -126,8 +143,60 @@ impl Default for ReadingConfig {
             max_width: Some(100),
             justify: false,
             ascii_only: false,
+            line_spacing: default_line_spacing(),
+            paragraph_spacing: default_paragraph_spacing(),
+            indent: 0,
         }
     }
+}
+
+/// Color and light/dark preferences for the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThemeConfig {
+    /// Accent color name: cyan, blue, green, magenta, red, yellow, white, or gray.
+    #[serde(default = "default_accent")]
+    pub accent: String,
+    /// Adjust secondary colors for light terminal backgrounds.
+    #[serde(default)]
+    pub light: bool,
+}
+
+fn default_accent() -> String {
+    "cyan".to_owned()
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            accent: default_accent(),
+            light: false,
+        }
+    }
+}
+
+/// Optional overrides for the reader's single-character keys.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KeyBindings {
+    #[serde(default)]
+    pub contents: Option<char>,
+    #[serde(default)]
+    pub search: Option<char>,
+    #[serde(default)]
+    pub next_match: Option<char>,
+    #[serde(default)]
+    pub previous_match: Option<char>,
+    #[serde(default)]
+    pub bookmark_add: Option<char>,
+    #[serde(default)]
+    pub bookmarks: Option<char>,
+    #[serde(default)]
+    pub sync_push: Option<char>,
+    #[serde(default)]
+    pub sync_pull: Option<char>,
+    #[serde(default)]
+    pub sync_toggle: Option<char>,
+    #[serde(default)]
+    pub quit: Option<char>,
 }
 
 /// How documents are matched against the sync server.
@@ -195,6 +264,9 @@ pub struct SyncConfig {
     pub device_name: Option<String>,
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Books that never sync, regardless of other settings.
+    #[serde(default)]
+    pub excluded_books: Vec<PathBuf>,
 }
 
 fn default_sync_server() -> String {
@@ -222,6 +294,7 @@ impl Default for SyncConfig {
             minutes_before_update: None,
             device_name: None,
             device_id: None,
+            excluded_books: Vec::new(),
         }
     }
 }
@@ -247,6 +320,10 @@ pub struct Config {
     #[serde(default)]
     pub reading: ReadingConfig,
     #[serde(default)]
+    pub theme: ThemeConfig,
+    #[serde(default)]
+    pub keys: KeyBindings,
+    #[serde(default)]
     pub sync: SyncConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -262,6 +339,8 @@ impl Default for Config {
             schema_version: config_schema_version(),
             library: LibraryConfig::default(),
             reading: ReadingConfig::default(),
+            theme: ThemeConfig::default(),
+            keys: KeyBindings::default(),
             sync: SyncConfig::default(),
             logging: LoggingConfig::default(),
         }
@@ -404,6 +483,140 @@ impl RecentsStore {
         self.items.retain(|item| item.path != recent.path);
         self.items.insert(0, recent);
         self.items.truncate(20);
+    }
+}
+
+/// A saved location inside a book, with a human-readable label.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Bookmark {
+    pub chapter_index: usize,
+    pub block_index: usize,
+    pub char_offset: usize,
+    pub label: String,
+    #[serde(default)]
+    pub created: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct BookmarksFile {
+    #[serde(default = "config_schema_version")]
+    version: u32,
+    #[serde(default)]
+    books: HashMap<PathBuf, Vec<Bookmark>>,
+}
+
+/// Local per-book bookmarks stored in `bookmarks.json`.
+#[derive(Debug, Default)]
+pub struct BookmarkStore {
+    books: HashMap<PathBuf, Vec<Bookmark>>,
+}
+
+impl BookmarkStore {
+    pub fn load() -> Result<Self, CoreError> {
+        let path = state_file("bookmarks.json")?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let file: BookmarksFile = serde_json::from_slice(&fs::read(path)?)?;
+        Ok(Self { books: file.books })
+    }
+
+    #[must_use]
+    pub fn list(&self, path: &Path) -> &[Bookmark] {
+        self.books.get(path).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn add(&mut self, path: &Path, mut bookmark: Bookmark) -> Result<(), CoreError> {
+        bookmark.created = unix_timestamp();
+        let entries = self.books.entry(path.to_path_buf()).or_default();
+        entries.push(bookmark);
+        entries.sort_by_key(|entry| (entry.chapter_index, entry.block_index, entry.char_offset));
+        self.save()
+    }
+
+    pub fn remove(&mut self, path: &Path, index: usize) -> Result<bool, CoreError> {
+        let Some(entries) = self.books.get_mut(path) else {
+            return Ok(false);
+        };
+        if index >= entries.len() {
+            return Ok(false);
+        }
+        entries.remove(index);
+        if entries.is_empty() {
+            self.books.remove(path);
+        }
+        self.save()?;
+        Ok(true)
+    }
+
+    fn save(&self) -> Result<(), CoreError> {
+        let destination = state_file("bookmarks.json")?;
+        write_json_atomic(
+            &destination,
+            &BookmarksFile {
+                version: config_schema_version(),
+                books: self.books.clone(),
+            },
+        )
+    }
+}
+
+/// Accumulated reading totals for one book.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct BookStats {
+    pub seconds: u64,
+    pub pages: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StatsFile {
+    #[serde(default = "config_schema_version")]
+    version: u32,
+    #[serde(default)]
+    books: HashMap<PathBuf, BookStats>,
+}
+
+/// Reading statistics stored in `stats.json`.
+#[derive(Debug, Default)]
+pub struct StatsStore {
+    books: HashMap<PathBuf, BookStats>,
+}
+
+impl StatsStore {
+    pub fn load() -> Result<Self, CoreError> {
+        let path = state_file("stats.json")?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let file: StatsFile = serde_json::from_slice(&fs::read(path)?)?;
+        Ok(Self { books: file.books })
+    }
+
+    #[must_use]
+    pub fn get(&self, path: &Path) -> BookStats {
+        self.books.get(path).copied().unwrap_or_default()
+    }
+
+    /// Add a finished reading session to the book's totals.
+    pub fn record(&mut self, path: &Path, seconds: u64, pages: u64) -> Result<(), CoreError> {
+        if seconds == 0 && pages == 0 {
+            return Ok(());
+        }
+        let stats = self.books.entry(path.to_path_buf()).or_default();
+        stats.seconds = stats.seconds.saturating_add(seconds);
+        stats.pages = stats.pages.saturating_add(pages);
+        self.save()
+    }
+
+    fn save(&self) -> Result<(), CoreError> {
+        let destination = state_file("stats.json")?;
+        write_json_atomic(
+            &destination,
+            &StatsFile {
+                version: config_schema_version(),
+                books: self.books.clone(),
+            },
+        )
     }
 }
 
@@ -629,6 +842,17 @@ mod tests {
                 max_width: Some(88),
                 justify: true,
                 ascii_only: true,
+                line_spacing: 2,
+                paragraph_spacing: 0,
+                indent: 4,
+            },
+            theme: ThemeConfig {
+                accent: "green".to_owned(),
+                light: true,
+            },
+            keys: KeyBindings {
+                contents: Some('c'),
+                ..KeyBindings::default()
             },
             sync: SyncConfig {
                 server_url: "https://kosync.eu".to_owned(),
@@ -641,6 +865,7 @@ mod tests {
                 minutes_before_update: Some(5),
                 device_name: Some("laptop".to_owned()),
                 device_id: Some("abc123".to_owned()),
+                excluded_books: vec![PathBuf::from("C:/Books/private.epub")],
             },
             logging: LoggingConfig::default(),
         };
@@ -651,11 +876,22 @@ mod tests {
         assert_eq!(parsed.reading.max_width, Some(88));
         assert!(parsed.reading.justify);
         assert!(parsed.reading.ascii_only);
+        assert_eq!(parsed.reading.line_spacing, 2);
+        assert_eq!(parsed.reading.paragraph_spacing, 0);
+        assert_eq!(parsed.reading.indent, 4);
+        assert_eq!(parsed.theme.accent, "green");
+        assert!(parsed.theme.light);
+        assert_eq!(parsed.keys.contents, Some('c'));
+        assert_eq!(parsed.keys.search, None);
         assert_eq!(parsed.sync.server_url, "https://kosync.eu");
         assert_eq!(parsed.sync.matching, MatchingMethod::Filename);
         assert_eq!(parsed.sync.sync_forward, SyncStrategy::Silent);
         assert_eq!(parsed.sync.pages_before_update, Some(10));
         assert_eq!(parsed.sync.minutes_before_update, Some(5));
+        assert_eq!(
+            parsed.sync.excluded_books,
+            vec![PathBuf::from("C:/Books/private.epub")]
+        );
         Ok(())
     }
 
@@ -663,6 +899,13 @@ mod tests {
     fn legacy_config_defaults_new_sections() -> Result<(), CoreError> {
         let parsed: Config = toml::from_str("schema_version = 1\n[library]\nbook_dirs = []\n")?;
         assert_eq!(parsed.reading.max_width, Some(100));
+        assert_eq!(parsed.reading.line_spacing, 1);
+        assert_eq!(parsed.reading.paragraph_spacing, 1);
+        assert_eq!(parsed.reading.indent, 0);
+        assert_eq!(parsed.theme.accent, "cyan");
+        assert!(!parsed.theme.light);
+        assert_eq!(parsed.keys.contents, None);
+        assert!(parsed.sync.excluded_books.is_empty());
         assert_eq!(parsed.sync.server_url, "https://kosync.eu");
         assert_eq!(parsed.sync.sync_backward, SyncStrategy::Disable);
         assert!(parsed.sync.auto_sync);
