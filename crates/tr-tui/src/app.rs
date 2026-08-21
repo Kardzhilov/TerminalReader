@@ -343,6 +343,7 @@ impl App {
             KeyCode::Up => home.selection = home.selection.saturating_sub(1),
             KeyCode::Down => home.selection = (home.selection + 1).min(count.saturating_sub(1)),
             KeyCode::Enter => self.activate_home_item(home.selection),
+            KeyCode::Delete | KeyCode::Backspace => self.remove_home_recent(home),
             _ => {}
         }
     }
@@ -1038,6 +1039,7 @@ impl App {
                 "Home",
                 "  arrows      move selection",
                 "  Enter       open selection",
+                "  Del         remove selection from Recent",
                 "  s           settings",
                 "  q           quit",
             ]),
@@ -1848,6 +1850,33 @@ impl App {
             mode: SettingsMode::AddingLibrary,
             ..SettingsScreen::default()
         }));
+    }
+
+    /// Delete the selected recent entry (Continue reading counts as the
+    /// newest one); library rows are left alone.
+    fn remove_home_recent(&mut self, home: &mut HomeScreen) {
+        let has_continue = self
+            .recents
+            .most_recent()
+            .is_some_and(|recent| recent.path.exists());
+        let list_index = match (has_continue, home.selection) {
+            (true, 0) => 0,
+            (true, selection) => selection - 1,
+            (false, selection) => selection,
+        };
+        let Some(recent) = self.recents.list().get(list_index) else {
+            return;
+        };
+        let title = recent.title.clone();
+        let path = recent.path.clone();
+        match self.recents.remove(&path) {
+            Ok(true) => {
+                self.status = Some(format!("Removed \"{title}\" from Recent."));
+                home.selection = home.selection.min(self.home_item_count().saturating_sub(1));
+            }
+            Ok(false) => {}
+            Err(error) => self.status = Some(format!("Could not update recents: {error}")),
+        }
     }
 
     fn filtered_books(library: &LibraryScreen) -> Vec<&LibraryBook> {
