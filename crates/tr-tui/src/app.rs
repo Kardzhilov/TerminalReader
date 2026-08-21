@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::mpsc::{Receiver, Sender, channel},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -266,6 +267,7 @@ pub struct App {
     positions: PositionStore,
     recents: RecentsStore,
     scan_cache: ScanCache,
+    scanner: LibraryScanner,
     bookmarks: BookmarkStore,
     stats: StatsStore,
     sync: SyncController,
@@ -287,9 +289,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(initial_book: Option<PathBuf>, offline: bool) -> Result<Self> {
+    pub fn new(
+        config: Config,
+        config_backup: Option<PathBuf>,
+        initial_book: Option<PathBuf>,
+        offline: bool,
+    ) -> Result<Self> {
         let first_run = !Config::exists();
-        let (config, config_backup) = Config::load_or_backup()?;
         let mut sync = SyncController::new();
         if offline {
             // Leave the controller signed out so nothing touches the network.
@@ -315,6 +321,7 @@ impl App {
             positions: PositionStore::load()?,
             recents: RecentsStore::load()?,
             scan_cache: ScanCache::load(),
+            scanner: LibraryScanner::new(),
             bookmarks: BookmarkStore::load()?,
             stats: StatsStore::load()?,
             sync,
@@ -358,6 +365,7 @@ impl App {
         while !self.should_exit {
             self.process_sync_events();
             self.process_update_events();
+            self.process_scan_events();
             self.maybe_timed_push();
             self.expire_status();
             terminal.draw(|frame| self.draw(frame))?;
@@ -1525,50 +1533,53 @@ impl App {
             .map(|directory| directory.display().to_string())
             .collect();
 
+        let items = self.home_items();
+        let mut item_iter = items.iter().copied().enumerate().peekable();
         let mut rows = Vec::new();
-        let mut index = 0;
-        if let Some(text) = continue_row {
+        if matches!(item_iter.peek(), Some((_, HomeItem::Continue))) {
+            let index = item_iter.next().map_or(0, |(index, _)| index);
             rows.push("Continue reading".to_owned());
             self.register_row(area, rows.len(), Action::HomeOpen(index));
-            rows.push(Self::selectable_row(home.selection, index, &text));
-            index += 1;
+            rows.push(Self::selectable_row(
+                home.selection,
+                index,
+                &continue_row.unwrap_or_default(),
+            ));
         } else {
             rows.push("Open a library or run terminalreader read <file>".to_owned());
         }
         rows.push(String::new());
         rows.push("Recent".to_owned());
         let mut missing_rows = Vec::new();
-        for (text, missing) in &recent_rows {
+        while let Some((index, HomeItem::Recent(list_index))) = item_iter.peek().copied() {
+            item_iter.next();
+            let Some((text, missing)) = recent_rows.get(list_index) else {
+                continue;
+            };
             self.register_row(area, rows.len(), Action::HomeOpen(index));
             if *missing {
                 missing_rows.push(rows.len());
             }
             rows.push(Self::selectable_row(home.selection, index, text));
-            index += 1;
         }
         rows.push(String::new());
         rows.push("Libraries".to_owned());
-        if self.config.library.book_dirs.len() > 1 {
+        for (index, item) in item_iter {
+            let text = match item {
+                HomeItem::AllBooks => format!(
+                    "All books ({} libraries)",
+                    self.config.library.book_dirs.len()
+                ),
+                HomeItem::Library(dir_index) => {
+                    dir_rows.get(dir_index).cloned().unwrap_or_default()
+                }
+                HomeItem::AddLibrary => "+ Add a library…".to_owned(),
+                HomeItem::Continue | HomeItem::Recent(_) => continue,
+            };
             self.register_row(area, rows.len(), Action::HomeOpen(index));
-            rows.push(Self::selectable_row(
-                home.selection,
-                index,
-                &format!("All books ({} libraries)", self.config.library.book_dirs.len()),
-            ));
-            index += 1;
+            rows.push(Self::selectable_row(home.selection, index, &text));
         }
-        for text in &dir_rows {
-            self.register_row(area, rows.len(), Action::HomeOpen(index));
-            rows.push(Self::selectable_row(home.selection, index, text));
-            index += 1;
-        }
-        self.register_row(area, rows.len(), Action::HomeOpen(index));
-        rows.push(Self::selectable_row(
-            home.selection,
-            index,
-            "+ Add a library…",
-        ));
-        home.selection = home.selection.min(index);
+        home.selection = home.selection.min(items.len().saturating_sub(1));
         let footer = " [Settings] [Quit]  Enter: open | arrows: move | ?: help | q: quit ";
         self.register_footer(
             area,
@@ -2341,106 +2352,86 @@ impl App {
             .push((Rect::new(x, y, width, 1), Action::InputClick));
     }
 
-    fn home_item_count(&self) -> usize {
-        usize::from(
+    /// The home screen's selectable items in display order.
+    fn home_items(&self) -> Vec<HomeItem> {
+        home_items(
             self.recents
                 .most_recent()
                 .is_some_and(|recent| recent.path.exists()),
-        ) + self.recents.list().len()
-            + usize::from(self.config.library.book_dirs.len() > 1)
-            + self.config.library.book_dirs.len()
-            + 1
+            self.recents.list().len(),
+            self.config.library.book_dirs.len(),
+        )
+    }
+
+    fn home_item_count(&self) -> usize {
+        self.home_items().len()
     }
 
     fn activate_home_item(&mut self, index: usize) {
-        let mut cursor = 0;
-        if let Some(recent) = self
-            .recents
-            .most_recent()
-            .filter(|recent| recent.path.exists())
-        {
-            if index == cursor {
-                let _ = self.open_book(recent.path.clone());
-                return;
+        let items = self.home_items();
+        match items.get(index) {
+            Some(HomeItem::Continue) => {
+                let path = self.recents.most_recent().map(|recent| recent.path.clone());
+                if let Some(path) = path {
+                    let _ = self.open_book(path);
+                }
             }
-            cursor += 1;
-        }
-        if let Some(recent) = self.recents.list().get(index.saturating_sub(cursor)) {
-            if recent.path.exists() {
-                let _ = self.open_book(recent.path.clone());
-            } else {
-                self.status =
-                    Some("Book file is missing — press Del to remove it from Recent.".to_owned());
+            Some(HomeItem::Recent(list_index)) => {
+                let Some(recent) = self.recents.list().get(*list_index) else {
+                    return;
+                };
+                let path = recent.path.clone();
+                if path.exists() {
+                    let _ = self.open_book(path);
+                } else {
+                    self.status = Some(
+                        "Book file is missing — press Del to remove it from Recent.".to_owned(),
+                    );
+                }
             }
-            return;
-        }
-        cursor += self.recents.list().len();
-        if self.config.library.book_dirs.len() > 1 {
-            if index == cursor {
-                self.open_aggregated_library();
-                return;
+            Some(HomeItem::AllBooks) => self.open_aggregated_library(),
+            Some(HomeItem::Library(dir_index)) => {
+                if let Some(directory) = self.config.library.book_dirs.get(*dir_index) {
+                    let directory = directory.clone();
+                    self.start_library_scan(directory.display().to_string(), vec![directory]);
+                }
             }
-            cursor += 1;
-        }
-        if let Some(directory) = self
-            .config
-            .library
-            .book_dirs
-            .get(index.saturating_sub(cursor))
-        {
-            let directory = directory.clone();
-            let books = scan_library_cached(&directory, &mut self.scan_cache);
-            if let Err(error) = self.scan_cache.save() {
-                logging::warn(&format!("could not save scan cache: {error}"));
+            Some(HomeItem::AddLibrary) | None => {
+                self.next_screen = Some(Screen::Settings(SettingsScreen {
+                    mode: SettingsMode::AddingLibrary,
+                    ..SettingsScreen::default()
+                }));
             }
-            self.next_screen = Some(Screen::Library(LibraryScreen {
-                title: directory.display().to_string(),
-                books,
-                filter: TextInput::default(),
-                selection: 0,
-                top: 0,
-            }));
-            return;
         }
-        self.next_screen = Some(Screen::Settings(SettingsScreen {
-            mode: SettingsMode::AddingLibrary,
-            ..SettingsScreen::default()
-        }));
     }
 
     /// One merged, deduplicated, title-sorted list across all book dirs.
     fn open_aggregated_library(&mut self) {
         let directories = self.config.library.book_dirs.clone();
-        let mut books = Vec::new();
-        for directory in &directories {
-            books.extend(scan_library_cached(directory, &mut self.scan_cache));
+        let title = format!("All books ({} libraries)", directories.len());
+        self.start_library_scan(title, directories);
+    }
+
+    /// Scan on a worker thread so a cold scan of a large library does not
+    /// freeze the UI; the result arrives via `process_scan_events`.
+    fn start_library_scan(&mut self, title: String, directories: Vec<PathBuf>) {
+        if self.scanner.busy {
+            self.status = Some("A library scan is already running…".to_owned());
+            return;
         }
-        if let Err(error) = self.scan_cache.save() {
-            logging::warn(&format!("could not save scan cache: {error}"));
-        }
-        books.sort_by(|left, right| left.path.cmp(&right.path));
-        books.dedup_by(|left, right| left.path == right.path);
-        books.sort_by(|left, right| left.metadata.title.cmp(&right.metadata.title));
-        self.next_screen = Some(Screen::Library(LibraryScreen {
-            title: format!("All books ({} libraries)", directories.len()),
-            books,
-            filter: TextInput::default(),
-            selection: 0,
-            top: 0,
-        }));
+        self.status = Some("Scanning library…".to_owned());
+        self.scanner
+            .start(title, directories, self.scan_cache.clone());
     }
 
     /// Delete the selected recent entry (Continue reading counts as the
     /// newest one); library rows are left alone.
     fn remove_home_recent(&mut self, home: &mut HomeScreen) {
-        let has_continue = self
-            .recents
-            .most_recent()
-            .is_some_and(|recent| recent.path.exists());
-        let list_index = match (has_continue, home.selection) {
-            (true, 0) => 0,
-            (true, selection) => selection - 1,
-            (false, selection) => selection,
+        let items = self.home_items();
+        let list_index = match items.get(home.selection) {
+            Some(HomeItem::Continue) => 0,
+            Some(HomeItem::Recent(index)) => *index,
+            _ => return,
         };
         let Some(recent) = self.recents.list().get(list_index) else {
             return;
@@ -2637,6 +2628,38 @@ impl App {
         Self::push_progress(&self.config, &mut self.sync, reader, false);
     }
 
+    /// Handle a finished background library scan.
+    fn process_scan_events(&mut self) {
+        let Some(outcome) = self.scanner.poll() else {
+            // Keep the scanning notice up while the worker is running.
+            if self.scanner.busy && self.status.is_none() {
+                self.status = Some("Scanning library…".to_owned());
+            }
+            return;
+        };
+        self.scan_cache = outcome.cache;
+        if let Err(error) = self.scan_cache.save() {
+            logging::warn(&format!("could not save scan cache: {error}"));
+        }
+        // Only jump to the library if the user is still where they asked for it.
+        if matches!(self.screen, Screen::Home(_)) {
+            self.status = None;
+            self.next_screen = Some(Screen::Library(LibraryScreen {
+                title: outcome.title,
+                books: outcome.books,
+                filter: TextInput::default(),
+                selection: 0,
+                top: 0,
+            }));
+            self.apply_screen_transition();
+        } else {
+            self.status = Some(format!(
+                "Library scan finished ({} books).",
+                outcome.books.len()
+            ));
+        }
+    }
+
     /// Handle finished background update work.
     fn process_update_events(&mut self) {
         for event in self.update.poll() {
@@ -2811,6 +2834,90 @@ impl App {
 
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
+}
+
+/// One selectable row on the home screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeItem {
+    Continue,
+    Recent(usize),
+    AllBooks,
+    Library(usize),
+    AddLibrary,
+}
+
+/// Single source of truth for home-screen item order; drawing, activation,
+/// and deletion all derive their indices from this list.
+fn home_items(has_continue: bool, recent_count: usize, library_count: usize) -> Vec<HomeItem> {
+    let mut items = Vec::new();
+    if has_continue {
+        items.push(HomeItem::Continue);
+    }
+    items.extend((0..recent_count).map(HomeItem::Recent));
+    if library_count > 1 {
+        items.push(HomeItem::AllBooks);
+    }
+    items.extend((0..library_count).map(HomeItem::Library));
+    items.push(HomeItem::AddLibrary);
+    items
+}
+
+/// A finished background library scan.
+#[derive(Debug)]
+struct ScanOutcome {
+    title: String,
+    books: Vec<LibraryBook>,
+    cache: ScanCache,
+}
+
+/// Background library-scan worker, mirroring `UpdateController`.
+#[derive(Debug)]
+struct LibraryScanner {
+    tx: Sender<ScanOutcome>,
+    rx: Receiver<ScanOutcome>,
+    busy: bool,
+}
+
+impl LibraryScanner {
+    fn new() -> Self {
+        let (tx, rx) = channel();
+        Self {
+            tx,
+            rx,
+            busy: false,
+        }
+    }
+
+    /// Scan `directories` on a worker thread with a copy of the cache; the
+    /// updated cache comes back with the result.
+    fn start(&mut self, title: String, directories: Vec<PathBuf>, mut cache: ScanCache) {
+        self.busy = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let mut books = Vec::new();
+            for directory in &directories {
+                books.extend(scan_library_cached(directory, &mut cache));
+            }
+            if directories.len() > 1 {
+                books.sort_by(|left, right| left.path.cmp(&right.path));
+                books.dedup_by(|left, right| left.path == right.path);
+                books.sort_by(|left, right| left.metadata.title.cmp(&right.metadata.title));
+            }
+            let _ = tx.send(ScanOutcome {
+                title,
+                books,
+                cache,
+            });
+        });
+    }
+
+    fn poll(&mut self) -> Option<ScanOutcome> {
+        let outcome = self.rx.try_recv().ok();
+        if outcome.is_some() {
+            self.busy = false;
+        }
+        outcome
+    }
 }
 
 /// The reader's character keys with config overrides applied.
@@ -3398,5 +3505,41 @@ impl ReaderScreen {
             _ => {}
         }
         self.ensure_toc_visible();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_items_orders_continue_recents_aggregate_libraries_add() {
+        let items = home_items(true, 2, 3);
+        assert_eq!(
+            items,
+            vec![
+                HomeItem::Continue,
+                HomeItem::Recent(0),
+                HomeItem::Recent(1),
+                HomeItem::AllBooks,
+                HomeItem::Library(0),
+                HomeItem::Library(1),
+                HomeItem::Library(2),
+                HomeItem::AddLibrary,
+            ]
+        );
+    }
+
+    #[test]
+    fn home_items_skips_continue_and_aggregate_when_absent() {
+        assert_eq!(home_items(false, 0, 0), vec![HomeItem::AddLibrary]);
+        assert_eq!(
+            home_items(false, 1, 1),
+            vec![
+                HomeItem::Recent(0),
+                HomeItem::Library(0),
+                HomeItem::AddLibrary,
+            ]
+        );
     }
 }

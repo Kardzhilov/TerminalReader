@@ -108,11 +108,15 @@ terminalreader update          # self-update (--check to only check)
 | Reader   | `PgUp` `←`          | Previous page                             |
 | Reader   | `[` / `]`           | Previous / next chapter                   |
 | Reader   | `t`                 | Table of contents (type to filter)        |
+| Reader   | `/` then `n` / `N`  | Search the book, next / previous match    |
+| Reader   | `m` / `M`           | Add a bookmark / open bookmarks           |
 | Reader   | `s` / `p`           | Push / pull sync progress now             |
+| Reader   | `x`                 | Toggle sync for this book                 |
 | Reader   | `Esc` / `q`         | Save position and go home / quit          |
 
+Reader keys are remappable in the `[keys]` section of `config.toml`.
 Everything is also mouse-clickable, with hover highlighting; in the reader the
-mouse only operates the bottom bar, never the page.
+mouse only operates the bottom bar and image boxes, never the page.
 
 ## Progress sync
 
@@ -124,9 +128,22 @@ Open Settings (`s`), then:
    syncs identical files, **filename** syncs by name. This must match your
    other devices.
 
-Forward/backward sync strategies (`f`/`b`), auto-sync (`t`), and page-interval
-pushes (`g`) mirror KOReader's Progress sync plugin. Failed pushes are queued
-on disk and retried automatically — even across restarts.
+### Sync settings
+
+| Key | Setting        | What it does                                                                 |
+| --- | -------------- | ---------------------------------------------------------------------------- |
+| `c` | Matching       | How books are identified on the server: binary (identical file) or filename  |
+| `f` | Forward sync   | When the server is *ahead* of you: prompt, silently jump, or ignore          |
+| `b` | Backward sync  | When the server is *behind* you: prompt, silently jump, or ignore            |
+| `t` | Auto sync      | Pull position on open, push on close and quit                                |
+| `g` | Push every N pages | Also push mid-session after every N page turns                           |
+| `e` | Push every N minutes | Also push mid-session on a timer                                        |
+| `n` | Device name    | The name other devices see in pull prompts                                   |
+
+Automatic pushes are debounced (25 s) and coalesced per book. Failed pushes
+are queued on disk and retried automatically — even across restarts. Press
+`x` in the reader to exclude a single book from sync, or start with
+`--offline` to disable all syncing for a run.
 
 ## Configuration
 
@@ -145,6 +162,7 @@ macOS and Windows use the equivalent platform directories.
 cargo test --workspace                                   # unit tests
 cargo clippy --workspace --all-targets -- -D warnings    # lints (pedantic)
 cargo +nightly fuzz run epub_open                        # fuzz the EPUB parser
+cargo +nightly fuzz run chapter_parse                    # fuzz the chapter XHTML parser
 cargo +nightly fuzz run xpointer_parse                   # fuzz progress strings
 ```
 

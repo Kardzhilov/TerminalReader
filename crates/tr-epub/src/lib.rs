@@ -140,7 +140,69 @@ impl EpubBook {
 }
 
 fn read_entry(archive: &mut ZipArchive<File>, path: &str) -> Result<String, EpubError> {
-    Ok(String::from_utf8(read_entry_bytes(archive, path)?)?)
+    decode_text(read_entry_bytes(archive, path)?)
+}
+
+/// Decode entry bytes: UTF-8 by default, UTF-16 via BOM, and Latin-1 /
+/// Windows-1252 via the XML declaration.
+fn decode_text(bytes: Vec<u8>) -> Result<String, EpubError> {
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return Ok(decode_utf16(rest, u16::from_le_bytes));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return Ok(decode_utf16(rest, u16::from_be_bytes));
+    }
+    let bytes = match bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        Some(rest) => rest.to_vec(),
+        None => bytes,
+    };
+    match declared_encoding(&bytes).as_deref() {
+        Some("latin-1" | "latin1" | "iso-8859-1" | "windows-1252" | "cp1252") => {
+            Ok(decode_windows_1252(&bytes))
+        }
+        _ => Ok(String::from_utf8(bytes)?),
+    }
+}
+
+fn decode_utf16(bytes: &[u8], combine: fn([u8; 2]) -> u16) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .filter_map(|pair| pair.try_into().ok().map(combine))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// The encoding declared in `<?xml ... encoding="..."?>`, lowercased.
+fn declared_encoding(bytes: &[u8]) -> Option<String> {
+    let head = String::from_utf8_lossy(bytes.get(..bytes.len().min(200))?);
+    let declaration = head.split("?>").next()?;
+    if !declaration.contains("<?xml") {
+        return None;
+    }
+    let after = declaration.split("encoding").nth(1)?;
+    let after = after.trim_start().strip_prefix('=')?.trim_start();
+    let quote = after.chars().next().filter(|&quote| quote == '"' || quote == '\'')?;
+    let value = after.get(1..)?.split(quote).next()?;
+    Some(value.trim().to_ascii_lowercase())
+}
+
+/// Latin-1 mapping with the Windows-1252 additions in 0x80-0x9F (what
+/// real-world "latin-1" content almost always means).
+fn decode_windows_1252(bytes: &[u8]) -> String {
+    const HIGH: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8D}', 'Ž', '\u{8F}',
+        '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9D}', 'ž', 'Ÿ',
+    ];
+    bytes
+        .iter()
+        .map(|&byte| match byte {
+            0x80..=0x9F => HIGH
+                .get(usize::from(byte - 0x80))
+                .copied()
+                .unwrap_or('\u{FFFD}'),
+            _ => char::from(byte),
+        })
+        .collect()
 }
 
 fn read_entry_bytes(archive: &mut ZipArchive<File>, path: &str) -> Result<Vec<u8>, EpubError> {
@@ -437,7 +499,10 @@ fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<Toc
     Ok(entries)
 }
 
-fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
+/// Parse an XHTML chapter into content blocks with their source paths.
+/// Public so the fuzz targets can exercise the parser directly.
+#[must_use]
+pub fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
     let mut reader = Reader::from_reader(Cursor::new(xhtml));
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -693,6 +758,40 @@ fn normalize_archive_path(path: &Path) -> String {
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_text_handles_utf16_boms() {
+        let text = "<p>héllo</p>";
+        let mut little_endian = vec![0xFF, 0xFE];
+        let mut big_endian = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            little_endian.extend(unit.to_le_bytes());
+            big_endian.extend(unit.to_be_bytes());
+        }
+        assert_eq!(decode_text(little_endian).ok().as_deref(), Some(text));
+        assert_eq!(decode_text(big_endian).ok().as_deref(), Some(text));
+    }
+
+    #[test]
+    fn decode_text_honors_declared_latin1_and_maps_cp1252_range() {
+        let mut bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><p>caf".to_vec();
+        bytes.push(0xE9); // é in Latin-1
+        bytes.extend(b" ");
+        bytes.push(0x93); // “ in Windows-1252
+        bytes.extend(b"q</p>");
+        assert_eq!(
+            decode_text(bytes).ok().as_deref(),
+            Some("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><p>café “q</p>")
+        );
+    }
+
+    #[test]
+    fn decode_text_strips_utf8_bom_and_rejects_undeclared_garbage() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend(b"<p>plain</p>");
+        assert_eq!(decode_text(bytes).ok().as_deref(), Some("<p>plain</p>"));
+        assert!(decode_text(vec![b'<', 0xE9, b'>']).is_err());
+    }
 
     #[test]
     fn parses_blocks_and_images() {

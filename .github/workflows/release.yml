@@ -111,6 +111,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Generate SHA-256 checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.version.outputs.version }}

@@ -138,12 +138,9 @@ impl SyncController {
             }
             return;
         };
-        if !manual {
-            let debounced = self.last_call.is_some_and(|last| last.elapsed() < DEBOUNCE);
-            if debounced {
-                self.defer(update);
-                return;
-            }
+        if !manual && should_defer(self.last_call, Instant::now()) {
+            self.defer(update);
+            return;
         }
         // This update supersedes anything deferred for the same document.
         self.deferred
@@ -214,7 +211,7 @@ impl SyncController {
     /// Returns events the app must act on (auth outcomes and pull results);
     /// push bookkeeping — status, offline queue, drain — is handled here.
     pub fn poll(&mut self, config: &SyncConfig) -> Vec<SyncEvent> {
-        let expired = self.last_call.is_none_or(|last| last.elapsed() >= DEBOUNCE);
+        let expired = !should_defer(self.last_call, Instant::now());
         if expired && !self.deferred.is_empty() {
             // One per window; the rest go out on later polls.
             let update = self.deferred.remove(0);
@@ -331,10 +328,35 @@ impl SyncController {
     }
 }
 
+impl SyncController {
+    /// A controller with an empty queue and no persistence, for unit tests.
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        let (tx, rx) = channel();
+        Self {
+            tx,
+            rx,
+            credentials: None,
+            queue: ProgressQueue::default(),
+            queue_path: None,
+            last_call: None,
+            deferred: Vec::new(),
+            in_flight: 0,
+            status: None,
+        }
+    }
+}
+
 impl Default for SyncController {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// True when an automatic push at `now` falls inside the debounce window
+/// after the last server call.
+fn should_defer(last_call: Option<Instant>, now: Instant) -> bool {
+    last_call.is_some_and(|last| now.saturating_duration_since(last) < DEBOUNCE)
 }
 
 /// `KOReader` rounds percentages to four decimal places.
@@ -512,5 +534,59 @@ mod tests {
     fn percent_rounding_matches_koreader() {
         assert!((round_percent(0.123_456) - 0.1234).abs() < 1e-12);
         assert!((round_percent(1.0) - 1.0).abs() < 1e-12);
+    }
+
+    fn update(document: &str, percentage: f64) -> ProgressUpdate {
+        ProgressUpdate {
+            document: document.to_owned(),
+            metadata: None,
+            progress: "/body/DocFragment[1]/body/p[1].0".to_owned(),
+            percentage,
+            device: "test".to_owned(),
+            device_id: "test-id".to_owned(),
+        }
+    }
+
+    #[test]
+    fn debounce_defers_only_inside_window() {
+        let now = Instant::now();
+        assert!(!should_defer(None, now), "first call is never deferred");
+        assert!(should_defer(Some(now), now));
+        assert!(should_defer(
+            Some(now),
+            now + DEBOUNCE.saturating_sub(Duration::from_secs(1))
+        ));
+        assert!(!should_defer(Some(now), now + DEBOUNCE));
+    }
+
+    #[test]
+    fn defer_coalesces_to_the_newest_update_per_document() {
+        let mut controller = SyncController::for_tests();
+        controller.defer(update("doc-a", 0.1));
+        controller.defer(update("doc-b", 0.2));
+        controller.defer(update("doc-a", 0.5));
+        assert_eq!(controller.deferred.len(), 2);
+        let doc_a = controller
+            .deferred
+            .iter()
+            .find(|deferred| deferred.document == "doc-a")
+            .unwrap();
+        assert!((doc_a.percentage - 0.5).abs() < 1e-12, "newest update wins");
+    }
+
+    #[test]
+    fn queue_remove_keeps_other_documents_in_order() {
+        let mut controller = SyncController::for_tests();
+        controller.queue.push(update("doc-a", 0.1));
+        controller.queue.push(update("doc-b", 0.2));
+        controller.queue.push(update("doc-c", 0.3));
+        controller.queue_remove("doc-b");
+        let remaining: Vec<&str> = controller
+            .queue
+            .items()
+            .iter()
+            .map(|item| item.update.document.as_str())
+            .collect();
+        assert_eq!(remaining, vec!["doc-a", "doc-c"]);
     }
 }

@@ -635,7 +635,7 @@ struct ScanCacheEntry {
 }
 
 /// Library metadata cache keyed by path and validated by size and mtime.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ScanCache {
     #[serde(default)]
     entries: HashMap<PathBuf, ScanCacheEntry>,

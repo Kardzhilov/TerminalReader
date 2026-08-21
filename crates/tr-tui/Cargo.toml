@@ -11,9 +11,11 @@ anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 flate2.workspace = true
+hex.workspace = true
 ratatui.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+sha2.workspace = true
 tar.workspace = true
 tr-core = { path = "../tr-core" }
 tr-epub = { path = "../tr-epub" }

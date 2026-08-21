@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 const REPO: &str = "Kardzhilov/TerminalReader";
 
@@ -83,21 +84,60 @@ pub fn check() -> Result<UpdateCheck> {
     })
 }
 
-/// Download release `tag` for this platform and replace the running binary.
+/// Download release `tag` for this platform, verify its published SHA-256
+/// checksum, and replace the running binary.
 pub fn apply(tag: &str) -> Result<()> {
     let target = target_triple()?;
     let extension = if cfg!(windows) { "zip" } else { "tar.gz" };
     let asset = format!("terminalreader-{tag}-{target}.{extension}");
     let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}");
-    let archive = http_client()?
+    let client = http_client()?;
+    let archive = client
         .get(&url)
         .send()
         .context("could not reach github.com")?
         .error_for_status()
         .with_context(|| format!("release asset missing: {asset}"))?
         .bytes()?;
+    verify_checksum(&client, tag, &asset, &archive)?;
     let binary = extract_binary(&archive, tag, target)?;
     replace_current_exe(&binary)
+}
+
+/// Refuse to install an archive whose SHA-256 does not match the sums file
+/// published with the release.
+fn verify_checksum(
+    client: &reqwest::blocking::Client,
+    tag: &str,
+    asset: &str,
+    archive: &[u8],
+) -> Result<()> {
+    let url = format!("https://github.com/{REPO}/releases/download/{tag}/SHA256SUMS.txt");
+    let sums = client
+        .get(&url)
+        .send()
+        .context("could not reach github.com")?
+        .error_for_status()
+        .context("release has no SHA256SUMS.txt; refusing unverified update")?
+        .text()?;
+    let expected = expected_sum(&sums, asset)
+        .with_context(|| format!("SHA256SUMS.txt has no entry for {asset}"))?;
+    let actual = hex::encode(Sha256::digest(archive));
+    if !actual.eq_ignore_ascii_case(&expected) {
+        bail!("checksum mismatch for {asset}: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+/// Find the checksum for `asset` in `sha256sum` output (`<hex>  <name>`,
+/// with an optional `*` binary-mode marker).
+fn expected_sum(sums: &str, asset: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?;
+        (name.trim_start_matches('*') == asset).then(|| hash.to_owned())
+    })
 }
 
 fn extract_binary(archive: &[u8], tag: &str, target: &str) -> Result<Vec<u8>> {
@@ -257,5 +297,21 @@ mod tests {
         let newer = parse_version("v1.10.0");
         let older = parse_version("v1.9.9");
         assert!(newer > older);
+    }
+
+    #[test]
+    fn expected_sum_finds_asset_in_sha256sum_output() {
+        let sums = "abc123  terminalreader-v1.0.0-x86_64-unknown-linux-gnu.tar.gz\n\
+                    def456 *terminalreader-v1.0.0-x86_64-pc-windows-msvc.zip\n";
+        assert_eq!(
+            expected_sum(sums, "terminalreader-v1.0.0-x86_64-unknown-linux-gnu.tar.gz").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            expected_sum(sums, "terminalreader-v1.0.0-x86_64-pc-windows-msvc.zip").as_deref(),
+            Some("def456")
+        );
+        assert_eq!(expected_sum(sums, "other.zip"), None);
+        assert_eq!(expected_sum("", "other.zip"), None);
     }
 }

@@ -62,7 +62,12 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_logging(cli.log_file, cli.log_level.as_deref());
+    // Load the config once; logging setup and the app share it.
+    let (config, config_backup) = Config::load_or_backup().unwrap_or_else(|error| {
+        eprintln!("warning: could not load config: {error}");
+        (Config::default(), None)
+    });
+    init_logging(&config, cli.log_file, cli.log_level.as_deref());
     match cli.command {
         Some(Command::Dump { book }) => dump(&book),
         Some(Command::Library { directory }) => {
@@ -73,8 +78,8 @@ fn main() -> Result<()> {
         Some(Command::Hash { book }) => hash(&book),
         Some(Command::Doctor { book }) => doctor(book.as_deref()),
         Some(Command::Update { check }) => self_update(check),
-        Some(Command::Read { book }) => run_tui(Some(book), cli.offline),
-        None => run_tui(None, cli.offline),
+        Some(Command::Read { book }) => run_tui(config, config_backup, Some(book), cli.offline),
+        None => run_tui(config, config_backup, None, cli.offline),
     }
 }
 
@@ -101,28 +106,33 @@ fn self_update(check_only: bool) -> Result<()> {
 }
 
 /// Enable file logging from CLI flags or the persisted config.
-fn init_logging(cli_file: Option<PathBuf>, cli_level: Option<&str>) {
-    let config = Config::load().unwrap_or_default();
+fn init_logging(config: &Config, cli_file: Option<PathBuf>, cli_level: Option<&str>) {
     let enabled = cli_file.is_some() || config.logging.enabled;
     if !enabled {
         return;
     }
     let level = cli_level
         .map(str::to_owned)
-        .or(config.logging.level)
+        .or_else(|| config.logging.level.clone())
         .unwrap_or_else(|| "info".to_owned());
-    let path = cli_file.or(config.logging.file);
+    let path = cli_file.or_else(|| config.logging.file.clone());
     match logging::init(path, logging::Level::parse(&level)) {
         Ok(path) => logging::info(&format!("logging started at {}", path.display())),
         Err(error) => eprintln!("warning: could not open log file: {error}"),
     }
 }
 
-fn run_tui(initial_book: Option<PathBuf>, offline: bool) -> Result<()> {
+fn run_tui(
+    config: Config,
+    config_backup: Option<PathBuf>,
+    initial_book: Option<PathBuf>,
+    offline: bool,
+) -> Result<()> {
     let terminal = ratatui::init();
     let mouse_result = execute!(std::io::stdout(), EnableMouseCapture);
     let result = match mouse_result {
-        Ok(()) => App::new(initial_book, offline).and_then(|mut app| app.run(terminal)),
+        Ok(()) => App::new(config, config_backup, initial_book, offline)
+            .and_then(|mut app| app.run(terminal)),
         Err(error) => Err(error.into()),
     };
     let mouse_result = execute!(std::io::stdout(), DisableMouseCapture);
