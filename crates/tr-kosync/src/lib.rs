@@ -379,7 +379,10 @@ mod tests {
         assert_eq!(record_from_body(""), ProgressRecord::default());
         assert_eq!(record_from_body("{}"), ProgressRecord::default());
         assert_eq!(record_from_body("null"), ProgressRecord::default());
-        assert_eq!(record_from_body("<html>err</html>"), ProgressRecord::default());
+        assert_eq!(
+            record_from_body("<html>err</html>"),
+            ProgressRecord::default()
+        );
         let record = record_from_body(r#"{"progress":"/body/p[1].0","percentage":0.5}"#);
         assert_eq!(record.progress.as_deref(), Some("/body/p[1].0"));
         assert_eq!(record.percentage, Some(0.5));

@@ -304,7 +304,11 @@ mod tests {
         let sums = "abc123  terminalreader-v1.0.0-x86_64-unknown-linux-gnu.tar.gz\n\
                     def456 *terminalreader-v1.0.0-x86_64-pc-windows-msvc.zip\n";
         assert_eq!(
-            expected_sum(sums, "terminalreader-v1.0.0-x86_64-unknown-linux-gnu.tar.gz").as_deref(),
+            expected_sum(
+                sums,
+                "terminalreader-v1.0.0-x86_64-unknown-linux-gnu.tar.gz"
+            )
+            .as_deref(),
             Some("abc123")
         );
         assert_eq!(

@@ -64,7 +64,11 @@ impl Palette {
     fn status(self) -> Style {
         if self.color {
             // Yellow is unreadable on light backgrounds.
-            Style::new().fg(if self.light { Color::Blue } else { Color::Yellow })
+            Style::new().fg(if self.light {
+                Color::Blue
+            } else {
+                Color::Yellow
+            })
         } else {
             Style::new().add_modifier(Modifier::ITALIC)
         }
@@ -88,7 +92,11 @@ impl Palette {
 
     fn dim(self) -> Style {
         if self.color {
-            Style::new().fg(if self.light { Color::Gray } else { Color::DarkGray })
+            Style::new().fg(if self.light {
+                Color::Gray
+            } else {
+                Color::DarkGray
+            })
         } else {
             Style::new().add_modifier(Modifier::DIM)
         }
@@ -564,17 +572,22 @@ impl App {
                 });
             }
             SettingsMode::EditMinutes => {
-                self.handle_settings_edit(settings, key, SettingsMode::EditMinutes, |app, value| {
-                    if value.is_empty() || value == "0" {
-                        app.config.sync.minutes_before_update = None;
-                        return Ok("Timed pushes disabled.".to_owned());
-                    }
-                    let minutes: u32 = value
-                        .parse()
-                        .map_err(|_| "Enter minutes, 0, or leave empty.".to_owned())?;
-                    app.config.sync.minutes_before_update = Some(minutes);
-                    Ok(format!("Pushing every {minutes} minutes."))
-                });
+                self.handle_settings_edit(
+                    settings,
+                    key,
+                    SettingsMode::EditMinutes,
+                    |app, value| {
+                        if value.is_empty() || value == "0" {
+                            app.config.sync.minutes_before_update = None;
+                            return Ok("Timed pushes disabled.".to_owned());
+                        }
+                        let minutes: u32 = value
+                            .parse()
+                            .map_err(|_| "Enter minutes, 0, or leave empty.".to_owned())?;
+                        app.config.sync.minutes_before_update = Some(minutes);
+                        Ok(format!("Pushing every {minutes} minutes."))
+                    },
+                );
             }
             SettingsMode::EditDevice => {
                 self.handle_settings_edit(settings, key, SettingsMode::EditDevice, |app, value| {
@@ -1130,10 +1143,7 @@ impl App {
                         } else if mouse.row > area.y
                             && mouse.row < area.y + area.height.saturating_sub(1)
                         {
-                            let top = reader
-                                .bookmarks_open
-                                .as_ref()
-                                .map_or(0, |state| state.top);
+                            let top = reader.bookmarks_open.as_ref().map_or(0, |state| state.top);
                             let index = top + usize::from(mouse.row - area.y - 1);
                             if let Some(bookmark) = self.bookmarks.list(&reader.path).get(index) {
                                 let position = SavedPosition {
@@ -1464,7 +1474,10 @@ impl App {
                         "  {} {}            push / pull progress now",
                         keys.sync_push, keys.sync_pull
                     ),
-                    format!("  {}              toggle sync for this book", keys.sync_toggle),
+                    format!(
+                        "  {}              toggle sync for this book",
+                        keys.sync_toggle
+                    ),
                     "  click image    open image in system viewer".to_owned(),
                     "  Esc            save and go home".to_owned(),
                     format!("  {}              save and quit", keys.quit),
@@ -1957,12 +1970,12 @@ impl App {
         let (page, count) = reader.page_numbers();
         let percent = reader.percentage() * 100.0;
         let queued = self.sync.queue_len();
-        let badge = if queued > 0 && self.config.sync.auto_sync && self.config.sync.username.is_some()
-        {
-            format!("| {queued} queued ")
-        } else {
-            String::new()
-        };
+        let badge =
+            if queued > 0 && self.config.sync.auto_sync && self.config.sync.username.is_some() {
+                format!("| {queued} queued ")
+            } else {
+                String::new()
+            };
         let footer = format!(
             " [Contents] [Previous] [Next] [Home]  [/] chapter | ?: help | page {page}/{count} | {percent:.0}% {badge}"
         );
@@ -2028,8 +2041,7 @@ impl App {
             if !line.atomic {
                 continue;
             }
-            if let Some(tr_epub::Block::Image { href: Some(_), .. }) =
-                reader.blocks.get(line.block)
+            if let Some(tr_epub::Block::Image { href: Some(_), .. }) = reader.blocks.get(line.block)
             {
                 if let Some(y) = self.content_row_y(area, row) {
                     self.hit_targets.push((
@@ -2061,11 +2073,8 @@ impl App {
             "{}\nEnter: search all chapters | Esc: close",
             input.render("Find: ")
         );
-        let widget = Paragraph::new(text).block(
-            TuiBlock::default()
-                .borders(Borders::ALL)
-                .title(" Search "),
-        );
+        let widget =
+            Paragraph::new(text).block(TuiBlock::default().borders(Borders::ALL).title(" Search "));
         frame.render_widget(Clear, area);
         frame.render_widget(widget, area);
     }

@@ -54,7 +54,10 @@ pub struct SourcePathStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
     Paragraph(String),
-    Heading { level: u8, text: String },
+    Heading {
+        level: u8,
+        text: String,
+    },
     Quote(String),
     Code(String),
     Rule,
@@ -181,7 +184,10 @@ fn declared_encoding(bytes: &[u8]) -> Option<String> {
     }
     let after = declaration.split("encoding").nth(1)?;
     let after = after.trim_start().strip_prefix('=')?.trim_start();
-    let quote = after.chars().next().filter(|&quote| quote == '"' || quote == '\'')?;
+    let quote = after
+        .chars()
+        .next()
+        .filter(|&quote| quote == '"' || quote == '\'')?;
     let value = after.get(1..)?.split(quote).next()?;
     Some(value.trim().to_ascii_lowercase())
 }
@@ -190,8 +196,9 @@ fn declared_encoding(bytes: &[u8]) -> Option<String> {
 /// real-world "latin-1" content almost always means).
 fn decode_windows_1252(bytes: &[u8]) -> String {
     const HIGH: [char; 32] = [
-        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8D}', 'Ž', '\u{8F}',
-        '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9D}', 'ž', 'Ÿ',
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8D}', 'Ž',
+        '\u{8F}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9D}',
+        'ž', 'Ÿ',
     ];
     bytes
         .iter()
@@ -409,8 +416,7 @@ fn parse_ncx(xml: &str, ncx_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEn
                     {
                         let target =
                             resolve_path(ncx_path, src.split('#').next().unwrap_or_default());
-                        if let Some(spine_index) =
-                            spine.iter().position(|item| item.path == target)
+                        if let Some(spine_index) = spine.iter().position(|item| item.path == target)
                         {
                             if !label.is_empty() {
                                 entries.push(TocEntry { label, spine_index });
@@ -924,9 +930,6 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            hrefs,
-            vec![Some("../Images/map.png"), Some("cover.jpg")]
-        );
+        assert_eq!(hrefs, vec![Some("../Images/map.png"), Some("cover.jpg")]);
     }
 }
