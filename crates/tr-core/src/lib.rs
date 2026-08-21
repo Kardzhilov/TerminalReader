@@ -153,12 +153,19 @@ impl Default for ReadingConfig {
 /// Color and light/dark preferences for the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeConfig {
+    /// Preset name (e.g. gruvbox, dracula, nord); "custom" uses `accent`/`light`.
+    #[serde(default = "default_preset")]
+    pub preset: String,
     /// Accent color name: cyan, blue, green, magenta, red, yellow, white, or gray.
     #[serde(default = "default_accent")]
     pub accent: String,
     /// Adjust secondary colors for light terminal backgrounds.
     #[serde(default)]
     pub light: bool,
+}
+
+fn default_preset() -> String {
+    "custom".to_owned()
 }
 
 fn default_accent() -> String {
@@ -168,6 +175,7 @@ fn default_accent() -> String {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
+            preset: default_preset(),
             accent: default_accent(),
             light: false,
         }
@@ -847,6 +855,7 @@ mod tests {
                 indent: 4,
             },
             theme: ThemeConfig {
+                preset: "gruvbox".to_owned(),
                 accent: "green".to_owned(),
                 light: true,
             },
@@ -879,6 +888,7 @@ mod tests {
         assert_eq!(parsed.reading.line_spacing, 2);
         assert_eq!(parsed.reading.paragraph_spacing, 0);
         assert_eq!(parsed.reading.indent, 4);
+        assert_eq!(parsed.theme.preset, "gruvbox");
         assert_eq!(parsed.theme.accent, "green");
         assert!(parsed.theme.light);
         assert_eq!(parsed.keys.contents, Some('c'));
@@ -902,6 +912,7 @@ mod tests {
         assert_eq!(parsed.reading.line_spacing, 1);
         assert_eq!(parsed.reading.paragraph_spacing, 1);
         assert_eq!(parsed.reading.indent, 0);
+        assert_eq!(parsed.theme.preset, "custom");
         assert_eq!(parsed.theme.accent, "cyan");
         assert!(!parsed.theme.light);
         assert_eq!(parsed.keys.contents, None);

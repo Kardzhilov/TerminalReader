@@ -145,6 +145,22 @@ are queued on disk and retried automatically — even across restarts. Press
 `x` in the reader to exclude a single book from sync, or start with
 `--offline` to disable all syncing for a run.
 
+## Theming
+
+Press `h` in Settings to cycle through preset colorways: gruvbox,
+gruvbox-light, dracula, nord, solarized, solarized-light, catppuccin,
+tokyo-night, and one-dark. The `custom` preset uses the `[theme]` section of
+`config.toml` instead:
+
+```toml
+[theme]
+preset = "custom"  # or any preset name above
+accent = "green"   # cyan, blue, green, magenta, red, yellow, white, or gray
+light = true       # adjust secondary colors for light terminal backgrounds
+```
+
+Set the `NO_COLOR` environment variable to disable colors entirely.
+
 ## Configuration
 
 | What                                      | Where (Linux)                            |

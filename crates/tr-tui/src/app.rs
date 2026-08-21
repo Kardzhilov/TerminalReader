@@ -40,16 +40,137 @@ const PROMPT_STAY_LABEL: &str = "[Stay here]";
 struct Palette {
     color: bool,
     accent: Color,
-    light: bool,
+    status: Color,
+    dim: Color,
+    missing: Color,
+}
+
+/// A named colorway for the UI chrome.
+struct ThemePreset {
+    name: &'static str,
+    accent: Color,
+    status: Color,
+    dim: Color,
+    missing: Color,
+}
+
+/// Sentinel preset that uses the `accent`/`light` values from config.toml.
+const CUSTOM_THEME: &str = "custom";
+
+/// Popular colorways selectable from the settings screen.
+const THEME_PRESETS: &[ThemePreset] = &[
+    ThemePreset {
+        name: "gruvbox",
+        accent: Color::Rgb(0xfe, 0x80, 0x19),
+        status: Color::Rgb(0xfa, 0xbd, 0x2f),
+        dim: Color::Rgb(0x92, 0x83, 0x74),
+        missing: Color::Rgb(0xfb, 0x49, 0x34),
+    },
+    ThemePreset {
+        name: "gruvbox-light",
+        accent: Color::Rgb(0xaf, 0x3a, 0x03),
+        status: Color::Rgb(0xb5, 0x76, 0x14),
+        dim: Color::Rgb(0x92, 0x83, 0x74),
+        missing: Color::Rgb(0x9d, 0x00, 0x06),
+    },
+    ThemePreset {
+        name: "dracula",
+        accent: Color::Rgb(0xbd, 0x93, 0xf9),
+        status: Color::Rgb(0xf1, 0xfa, 0x8c),
+        dim: Color::Rgb(0x62, 0x72, 0xa4),
+        missing: Color::Rgb(0xff, 0x55, 0x55),
+    },
+    ThemePreset {
+        name: "nord",
+        accent: Color::Rgb(0x88, 0xc0, 0xd0),
+        status: Color::Rgb(0xeb, 0xcb, 0x8b),
+        dim: Color::Rgb(0x61, 0x6e, 0x88),
+        missing: Color::Rgb(0xbf, 0x61, 0x6a),
+    },
+    ThemePreset {
+        name: "solarized",
+        accent: Color::Rgb(0x26, 0x8b, 0xd2),
+        status: Color::Rgb(0xb5, 0x89, 0x00),
+        dim: Color::Rgb(0x58, 0x6e, 0x75),
+        missing: Color::Rgb(0xdc, 0x32, 0x2f),
+    },
+    ThemePreset {
+        name: "solarized-light",
+        accent: Color::Rgb(0x26, 0x8b, 0xd2),
+        status: Color::Rgb(0xb5, 0x89, 0x00),
+        dim: Color::Rgb(0x93, 0xa1, 0xa1),
+        missing: Color::Rgb(0xdc, 0x32, 0x2f),
+    },
+    ThemePreset {
+        name: "catppuccin",
+        accent: Color::Rgb(0xcb, 0xa6, 0xf7),
+        status: Color::Rgb(0xf9, 0xe2, 0xaf),
+        dim: Color::Rgb(0x6c, 0x70, 0x86),
+        missing: Color::Rgb(0xf3, 0x8b, 0xa8),
+    },
+    ThemePreset {
+        name: "tokyo-night",
+        accent: Color::Rgb(0x7a, 0xa2, 0xf7),
+        status: Color::Rgb(0xe0, 0xaf, 0x68),
+        dim: Color::Rgb(0x56, 0x5f, 0x89),
+        missing: Color::Rgb(0xf7, 0x76, 0x8e),
+    },
+    ThemePreset {
+        name: "one-dark",
+        accent: Color::Rgb(0x61, 0xaf, 0xef),
+        status: Color::Rgb(0xe5, 0xc0, 0x7b),
+        dim: Color::Rgb(0x5c, 0x63, 0x70),
+        missing: Color::Rgb(0xe0, 0x6c, 0x75),
+    },
+];
+
+/// The preset after `current` in the cycle: custom -> presets… -> custom.
+fn next_theme_preset(current: &str) -> &'static str {
+    let index = THEME_PRESETS
+        .iter()
+        .position(|preset| preset.name.eq_ignore_ascii_case(current));
+    match index {
+        None => THEME_PRESETS
+            .first()
+            .map_or(CUSTOM_THEME, |preset| preset.name),
+        Some(index) => THEME_PRESETS
+            .get(index + 1)
+            .map_or(CUSTOM_THEME, |preset| preset.name),
+    }
 }
 
 impl Palette {
     fn detect(theme: &tr_core::ThemeConfig) -> Self {
         let no_color = env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+        let (accent, status, dim, missing) = THEME_PRESETS
+            .iter()
+            .find(|preset| preset.name.eq_ignore_ascii_case(&theme.preset))
+            .map_or_else(
+                || {
+                    (
+                        accent_color(&theme.accent),
+                        // Yellow is unreadable on light backgrounds.
+                        if theme.light {
+                            Color::Blue
+                        } else {
+                            Color::Yellow
+                        },
+                        if theme.light {
+                            Color::Gray
+                        } else {
+                            Color::DarkGray
+                        },
+                        Color::Red,
+                    )
+                },
+                |preset| (preset.accent, preset.status, preset.dim, preset.missing),
+            );
         Self {
             color: !no_color,
-            accent: accent_color(&theme.accent),
-            light: theme.light,
+            accent,
+            status,
+            dim,
+            missing,
         }
     }
 
@@ -63,12 +184,7 @@ impl Palette {
 
     fn status(self) -> Style {
         if self.color {
-            // Yellow is unreadable on light backgrounds.
-            Style::new().fg(if self.light {
-                Color::Blue
-            } else {
-                Color::Yellow
-            })
+            Style::new().fg(self.status)
         } else {
             Style::new().add_modifier(Modifier::ITALIC)
         }
@@ -92,11 +208,7 @@ impl Palette {
 
     fn dim(self) -> Style {
         if self.color {
-            Style::new().fg(if self.light {
-                Color::Gray
-            } else {
-                Color::DarkGray
-            })
+            Style::new().fg(self.dim)
         } else {
             Style::new().add_modifier(Modifier::DIM)
         }
@@ -104,7 +216,7 @@ impl Palette {
 
     fn missing(self) -> Style {
         if self.color {
-            Style::new().fg(Color::Red)
+            Style::new().fg(self.missing)
         } else {
             Style::new().add_modifier(Modifier::DIM)
         }
@@ -704,6 +816,12 @@ impl App {
                     "ASCII mode {}.",
                     on_off(self.config.reading.ascii_only)
                 )));
+            }
+            KeyCode::Char('h') => {
+                self.config.theme.preset = next_theme_preset(&self.config.theme.preset).to_owned();
+                self.palette = Palette::detect(&self.config.theme);
+                settings.message =
+                    Some(self.save_config_with(format!("Theme: {}.", self.config.theme.preset)));
             }
             KeyCode::Char('u') => {
                 settings.mode = SettingsMode::EditServer;
@@ -1754,6 +1872,11 @@ impl App {
         rows.push(format!(
             "  [m] ASCII mode: {} — swap curly quotes/dashes for plain ones",
             on_off(self.config.reading.ascii_only)
+        ));
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('h')));
+        rows.push(format!(
+            "  [h] Theme: {} — cycle presets; custom uses [theme] in config.toml",
+            self.config.theme.preset
         ));
         rows.push(String::new());
         rows.push("Progress sync (KOReader-compatible)".to_owned());
@@ -3549,6 +3672,23 @@ mod tests {
                 HomeItem::Library(0),
                 HomeItem::AddLibrary,
             ]
+        );
+    }
+
+    #[test]
+    fn theme_presets_cycle_through_custom_and_back() {
+        let mut seen = vec![CUSTOM_THEME];
+        let mut current = next_theme_preset(CUSTOM_THEME);
+        while current != CUSTOM_THEME {
+            seen.push(current);
+            current = next_theme_preset(current);
+        }
+        assert_eq!(seen.len(), THEME_PRESETS.len() + 1);
+        assert!(seen.contains(&"gruvbox"));
+        // Unknown names fall back into the cycle instead of getting stuck.
+        assert_eq!(
+            next_theme_preset("no-such-theme"),
+            next_theme_preset(CUSTOM_THEME)
         );
     }
 }
