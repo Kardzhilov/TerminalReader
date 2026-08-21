@@ -1,6 +1,6 @@
 //! Terminal-width-aware rendering and layout for EPUB blocks.
 
-use tr_epub::Block;
+use tr_epub::{Block, InlineSpan};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Sentinel offset for the blank separator line between blocks.
@@ -180,6 +180,62 @@ pub fn line_for_anchor(lines: &[Line], block: usize, char_offset: usize) -> usiz
     index
 }
 
+/// Byte ranges of a block's inline spans within one rendered line, as
+/// `(start, end, span index)` triples into `line.text`.
+///
+/// Wrapped lines contain the block's words verbatim — decorations (the
+/// quote prefix, indentation, justification padding) only add whitespace
+/// or extra tokens — so each line word is matched back to the block text
+/// in order, starting at the line's anchor offset.
+#[must_use]
+pub fn line_inline_ranges(
+    line: &Line,
+    block_text: &str,
+    spans: &[InlineSpan],
+) -> Vec<(usize, usize, usize)> {
+    if spans.is_empty() || line.is_separator() || line.atomic {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut cursor = line.char_offset.min(block_text.len());
+    let mut line_search = 0;
+    for word in line.text.split_whitespace() {
+        let Some(line_start) = line
+            .text
+            .get(line_search..)
+            .and_then(|rest| rest.find(word))
+            .map(|found| line_search + found)
+        else {
+            break;
+        };
+        line_search = line_start + word.len();
+        let Some(rest) = block_text.get(cursor..) else {
+            break;
+        };
+        let block_start = cursor + (rest.len() - rest.trim_start().len());
+        match block_text.get(block_start..) {
+            Some(tail) if tail.starts_with(word) => {
+                cursor = block_start + word.len();
+                for (index, span) in spans.iter().enumerate() {
+                    let start = span.start.max(block_start);
+                    let end = span.end.min(block_start + word.len());
+                    if start < end {
+                        ranges.push((
+                            line_start + (start - block_start),
+                            line_start + (end - block_start),
+                            index,
+                        ));
+                    }
+                }
+            }
+            // A decoration token (e.g. the quote "> " prefix); skip it.
+            _ => {}
+        }
+    }
+    ranges.sort_unstable_by_key(|&(start, _, _)| start);
+    ranges
+}
+
 /// Render one block as (line text, byte offset of the line's first word).
 #[must_use]
 pub fn render_block(block: &Block, width: usize, ascii_only: bool) -> Vec<(String, usize)> {
@@ -213,7 +269,7 @@ pub fn render_block(block: &Block, width: usize, ascii_only: bool) -> Vec<(Strin
             },
             0,
         )],
-        Block::Image { alt, .. } => image_box(alt.as_deref(), width, ascii_only)
+        Block::Image { alt, href } => image_box(alt.as_deref(), href.as_deref(), width, ascii_only)
             .into_iter()
             .map(|line| (line, 0))
             .collect(),
@@ -221,7 +277,12 @@ pub fn render_block(block: &Block, width: usize, ascii_only: bool) -> Vec<(Strin
 }
 
 #[must_use]
-pub fn image_box(alt: Option<&str>, width: usize, ascii_only: bool) -> Vec<String> {
+pub fn image_box(
+    alt: Option<&str>,
+    href: Option<&str>,
+    width: usize,
+    ascii_only: bool,
+) -> Vec<String> {
     let box_width = width.clamp(12, 40);
     let (top_left, horizontal, top_right, vertical, bottom_left, bottom_right) = if ascii_only {
         ('+', '-', '+', '|', '+', '+')
@@ -234,8 +295,13 @@ pub fn image_box(alt: Option<&str>, width: usize, ascii_only: bool) -> Vec<Strin
             wrap(alt, box_width.saturating_sub(4))
                 .into_iter()
                 .map(|(line, _)| line)
-                .take(2),
+                .take(4),
         );
+    } else if let Some(name) = href
+        .and_then(|href| href.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+    {
+        content.push(truncate(name, box_width.saturating_sub(4)));
     }
     let mut lines = vec![format!(
         "{top_left}{}{top_right}",
@@ -417,12 +483,54 @@ mod tests {
 
     #[test]
     fn image_box_is_atomic() {
-        let lines = image_box(Some("Map"), 40, true);
+        let lines = image_box(Some("Map"), None, 40, true);
         assert_eq!(
             lines.first(),
             Some(&"+--------------------------------------+".to_owned())
         );
         assert!(lines.iter().any(|line| line.contains("[ IMAGE ]")));
+    }
+
+    #[test]
+    fn image_box_shows_filename_when_alt_missing_and_long_alt() {
+        let named = image_box(None, Some("../Images/map%20one.png"), 40, true);
+        assert!(named.iter().any(|line| line.contains("map%20one.png")));
+        // Long alt text keeps up to four lines instead of two.
+        let alt = "one two three four five six seven eight nine ten eleven twelve";
+        let boxed = image_box(Some(alt), None, 16, true);
+        let content_rows = boxed.len().saturating_sub(3); // borders + [ IMAGE ]
+        assert_eq!(content_rows, 4);
+    }
+
+    #[test]
+    fn line_inline_ranges_survive_wrap_quote_and_justify() {
+        use tr_epub::InlineKind;
+        let text = "plain emphasised words trail after the span ends here".to_owned();
+        let spans = vec![InlineSpan {
+            start: 6,
+            end: 22,
+            kind: InlineKind::Emphasis,
+        }];
+        for block in [Block::Paragraph(text.clone()), Block::Quote(text.clone())] {
+            let lines = layout_with(
+                std::slice::from_ref(&block),
+                24,
+                LayoutOptions {
+                    ascii_only: true,
+                    justify: true,
+                    ..LayoutOptions::default()
+                },
+            );
+            let mut styled = String::new();
+            for line in &lines {
+                for (start, end, span) in line_inline_ranges(line, &text, &spans) {
+                    assert_eq!(span, 0);
+                    styled.push_str(line.text.get(start..end).unwrap());
+                    styled.push(' ');
+                }
+            }
+            assert_eq!(styled.trim(), "emphasised words");
+        }
     }
 
     #[test]

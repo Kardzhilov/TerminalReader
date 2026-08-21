@@ -492,6 +492,8 @@ mod tests {
                     ordinal: *ordinal,
                 })
                 .collect(),
+            inline: Vec::new(),
+            ids: Vec::new(),
         }
     }
 

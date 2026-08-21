@@ -34,6 +34,9 @@ pub struct SavedPosition {
     /// Byte offset of the first visible word within the block.
     #[serde(default, alias = "block_line")]
     pub char_offset: usize,
+    /// Fraction of the book read when saved (0.0 when unknown).
+    #[serde(default)]
+    pub percent: f64,
 }
 
 /// Newest saved positions kept on disk; the stalest are evicted beyond this.
@@ -162,6 +165,9 @@ pub struct ThemeConfig {
     /// Adjust secondary colors for light terminal backgrounds.
     #[serde(default)]
     pub light: bool,
+    /// Blink the text-input caret; disable to reduce motion.
+    #[serde(default = "default_true")]
+    pub caret_blink: bool,
 }
 
 fn default_preset() -> String {
@@ -178,6 +184,7 @@ impl Default for ThemeConfig {
             preset: default_preset(),
             accent: default_accent(),
             light: false,
+            caret_blink: true,
         }
     }
 }
@@ -557,6 +564,20 @@ impl BookmarkStore {
         Ok(true)
     }
 
+    /// Change the label of the bookmark at `index`.
+    pub fn rename(&mut self, path: &Path, index: usize, label: String) -> Result<bool, CoreError> {
+        let Some(entry) = self
+            .books
+            .get_mut(path)
+            .and_then(|entries| entries.get_mut(index))
+        else {
+            return Ok(false);
+        };
+        entry.label = label;
+        self.save()?;
+        Ok(true)
+    }
+
     fn save(&self) -> Result<(), CoreError> {
         let destination = state_file("bookmarks.json")?;
         write_json_atomic(
@@ -632,6 +653,10 @@ impl StatsStore {
 pub struct LibraryBook {
     pub path: PathBuf,
     pub metadata: BookMetadata,
+    /// Number of spine items, for rough progress display (0 when unknown).
+    pub spine_count: usize,
+    /// File modification time, for "newest first" sorting.
+    pub mtime: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,6 +665,8 @@ struct ScanCacheEntry {
     mtime: u64,
     title: String,
     authors: Vec<String>,
+    #[serde(default)]
+    spine_count: usize,
 }
 
 /// Library metadata cache keyed by path and validated by size and mtime.
@@ -672,15 +699,29 @@ impl ScanCache {
         Ok(())
     }
 
-    fn lookup(&self, path: &Path, size: u64, mtime: u64) -> Option<BookMetadata> {
+    fn lookup(&self, path: &Path, size: u64, mtime: u64) -> Option<(BookMetadata, usize)> {
         let entry = self.entries.get(path)?;
-        (entry.size == size && entry.mtime == mtime).then(|| BookMetadata {
-            title: entry.title.clone(),
-            authors: entry.authors.clone(),
+        // Entries from older cache versions lack a spine count; treat them
+        // as misses so the count backfills on the next scan.
+        (entry.size == size && entry.mtime == mtime && entry.spine_count > 0).then(|| {
+            (
+                BookMetadata {
+                    title: entry.title.clone(),
+                    authors: entry.authors.clone(),
+                },
+                entry.spine_count,
+            )
         })
     }
 
-    fn store(&mut self, path: PathBuf, size: u64, mtime: u64, metadata: &BookMetadata) {
+    fn store(
+        &mut self,
+        path: PathBuf,
+        size: u64,
+        mtime: u64,
+        metadata: &BookMetadata,
+        spine_count: usize,
+    ) {
         self.entries.insert(
             path,
             ScanCacheEntry {
@@ -688,6 +729,7 @@ impl ScanCache {
                 mtime,
                 title: metadata.title.clone(),
                 authors: metadata.authors.clone(),
+                spine_count,
             },
         );
         self.dirty = true;
@@ -748,13 +790,21 @@ fn scan_directory(
                 continue;
             };
             seen.push(path.clone());
-            if let Some(metadata) = cache.lookup(&path, size, mtime) {
-                books.push(LibraryBook { path, metadata });
+            if let Some((metadata, spine_count)) = cache.lookup(&path, size, mtime) {
+                books.push(LibraryBook {
+                    path,
+                    metadata,
+                    spine_count,
+                    mtime,
+                });
             } else if let Ok(book) = EpubBook::open(&path) {
-                cache.store(path.clone(), size, mtime, &book.metadata);
+                let spine_count = book.spine.len();
+                cache.store(path.clone(), size, mtime, &book.metadata, spine_count);
                 books.push(LibraryBook {
                     path,
                     metadata: book.metadata,
+                    spine_count,
+                    mtime,
                 });
             }
         }
@@ -865,6 +915,7 @@ mod tests {
                 preset: "gruvbox".to_owned(),
                 accent: "green".to_owned(),
                 light: true,
+                caret_blink: false,
             },
             keys: KeyBindings {
                 contents: Some('c'),
@@ -898,6 +949,7 @@ mod tests {
         assert_eq!(parsed.theme.preset, "gruvbox");
         assert_eq!(parsed.theme.accent, "green");
         assert!(parsed.theme.light);
+        assert!(!parsed.theme.caret_blink);
         assert_eq!(parsed.keys.contents, Some('c'));
         assert_eq!(parsed.keys.search, None);
         assert_eq!(parsed.sync.server_url, "https://kosync.eu");
@@ -922,6 +974,7 @@ mod tests {
         assert_eq!(parsed.theme.preset, "custom");
         assert_eq!(parsed.theme.accent, "cyan");
         assert!(!parsed.theme.light);
+        assert!(parsed.theme.caret_blink);
         assert_eq!(parsed.keys.contents, None);
         assert!(parsed.sync.excluded_books.is_empty());
         assert_eq!(parsed.sync.server_url, "https://kosync.eu");
@@ -954,12 +1007,14 @@ mod tests {
             title: "Kept".to_owned(),
             authors: vec!["Author".to_owned()],
         };
-        cache.store(kept.clone(), 10, 20, &metadata);
-        cache.store(deleted.clone(), 1, 2, &metadata);
+        cache.store(kept.clone(), 10, 20, &metadata, 12);
+        cache.store(deleted.clone(), 1, 2, &metadata, 12);
 
         assert_eq!(
-            cache.lookup(&kept, 10, 20).map(|found| found.title),
-            Some("Kept".to_owned())
+            cache
+                .lookup(&kept, 10, 20)
+                .map(|(found, spine_count)| (found.title, spine_count)),
+            Some(("Kept".to_owned(), 12))
         );
         assert_eq!(cache.lookup(&kept, 10, 21), None, "mtime change misses");
         assert_eq!(cache.lookup(&kept, 11, 20), None, "size change misses");

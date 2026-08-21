@@ -43,6 +43,8 @@ pub struct SpineItem {
 pub struct TocEntry {
     pub label: String,
     pub spine_index: usize,
+    /// Nesting level in the navigation tree (0 = top level).
+    pub depth: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +73,30 @@ pub enum Block {
 pub struct SourcedBlock {
     pub block: Block,
     pub source_path: Vec<SourcePathStep>,
+    /// Inline emphasis and note references within the block text.
+    pub inline: Vec<InlineSpan>,
+    /// Element ids anchoring this block: its own plus those of enclosing
+    /// elements not already claimed by an earlier block.
+    pub ids: Vec<String>,
+}
+
+/// Inline styling or semantics over a block's text, as byte offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: InlineKind,
+}
+
+/// What an [`InlineSpan`] marks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineKind {
+    /// `<em>`, `<i>`, `<cite>`, `<dfn>`, `<var>`.
+    Emphasis,
+    /// `<strong>`, `<b>`.
+    Strong,
+    /// An `epub:type="noteref"` link; the payload is the target href.
+    Noteref(String),
 }
 
 #[derive(Debug)]
@@ -139,6 +165,20 @@ impl EpubBook {
         let path = resolve_path(&chapter_path, href);
         let bytes = read_entry_bytes(&mut self.archive, &path)?;
         Ok((path, bytes))
+    }
+
+    /// Resolve an in-chapter link (optionally carrying a fragment) to the
+    /// spine index of the chapter it points at. An empty file part means
+    /// the current chapter.
+    #[must_use]
+    pub fn spine_index_for(&self, chapter_index: usize, href: &str) -> Option<usize> {
+        let file = href.split('#').next().unwrap_or_default();
+        if file.is_empty() {
+            return Some(chapter_index);
+        }
+        let base = &self.spine.get(chapter_index)?.path;
+        let target = resolve_path(base, file);
+        self.spine.iter().position(|item| item.path == target)
     }
 }
 
@@ -401,6 +441,7 @@ fn parse_ncx(xml: &str, ncx_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEn
     let mut buf = Vec::new();
     let mut in_nav_map = false;
     let mut in_label = false;
+    let mut point_depth = 0_usize;
     let mut label = String::new();
     let mut pending_label = None::<String>;
     let mut entries = Vec::new();
@@ -409,6 +450,7 @@ fn parse_ncx(xml: &str, ncx_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEn
         match reader.read_event_into(&mut buf)? {
             Event::Start(element) => match local_name(element.name().as_ref()).as_str() {
                 "navmap" => in_nav_map = true,
+                "navpoint" if in_nav_map => point_depth += 1,
                 "navlabel" if in_nav_map => {
                     in_label = true;
                     label.clear();
@@ -440,7 +482,11 @@ fn parse_ncx(xml: &str, ncx_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEn
                         if let Some(spine_index) = spine.iter().position(|item| item.path == target)
                         {
                             if !label.is_empty() {
-                                entries.push(TocEntry { label, spine_index });
+                                entries.push(TocEntry {
+                                    label,
+                                    spine_index,
+                                    depth: point_depth.saturating_sub(1),
+                                });
                             }
                         }
                     }
@@ -448,6 +494,7 @@ fn parse_ncx(xml: &str, ncx_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEn
             }
             Event::End(element) => match local_name(element.name().as_ref()).as_str() {
                 "navmap" => in_nav_map = false,
+                "navpoint" if in_nav_map => point_depth = point_depth.saturating_sub(1),
                 "navlabel" if in_label => {
                     in_label = false;
                     pending_label = Some(normalize_text(&label));
@@ -468,7 +515,8 @@ fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<Toc
     let mut buf = Vec::new();
     let mut depth = 0_usize;
     let mut toc_depth = None;
-    let mut link = None::<(String, String)>;
+    let mut list_depth = 0_usize;
+    let mut link = None::<(String, String, usize)>;
     let mut entries = Vec::new();
 
     loop {
@@ -481,31 +529,34 @@ fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<Toc
                         .is_some_and(|value| value.split_whitespace().any(|item| item == "toc"))
                 {
                     toc_depth = Some(depth);
+                    list_depth = 0;
+                } else if toc_depth.is_some() && (name == "ol" || name == "ul") {
+                    list_depth += 1;
                 } else if name == "a" && toc_depth.is_some() {
                     if let Some(href) = attribute(&element, b"href")? {
-                        link = Some((href, String::new()));
+                        link = Some((href, String::new(), list_depth.saturating_sub(1)));
                     }
                 }
             }
             Event::Text(text) => {
-                if let Some((_, label)) = &mut link {
+                if let Some((_, label, _)) = &mut link {
                     label.push_str(&text.xml_content(quick_xml::XmlVersion::Implicit1_0)?);
                 }
             }
             Event::GeneralRef(reference) => {
-                if let Some((_, label)) = &mut link {
+                if let Some((_, label, _)) = &mut link {
                     push_general_ref(label, &reference);
                 }
             }
             Event::CData(data) => {
-                if let Some((_, label)) = &mut link {
+                if let Some((_, label, _)) = &mut link {
                     label.push_str(&String::from_utf8_lossy(&data.into_inner()));
                 }
             }
             Event::End(element) => {
                 let name = local_name(element.name().as_ref());
                 if name == "a" {
-                    if let Some((href, label)) = link.take() {
+                    if let Some((href, label, entry_depth)) = link.take() {
                         let target_path =
                             resolve_path(nav_path, href.split('#').next().unwrap_or_default());
                         if let Some(spine_index) =
@@ -513,10 +564,17 @@ fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<Toc
                         {
                             let label = normalize_text(&label);
                             if !label.is_empty() {
-                                entries.push(TocEntry { label, spine_index });
+                                entries.push(TocEntry {
+                                    label,
+                                    spine_index,
+                                    depth: entry_depth,
+                                });
                             }
                         }
                     }
+                }
+                if toc_depth.is_some() && (name == "ol" || name == "ul") {
+                    list_depth = list_depth.saturating_sub(1);
                 }
                 if name == "nav" && toc_depth == Some(depth) {
                     toc_depth = None;
@@ -559,15 +617,32 @@ pub fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
                     )
                 } else if name == "image" {
                     (None, attribute_local(&element, b"href").ok().flatten())
+                } else if name == "a" {
+                    (None, attribute(&element, b"href").ok().flatten())
                 } else {
                     (None, None)
                 };
+                let noteref = name == "a"
+                    && attribute_local(&element, b"type")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|value| {
+                            value.split_whitespace().any(|item| item == "noteref")
+                        });
+                let ids = attribute(&element, b"id")
+                    .ok()
+                    .flatten()
+                    .into_iter()
+                    .collect();
                 stack.push(ElementState {
                     name,
                     ordinal,
                     text: String::new(),
                     alt,
                     href,
+                    ids,
+                    noteref,
+                    spans: Vec::new(),
                 });
                 sibling_counts.push(HashMap::new());
             }
@@ -596,22 +671,7 @@ pub fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
             Ok(Event::End(_)) => {
                 if let Some(element) = stack.pop() {
                     sibling_counts.pop();
-                    // <pre> is the one element where whitespace is meaningful.
-                    let text = if element.name == "pre" {
-                        normalize_pre_text(&element.text)
-                    } else {
-                        normalize_text(&element.text)
-                    };
-                    if let Some(block) =
-                        block_for_element(&element.name, text, element.alt, element.href)
-                    {
-                        blocks.push(SourcedBlock {
-                            block,
-                            source_path: source_path(&stack, &element.name, element.ordinal),
-                        });
-                    } else if let Some(parent) = stack.last_mut() {
-                        parent.text.push_str(&element.text);
-                    }
+                    finish_chapter_element(element, &mut stack, &mut blocks);
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -629,6 +689,96 @@ struct ElementState {
     text: String,
     alt: Option<String>,
     href: Option<String>,
+    /// Element ids waiting to be claimed by the next block created inside.
+    ids: Vec<String>,
+    /// This is an `epub:type="noteref"` link.
+    noteref: bool,
+    /// Inline spans collected so far, as raw byte offsets into `text`.
+    spans: Vec<InlineSpan>,
+}
+
+/// Close an element: emit a block, or merge its text and spans into the parent.
+fn finish_chapter_element(
+    mut element: ElementState,
+    stack: &mut [ElementState],
+    blocks: &mut Vec<SourcedBlock>,
+) {
+    let (text, inline) = if element.name == "pre" {
+        (normalize_pre_text(&element.text), Vec::new())
+    } else {
+        normalize_text_with_spans(&element.text, &element.spans)
+    };
+    let alt = element.alt.take();
+    let href = element.href.take();
+    if let Some(block) = block_for_element(&element.name, text, alt, href.clone()) {
+        blocks.push(SourcedBlock {
+            block,
+            source_path: source_path(stack, &element.name, element.ordinal),
+            inline,
+            ids: claim_ids(stack, std::mem::take(&mut element.ids)),
+        });
+    } else if let Some(parent) = stack.last_mut() {
+        element.href = href;
+        merge_inline_element(parent, element);
+    }
+}
+
+/// Merge a closed inline element into its parent: raw text, shifted spans,
+/// a possible emphasis span of its own, and note-reference markers.
+fn merge_inline_element(parent: &mut ElementState, mut element: ElementState) {
+    parent.ids.append(&mut element.ids);
+    let base = parent.text.len();
+    if element.noteref {
+        if let Some(href) = element.href {
+            let label = normalize_text(&element.text);
+            let marker = if label.is_empty() {
+                "[*]".to_owned()
+            } else {
+                format!("[{label}]")
+            };
+            parent.spans.push(InlineSpan {
+                start: base,
+                end: base + marker.len(),
+                kind: InlineKind::Noteref(href),
+            });
+            parent.text.push_str(&marker);
+            return;
+        }
+    }
+    for span in element.spans.drain(..) {
+        parent.spans.push(InlineSpan {
+            start: base + span.start,
+            end: base + span.end,
+            kind: span.kind,
+        });
+    }
+    let kind = match element.name.as_str() {
+        "em" | "i" | "cite" | "dfn" | "var" => Some(InlineKind::Emphasis),
+        "strong" | "b" => Some(InlineKind::Strong),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        if !element.text.is_empty() {
+            parent.spans.push(InlineSpan {
+                start: base,
+                end: base + element.text.len(),
+                kind,
+            });
+        }
+    }
+    parent.text.push_str(&element.text);
+}
+
+/// Ids anchoring a new block: the element's own plus any not yet claimed
+/// by an earlier block from the enclosing elements (so `<aside id="fn1">`
+/// resolves to the first block inside the aside).
+fn claim_ids(stack: &mut [ElementState], own: Vec<String>) -> Vec<String> {
+    let mut ids: Vec<String> = stack
+        .iter_mut()
+        .flat_map(|ancestor| std::mem::take(&mut ancestor.ids))
+        .collect();
+    ids.extend(own);
+    ids
 }
 
 /// Handle a self-closing element inside a chapter: `<img/>`, `<image/>`,
@@ -649,11 +799,29 @@ fn empty_chapter_element(
         blocks.push(SourcedBlock {
             block: Block::Image { alt, href },
             source_path: source_path(stack, &name, 1),
+            inline: Vec::new(),
+            ids: claim_ids(
+                stack,
+                attribute(element, b"id")
+                    .ok()
+                    .flatten()
+                    .into_iter()
+                    .collect(),
+            ),
         });
     } else if name == "hr" {
         blocks.push(SourcedBlock {
             block: Block::Rule,
             source_path: source_path(stack, &name, 1),
+            inline: Vec::new(),
+            ids: claim_ids(
+                stack,
+                attribute(element, b"id")
+                    .ok()
+                    .flatten()
+                    .into_iter()
+                    .collect(),
+            ),
         });
     } else if name == "br" {
         if let Some(parent) = stack.last_mut() {
@@ -702,6 +870,60 @@ fn source_path(stack: &[ElementState], name: &str, ordinal: usize) -> Vec<Source
 
 fn normalize_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Collapse whitespace like [`normalize_text`] while remapping `spans` from
+/// raw-text offsets to offsets in the normalized text. Spans that collapse
+/// to nothing are dropped.
+fn normalize_text_with_spans(raw: &str, spans: &[InlineSpan]) -> (String, Vec<InlineSpan>) {
+    if spans.is_empty() {
+        return (normalize_text(raw), Vec::new());
+    }
+    let mut boundaries: Vec<usize> = spans
+        .iter()
+        .flat_map(|span| [span.start, span.end])
+        .collect();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let mut mapped: HashMap<usize, usize> = HashMap::new();
+    let mut next = boundaries.into_iter().peekable();
+    let mut normalized = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for (offset, character) in raw.char_indices() {
+        if next.peek() == Some(&offset) {
+            next.next();
+            // A boundary at the start of a word lands after the collapsed
+            // space that will be emitted before it.
+            let landing =
+                normalized.len() + usize::from(pending_space && !character.is_whitespace());
+            mapped.insert(offset, landing);
+        }
+        if character.is_whitespace() {
+            pending_space = !normalized.is_empty();
+        } else {
+            if pending_space {
+                normalized.push(' ');
+                pending_space = false;
+            }
+            normalized.push(character);
+        }
+    }
+    for boundary in next {
+        mapped.insert(boundary, normalized.len());
+    }
+    let remapped = spans
+        .iter()
+        .filter_map(|span| {
+            let start = *mapped.get(&span.start)?;
+            let end = *mapped.get(&span.end)?;
+            (start < end).then(|| InlineSpan {
+                start,
+                end,
+                kind: span.kind.clone(),
+            })
+        })
+        .collect();
+    (normalized, remapped)
 }
 
 /// Keep line structure and indentation, only trimming surrounding blank lines.
@@ -1033,6 +1255,66 @@ mod tests {
     }
 
     #[test]
+    fn inline_emphasis_maps_to_normalized_offsets() {
+        let blocks =
+            parse_chapter("<html><body><p>Some   <em>fancy\n words</em> here</p></body></html>");
+        assert_eq!(blocks.len(), 1);
+        let block = &blocks[0];
+        assert!(matches!(
+            &block.block,
+            Block::Paragraph(text) if text == "Some fancy words here"
+        ));
+        assert_eq!(
+            block.inline,
+            vec![InlineSpan {
+                start: 5,
+                end: 16,
+                kind: InlineKind::Emphasis,
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_inline_spans_and_noterefs_merge_upward() {
+        let blocks = parse_chapter(
+            r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body>
+            <p><em>a <strong>b</strong></em> then<a epub:type="noteref" href="notes.xhtml#fn1">1</a>.</p>
+            </body></html>"#,
+        );
+        assert_eq!(blocks.len(), 1);
+        let block = &blocks[0];
+        assert!(matches!(
+            &block.block,
+            Block::Paragraph(text) if text == "a b then[1]."
+        ));
+        assert!(block.inline.contains(&InlineSpan {
+            start: 2,
+            end: 3,
+            kind: InlineKind::Strong,
+        }));
+        assert!(block.inline.contains(&InlineSpan {
+            start: 0,
+            end: 3,
+            kind: InlineKind::Emphasis,
+        }));
+        assert!(block.inline.contains(&InlineSpan {
+            start: 8,
+            end: 11,
+            kind: InlineKind::Noteref("notes.xhtml#fn1".to_owned()),
+        }));
+    }
+
+    #[test]
+    fn wrapper_ids_are_claimed_by_first_inner_block() {
+        let blocks = parse_chapter(
+            "<html><body><aside id='fn1'><p>Note one.</p><p id='fn2'>Note two.</p></aside></body></html>",
+        );
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].ids, vec!["fn1".to_owned()]);
+        assert_eq!(blocks[1].ids, vec!["fn2".to_owned()]);
+    }
+
+    #[test]
     fn entity_references_resolve_in_opf_metadata() -> Result<(), EpubError> {
         let opf = r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
             <metadata>
@@ -1134,8 +1416,35 @@ mod tests {
         let toc = parse_nav(nav, "OPS/nav.xhtml", &spine)?;
         assert_eq!(toc.len(), 2);
         assert_eq!(toc[0].label, "Chapter 1: Dawn");
+        assert_eq!(toc[0].depth, 0);
         assert_eq!(toc[1].spine_index, 1);
         assert_eq!(toc[1].label, "The Time I Fought 30 Snakes");
+        Ok(())
+    }
+
+    #[test]
+    fn nav_nesting_depth_is_recorded() -> Result<(), EpubError> {
+        let spine = vec![
+            SpineItem {
+                path: "OPS/one.xhtml".to_owned(),
+                linear: true,
+            },
+            SpineItem {
+                path: "OPS/two.xhtml".to_owned(),
+                linear: true,
+            },
+        ];
+        let nav = r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body>
+            <nav epub:type="toc"><ol>
+                <li><a href="one.xhtml">Part One</a>
+                    <ol><li><a href="two.xhtml">Chapter 1</a></li></ol>
+                </li>
+            </ol></nav>
+        </body></html>"#;
+        let toc = parse_nav(nav, "OPS/nav.xhtml", &spine)?;
+        assert_eq!(toc.len(), 2);
+        assert_eq!(toc[0].depth, 0);
+        assert_eq!(toc[1].depth, 1);
         Ok(())
     }
 
@@ -1168,8 +1477,10 @@ mod tests {
         assert_eq!(toc.len(), 2);
         assert_eq!(toc[0].label, "First Steps");
         assert_eq!(toc[0].spine_index, 0);
+        assert_eq!(toc[0].depth, 0);
         assert_eq!(toc[1].label, "Nested Finale");
         assert_eq!(toc[1].spine_index, 1);
+        assert_eq!(toc[1].depth, 1);
         Ok(())
     }
 

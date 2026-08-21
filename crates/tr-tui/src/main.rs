@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -58,6 +58,11 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Print a shell completion script for bash, zsh, fish, powershell, or elvish.
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
 }
 
 fn main() -> Result<()> {
@@ -78,9 +83,24 @@ fn main() -> Result<()> {
         Some(Command::Hash { book }) => hash(&book),
         Some(Command::Doctor { book }) => doctor(book.as_deref()),
         Some(Command::Update { check }) => self_update(check),
+        Some(Command::Completions { shell }) => {
+            completions(shell);
+            Ok(())
+        }
         Some(Command::Read { book }) => run_tui(config, config_backup, Some(book), cli.offline),
         None => run_tui(config, config_backup, None, cli.offline),
     }
+}
+
+/// Write a completion script for `shell` to stdout, for eval or install.
+fn completions(shell: clap_complete::Shell) {
+    let mut command = Cli::command();
+    clap_complete::generate(
+        shell,
+        &mut command,
+        "terminalreader",
+        &mut std::io::stdout(),
+    );
 }
 
 fn self_update(check_only: bool) -> Result<()> {

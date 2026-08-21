@@ -97,14 +97,17 @@ impl TextInput {
         self.reset_blink();
     }
 
+    /// Render with the caret blinking, or held steady when `blink` is off
+    /// (a reduced-motion preference).
     #[must_use]
-    pub fn render(&self, label: &str) -> String {
+    pub fn render_caret(&self, label: &str, blink: bool) -> String {
         let display = if self.masked {
             "*".repeat(self.value.chars().count())
         } else {
             self.value.clone()
         };
-        let blink_on = Instant::now().duration_since(self.blink_epoch).as_millis() / 500 % 2 == 0;
+        let blink_on =
+            !blink || Instant::now().duration_since(self.blink_epoch).as_millis() / 500 % 2 == 0;
         if !blink_on {
             return format!("{label}{display}");
         }

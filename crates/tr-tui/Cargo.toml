@@ -6,13 +6,21 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+# Render images inside the reader via kitty/iTerm2/sixel graphics
+# (needs a capable terminal; falls back to the text placeholder).
+inline-images = ["dep:ratatui-image", "dep:image"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 crossterm.workspace = true
 flate2.workspace = true
 hex.workspace = true
+image = { version = "0.25", optional = true }
 ratatui.workspace = true
+ratatui-image = { version = "11.0", default-features = false, features = ["image-defaults", "crossterm"], optional = true }
 reqwest.workspace = true
 serde.workspace = true
 sha2.workspace = true
