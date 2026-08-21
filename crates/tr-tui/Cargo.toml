@@ -19,6 +19,7 @@ tr-core = { path = "../tr-core" }
 tr-epub = { path = "../tr-epub" }
 tr-kosync = { path = "../tr-kosync" }
 tr-render = { path = "../tr-render" }
+unicode-width.workspace = true
 url.workspace = true
 zip.workspace = true
 

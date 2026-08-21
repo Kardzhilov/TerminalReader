@@ -2953,6 +2953,7 @@ dependencies = [
  "tr-epub",
  "tr-kosync",
  "tr-render",
+ "unicode-width",
  "url",
  "zip",
 ]

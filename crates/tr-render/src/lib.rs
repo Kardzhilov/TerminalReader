@@ -1,7 +1,7 @@
 //! Terminal-width-aware rendering and layout for EPUB blocks.
 
 use tr_epub::Block;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Sentinel offset for the blank separator line between blocks.
 const SEPARATOR_OFFSET: usize = usize::MAX;
@@ -117,7 +117,7 @@ pub fn render_block(block: &Block, width: usize, ascii_only: bool) -> Vec<(Strin
             let mut offset = 0;
             let mut lines = Vec::new();
             for line in text.lines() {
-                lines.push((line.chars().take(width).collect(), offset));
+                lines.push((truncate(line, width), offset));
                 offset += line.len() + 1;
             }
             lines
@@ -254,8 +254,19 @@ fn wrap(text: &str, width: usize) -> Vec<(String, usize)> {
     lines
 }
 
+/// Cut to `width` terminal columns, not chars, so CJK text stays aligned.
 fn truncate(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+    let mut used = 0;
+    let mut result = String::new();
+    for character in text.chars() {
+        let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + char_width > width {
+            break;
+        }
+        used += char_width;
+        result.push(character);
+    }
+    result
 }
 
 #[cfg(test)]

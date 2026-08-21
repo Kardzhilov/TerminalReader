@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use crossterm::event::KeyCode;
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug)]
 pub struct TextInput {
@@ -71,30 +72,54 @@ impl TextInput {
 
     pub fn click(&mut self, column_offset: u16) {
         let target = usize::from(column_offset);
-        self.cursor = self
-            .value
-            .char_indices()
-            .find_map(|(index, _)| (index >= target).then_some(index))
-            .unwrap_or(self.value.len());
+        let mut column = 0;
+        self.cursor = self.value.len();
+        for (index, character) in self.value.char_indices() {
+            if column >= target {
+                self.cursor = index;
+                break;
+            }
+            // Masked inputs render every character one column wide.
+            column += if self.masked {
+                1
+            } else {
+                UnicodeWidthChar::width(character).unwrap_or(0)
+            };
+        }
         self.reset_blink();
     }
 
     #[must_use]
     pub fn render(&self, label: &str) -> String {
-        let before = self.value.get(..self.cursor).unwrap_or_default();
-        let after = self.value.get(self.cursor..).unwrap_or_default();
-        let caret = if Instant::now().duration_since(self.blink_epoch).as_millis() / 500 % 2 == 0 {
-            "|"
+        let display = if self.masked {
+            "*".repeat(self.value.chars().count())
         } else {
-            " "
+            self.value.clone()
         };
-        if self.masked {
-            let before = "*".repeat(before.chars().count());
-            let after = "*".repeat(after.chars().count());
-            format!("{label}{before}{caret}{after}")
-        } else {
-            format!("{label}{before}{caret}{after}")
+        let blink_on = Instant::now().duration_since(self.blink_epoch).as_millis() / 500 % 2 == 0;
+        if !blink_on {
+            return format!("{label}{display}");
         }
+        // Overlay the caret on the char under the cursor so the tail never shifts.
+        let cursor_chars = self
+            .value
+            .get(..self.cursor)
+            .map_or(0, |prefix| prefix.chars().count());
+        let mut overlaid = String::with_capacity(display.len() + 4);
+        let mut at_cursor = false;
+        for (index, character) in display.chars().enumerate() {
+            if index == cursor_chars {
+                at_cursor = true;
+                let width = UnicodeWidthChar::width(character).unwrap_or(1).max(1);
+                overlaid.push_str(&"█".repeat(width));
+            } else {
+                overlaid.push(character);
+            }
+        }
+        if !at_cursor {
+            overlaid.push('█');
+        }
+        format!("{label}{overlaid}")
     }
 
     fn delete(&mut self, forward: bool) -> bool {

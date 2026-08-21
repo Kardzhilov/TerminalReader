@@ -1,7 +1,7 @@
 use std::{
     env,
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -29,6 +29,8 @@ use crate::{
 
 const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 16;
+/// How long footer status messages stay on screen.
+const STATUS_TTL: Duration = Duration::from_secs(5);
 const PROMPT_GO_LABEL: &str = "[Go to position]";
 const PROMPT_STAY_LABEL: &str = "[Stay here]";
 
@@ -65,6 +67,30 @@ impl Palette {
             Style::new().fg(Color::Black).bg(Color::Cyan)
         } else {
             Style::new().add_modifier(Modifier::REVERSED)
+        }
+    }
+
+    fn heading(self) -> Style {
+        if self.color {
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().add_modifier(Modifier::BOLD)
+        }
+    }
+
+    fn dim(self) -> Style {
+        if self.color {
+            Style::new().fg(Color::DarkGray)
+        } else {
+            Style::new().add_modifier(Modifier::DIM)
+        }
+    }
+
+    fn missing(self) -> Style {
+        if self.color {
+            Style::new().fg(Color::Red)
+        } else {
+            Style::new().add_modifier(Modifier::DIM)
         }
     }
 }
@@ -124,6 +150,10 @@ struct SettingsScreen {
     mode: SettingsMode,
     input: TextInput,
     message: Option<String>,
+    /// Rows scrolled off the top of the settings list.
+    scroll: usize,
+    /// Total content rows from the previous draw, for clamping the scroll.
+    row_count: usize,
 }
 
 #[derive(Debug)]
@@ -201,7 +231,11 @@ pub struct App {
     screen: Screen,
     hit_targets: Vec<(Rect, Action)>,
     hover: Option<Position>,
+    /// Scroll offset of the screen currently being drawn, for hit targets.
+    scroll_offset: usize,
     status: Option<String>,
+    /// The displayed status and when it appeared, for auto-expiry.
+    status_seen: Option<(String, Instant)>,
     help: bool,
     should_exit: bool,
     next_screen: Option<Screen>,
@@ -246,7 +280,9 @@ impl App {
             },
             hit_targets: Vec::new(),
             hover: None,
+            scroll_offset: 0,
             status: None,
+            status_seen: None,
             help: false,
             should_exit: false,
             next_screen: None,
@@ -270,6 +306,7 @@ impl App {
             self.process_sync_events();
             self.process_update_events();
             self.maybe_timed_push();
+            self.expire_status();
             terminal.draw(|frame| self.draw(frame))?;
             if crossterm::event::poll(Duration::from_millis(50))? {
                 let event = crossterm::event::read()?;
@@ -889,12 +926,12 @@ impl App {
             },
             Screen::Settings(settings) => match mouse.kind {
                 MouseEventKind::ScrollUp if settings.mode == SettingsMode::Browse => {
-                    settings.selection = settings.selection.saturating_sub(1);
+                    settings.scroll = settings.scroll.saturating_sub(1);
                     true
                 }
                 MouseEventKind::ScrollDown if settings.mode == SettingsMode::Browse => {
-                    settings.selection = (settings.selection + 1)
-                        .min(self.config.library.book_dirs.len().saturating_sub(1));
+                    // Clamped against the row count on the next draw.
+                    settings.scroll += 1;
                     true
                 }
                 _ => false,
@@ -986,6 +1023,7 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         self.hit_targets.clear();
+        self.scroll_offset = 0;
         let area = frame.area();
         if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
             frame.render_widget(Paragraph::new("TerminalReader needs a terminal of at least 60 x 16.\nResize the window to continue."), area);
@@ -1119,18 +1157,11 @@ impl App {
                     recent.spine_count
                 )
             });
-        let recent_rows: Vec<String> = self
+        let recent_rows: Vec<(String, bool)> = self
             .recents
             .list()
             .iter()
-            .map(|recent| {
-                let missing = if recent.path.exists() {
-                    ""
-                } else {
-                    " (missing)"
-                };
-                format!("{}{}", recent.title, missing)
-            })
+            .map(|recent| (recent_row(recent), !recent.path.exists()))
             .collect();
         let dir_rows: Vec<String> = self
             .config
@@ -1152,8 +1183,12 @@ impl App {
         }
         rows.push(String::new());
         rows.push("Recent".to_owned());
-        for text in &recent_rows {
+        let mut missing_rows = Vec::new();
+        for (text, missing) in &recent_rows {
             self.register_row(area, rows.len(), Action::HomeOpen(index));
+            if *missing {
+                missing_rows.push(rows.len());
+            }
             rows.push(Self::selectable_row(home.selection, index, text));
             index += 1;
         }
@@ -1192,10 +1227,13 @@ impl App {
                     .right_aligned(),
             );
         }
-        frame.render_widget(
-            Paragraph::new(self.styled_rows(area, rows)).block(block),
-            area,
-        );
+        let mut text = self.styled_rows(area, rows);
+        for row in missing_rows {
+            if let Some(line) = text.lines.get_mut(row) {
+                line.style = self.palette.missing();
+            }
+        }
+        frame.render_widget(Paragraph::new(text).block(block), area);
     }
 
     fn draw_library(&mut self, frame: &mut Frame, library: &mut LibraryScreen) {
@@ -1269,6 +1307,16 @@ impl App {
     #[allow(clippy::too_many_lines)]
     fn draw_settings(&mut self, frame: &mut Frame, settings: &mut SettingsScreen) {
         let area = frame.area();
+        let visible = usize::from(area.height.saturating_sub(2)).max(1);
+        // Clamp against the previous draw's row count; edit modes pin the
+        // input rows (appended last) into view so you never type blind.
+        let max_scroll = settings.row_count.saturating_sub(visible);
+        settings.scroll = if settings.mode == SettingsMode::Browse {
+            settings.scroll.min(max_scroll)
+        } else {
+            max_scroll
+        };
+        self.scroll_offset = settings.scroll;
         let dir_rows: Vec<String> = self
             .config
             .library
@@ -1512,8 +1560,10 @@ impl App {
             .title(" Settings ")
             .title_style(self.palette.title())
             .title_bottom(self.styled_footer(area, footer));
+        settings.row_count = rows.len();
+        let visible_rows: Vec<String> = rows.into_iter().skip(settings.scroll).collect();
         frame.render_widget(
-            Paragraph::new(self.styled_rows(area, rows)).block(block),
+            Paragraph::new(self.styled_rows(area, visible_rows)).block(block),
             area,
         );
     }
@@ -1527,8 +1577,16 @@ impl App {
         };
         reader.ensure_layout(area.width, area.height, options);
         let (page, count) = reader.page_numbers();
+        let percent = reader.percentage() * 100.0;
+        let queued = self.sync.queue_len();
+        let badge = if queued > 0 && self.config.sync.auto_sync && self.config.sync.username.is_some()
+        {
+            format!("| {queued} queued ")
+        } else {
+            String::new()
+        };
         let footer = format!(
-            " [Contents] [Previous] [Next] [Home]  [/] chapter | ?: help | page {page}/{count} "
+            " [Contents] [Previous] [Next] [Home]  [/] chapter | ?: help | page {page}/{count} | {percent:.0}% {badge}"
         );
         self.register_footer(
             area,
@@ -1540,14 +1598,28 @@ impl App {
                 ("[Home]", Action::ReaderHome),
             ],
         );
+        let title = reader.chapter_label().map_or_else(
+            || {
+                format!(
+                    " {} — chapter {}/{} ",
+                    reader.book.metadata.title,
+                    reader.chapter_index + 1,
+                    reader.book.spine.len()
+                )
+            },
+            |label| {
+                format!(
+                    " {} — {} ({}/{}) ",
+                    reader.book.metadata.title,
+                    label,
+                    reader.chapter_index + 1,
+                    reader.book.spine.len()
+                )
+            },
+        );
         let mut block = TuiBlock::default()
             .borders(Borders::ALL)
-            .title(format!(
-                " {} — chapter {}/{} ",
-                reader.book.metadata.title,
-                reader.chapter_index + 1,
-                reader.book.spine.len()
-            ))
+            .title(title)
             .title_style(self.palette.title())
             .title_bottom(self.styled_footer(area, &footer));
         if let Some(status) = self.status_line() {
@@ -1557,10 +1629,23 @@ impl App {
                     .right_aligned(),
             );
         }
-        frame.render_widget(
-            Paragraph::new(reader.visible_lines().join("\n")).block(block),
-            area,
-        );
+        let content: Vec<UiLine<'static>> = reader
+            .visible_lines()
+            .iter()
+            .map(|line| {
+                let style = match reader.blocks.get(line.block) {
+                    Some(tr_epub::Block::Heading { .. }) => self.palette.heading(),
+                    Some(
+                        tr_epub::Block::Quote(_)
+                        | tr_epub::Block::Image { .. }
+                        | tr_epub::Block::Rule,
+                    ) => self.palette.dim(),
+                    _ => Style::new(),
+                };
+                UiLine::from(line.text.clone()).style(style)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(Text::from(content)).block(block), area);
         if reader.toc.is_some() {
             self.draw_reader_toc(frame, reader);
         }
@@ -1633,11 +1718,22 @@ impl App {
         let area = reader.toc_area();
         let entries = reader.filtered_toc();
         let rows_count = reader.toc_visible_rows();
+        let current = reader.chapter_index;
+        let (current_mark, read_mark) = if self.config.reading.ascii_only {
+            ('o', 'x')
+        } else {
+            ('●', '✓')
+        };
         let Some(toc) = &mut reader.toc else { return };
         let mut rows = vec![toc.filter.render("Search: ")];
         for (index, entry) in entries.iter().enumerate().skip(toc.top).take(rows_count) {
-            let marker = if index == toc.selection { ">" } else { " " };
-            rows.push(format!("{marker} {:>4}  {}", entry.0 + 1, entry.1));
+            let marker = if index == toc.selection { '>' } else { ' ' };
+            let state = match entry.0.cmp(&current) {
+                std::cmp::Ordering::Equal => current_mark,
+                std::cmp::Ordering::Less => read_mark,
+                std::cmp::Ordering::Greater => ' ',
+            };
+            rows.push(format!("{marker}{state} {:>4}  {}", entry.0 + 1, entry.1));
             self.hit_targets.push((
                 Rect::new(
                     area.x + 1,
@@ -1743,15 +1839,16 @@ impl App {
     }
 
     /// Screen row (0-based content row inside `area`'s border) → y coordinate,
-    /// or `None` when the row is clipped by the border.
-    fn content_row_y(area: Rect, row_index: usize) -> Option<u16> {
-        let y = area.y + 1 + u16::try_from(row_index).ok()?;
+    /// or `None` when the row is scrolled away or clipped by the border.
+    fn content_row_y(&self, area: Rect, row_index: usize) -> Option<u16> {
+        let visible_index = row_index.checked_sub(self.scroll_offset)?;
+        let y = area.y + 1 + u16::try_from(visible_index).ok()?;
         (y < area.y + area.height.saturating_sub(1)).then_some(y)
     }
 
     /// Make an entire content row clickable.
     fn register_row(&mut self, area: Rect, row_index: usize, action: Action) {
-        if let Some(y) = Self::content_row_y(area, row_index) {
+        if let Some(y) = self.content_row_y(area, row_index) {
             self.hit_targets.push((
                 Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1),
                 action,
@@ -1768,7 +1865,7 @@ impl App {
         text: &str,
         labels: &[(&str, Action)],
     ) {
-        let Some(y) = Self::content_row_y(area, row_index) else {
+        let Some(y) = self.content_row_y(area, row_index) else {
             return;
         };
         let mut starts: Vec<(usize, Action)> = labels
@@ -1794,7 +1891,7 @@ impl App {
 
     /// Make the value area of a rendered text input clickable for cursor moves.
     fn register_input_row(&mut self, area: Rect, row_index: usize, label: &str) {
-        let Some(y) = Self::content_row_y(area, row_index) else {
+        let Some(y) = self.content_row_y(area, row_index) else {
             return;
         };
         let label_width = u16::try_from(label.chars().count()).unwrap_or(0);
@@ -1831,7 +1928,8 @@ impl App {
             if recent.path.exists() {
                 let _ = self.open_book(recent.path.clone());
             } else {
-                self.status = Some("Book file is missing.".to_owned());
+                self.status =
+                    Some("Book file is missing — press Del to remove it from Recent.".to_owned());
             }
             return;
         }
@@ -1956,6 +2054,24 @@ impl App {
     /// Combined app/sync status for footers.
     fn status_line(&self) -> Option<String> {
         self.status.clone().or_else(|| self.sync.status.clone())
+    }
+
+    /// Clear the footer status a few seconds after it first appeared.
+    fn expire_status(&mut self) {
+        let Some(current) = self.status_line() else {
+            self.status_seen = None;
+            return;
+        };
+        match &self.status_seen {
+            Some((seen, since)) if *seen == current => {
+                if since.elapsed() >= STATUS_TTL {
+                    self.status = None;
+                    self.sync.status = None;
+                    self.status_seen = None;
+                }
+            }
+            _ => self.status_seen = Some((current, Instant::now())),
+        }
     }
 
     /// Queue a progress push for the reader's current position.
@@ -2200,6 +2316,45 @@ fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
+/// One Recent list row: title — authors — ch. x/y — 2 days ago (missing).
+fn recent_row(recent: &RecentBook) -> String {
+    let authors = if recent.authors.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", recent.authors)
+    };
+    let opened = if recent.last_opened > 0 {
+        format!(" — {}", relative_time(recent.last_opened))
+    } else {
+        String::new()
+    };
+    let missing = if recent.path.exists() {
+        ""
+    } else {
+        " (missing)"
+    };
+    format!(
+        "{}{authors} — ch. {}/{}{opened}{missing}",
+        recent.title,
+        recent.last_chapter + 1,
+        recent.spine_count
+    )
+}
+
+fn relative_time(then: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let delta = now.saturating_sub(then);
+    match delta {
+        0..=59 => "just now".to_owned(),
+        60..=3_599 => format!("{} min ago", delta / 60),
+        3_600..=86_399 => format!("{} h ago", delta / 3_600),
+        86_400..=172_799 => "1 day ago".to_owned(),
+        _ => format!("{} days ago", delta / 86_400),
+    }
+}
+
 fn matching_label(matching: tr_core::MatchingMethod) -> &'static str {
     match matching {
         tr_core::MatchingMethod::Binary => "binary (identical file)",
@@ -2313,13 +2468,18 @@ impl ReaderScreen {
             self.anchor = (line.block, line.char_offset);
         }
     }
-    fn visible_lines(&self) -> Vec<String> {
+    fn visible_lines(&self) -> &[Line] {
         self.lines
             .get(self.top_line..(self.top_line + self.content_height()).min(self.lines.len()))
             .unwrap_or_default()
+    }
+    /// TOC label for the current chapter, when the book provides one.
+    fn chapter_label(&self) -> Option<&str> {
+        self.book
+            .toc
             .iter()
-            .map(|line| line.text.clone())
-            .collect()
+            .find(|entry| entry.spine_index == self.chapter_index)
+            .map(|entry| entry.label.as_str())
     }
     fn page_numbers(&self) -> (usize, usize) {
         let step = self.content_height();
