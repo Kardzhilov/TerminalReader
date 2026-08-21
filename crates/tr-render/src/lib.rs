@@ -160,12 +160,24 @@ fn render_indented_paragraph(
 /// Index of the line containing the (block, char-offset) anchor, for any width.
 #[must_use]
 pub fn line_for_anchor(lines: &[Line], block: usize, char_offset: usize) -> usize {
-    lines
-        .iter()
-        .rposition(|line| {
-            !line.is_separator() && (line.block, line.char_offset) <= (block, char_offset)
-        })
-        .unwrap_or(0)
+    let Some(mut index) = lines.iter().rposition(|line| {
+        !line.is_separator() && (line.block, line.char_offset) <= (block, char_offset)
+    }) else {
+        return 0;
+    };
+    // An image box's lines all share one anchor; land on its top edge, not
+    // its bottom border.
+    while index > 0 {
+        let Some((line, previous)) = lines.get(index).zip(lines.get(index - 1)) else {
+            break;
+        };
+        if line.atomic && previous.atomic && previous.block == line.block {
+            index -= 1;
+        } else {
+            break;
+        }
+    }
+    index
 }
 
 /// Render one block as (line text, byte offset of the line's first word).
@@ -411,6 +423,27 @@ mod tests {
             Some(&"+--------------------------------------+".to_owned())
         );
         assert!(lines.iter().any(|line| line.contains("[ IMAGE ]")));
+    }
+
+    #[test]
+    fn anchor_on_image_block_lands_on_top_edge() {
+        let blocks = vec![
+            Block::Image {
+                alt: Some("Map".to_owned()),
+                href: None,
+            },
+            Block::Paragraph("after the image".to_owned()),
+        ];
+        let lines = layout(&blocks, 60, true);
+        // Opening at the image must show its top border, not its bottom row.
+        assert_eq!(line_for_anchor(&lines, 0, 0), 0);
+        assert!(lines[0].text.starts_with('+'));
+        // Anchors within later blocks are unaffected.
+        let paragraph_line = lines
+            .iter()
+            .position(|line| line.block == 1 && !line.is_separator())
+            .unwrap_or(0);
+        assert_eq!(line_for_anchor(&lines, 1, 0), paragraph_line);
     }
 
     #[test]

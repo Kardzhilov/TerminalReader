@@ -66,7 +66,7 @@ pub struct ProgressUpdate {
     pub device_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct ProgressRecord {
     pub document: Option<String>,
     pub progress: Option<String>,
@@ -144,7 +144,7 @@ impl KOSyncClient {
     }
 
     /// Fetch the server's progress record; `Ok(None)` when the document has
-    /// never been synced (servers answer 404 for unknown documents).
+    /// never been synced (servers answer 404, or 200 with an empty record).
     pub fn pull(&self, document: &str) -> Result<Option<ProgressRecord>, SyncError> {
         let response = self
             .authenticated_client(PROGRESS_TIMEOUT)?
@@ -153,7 +153,12 @@ impl KOSyncClient {
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        parse_progress_response(response, &[StatusCode::OK]).map(Some)
+        let record = parse_progress_response(response, &[StatusCode::OK])?;
+        // No position payload means the server has never seen this document.
+        if record.progress.is_none() && record.percentage.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(record))
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, SyncError> {
@@ -197,7 +202,13 @@ fn parse_progress_response(
     if !expected.contains(&status) {
         return Err(SyncError::Http(status));
     }
-    Ok(response.json()?)
+    Ok(record_from_body(&response.text()?))
+}
+
+/// Decode a progress body leniently: some servers answer with an empty body,
+/// `{}`, or `null` where others answer 404.
+fn record_from_body(body: &str) -> ProgressRecord {
+    serde_json::from_str(body).unwrap_or_default()
 }
 
 #[must_use]
@@ -361,6 +372,17 @@ mod tests {
             password_hash("koreader"),
             "90af4ab23bb923fc935ee9997e45b134"
         );
+    }
+
+    #[test]
+    fn record_from_body_tolerates_empty_and_null_responses() {
+        assert_eq!(record_from_body(""), ProgressRecord::default());
+        assert_eq!(record_from_body("{}"), ProgressRecord::default());
+        assert_eq!(record_from_body("null"), ProgressRecord::default());
+        assert_eq!(record_from_body("<html>err</html>"), ProgressRecord::default());
+        let record = record_from_body(r#"{"progress":"/body/p[1].0","percentage":0.5}"#);
+        assert_eq!(record.progress.as_deref(), Some("/body/p[1].0"));
+        assert_eq!(record.percentage, Some(0.5));
     }
 
     #[test]
