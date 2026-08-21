@@ -4,7 +4,7 @@ pub mod credentials;
 pub mod logging;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -694,9 +694,10 @@ impl ScanCache {
     }
 
     fn prune(&mut self, root: &Path, seen: &[PathBuf]) {
+        let seen: HashSet<&Path> = seen.iter().map(PathBuf::as_path).collect();
         let before = self.entries.len();
         self.entries
-            .retain(|path, _| !path.starts_with(root) || seen.contains(path));
+            .retain(|path, _| !path.starts_with(root) || seen.contains(path.as_path()));
         if self.entries.len() != before {
             self.dirty = true;
         }
@@ -731,7 +732,13 @@ fn scan_directory(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // `file_type` does not follow symlinks, so a symlinked directory is
+        // skipped instead of risking an infinite symlink cycle. Symlinked
+        // EPUB files still work: their metadata is read through the link.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             scan_directory(&path, cache, books, seen);
         } else if path
             .extension()

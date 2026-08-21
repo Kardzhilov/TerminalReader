@@ -250,7 +250,7 @@ struct ParsedOpf {
 
 fn parse_opf(xml: &str, opf_path: &str) -> Result<ParsedOpf, EpubError> {
     let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut manifest = HashMap::new();
     let mut nav_path = None;
@@ -259,6 +259,7 @@ fn parse_opf(xml: &str, opf_path: &str) -> Result<ParsedOpf, EpubError> {
     let mut title = String::new();
     let mut authors = Vec::new();
     let mut current_text_tag = None::<String>;
+    let mut current_text = String::new();
 
     loop {
         match reader.read_event_into(&mut buf)? {
@@ -266,60 +267,51 @@ fn parse_opf(xml: &str, opf_path: &str) -> Result<ParsedOpf, EpubError> {
                 let name = local_name(element.name().as_ref());
                 if name == "title" || name == "creator" {
                     current_text_tag = Some(name.clone());
+                    current_text.clear();
                 }
-                if name == "item" {
-                    record_manifest_item(
-                        &element,
-                        opf_path,
-                        &mut manifest,
-                        &mut nav_path,
-                        &mut ncx_path,
-                    )?;
-                }
-                if name == "itemref" {
-                    let idref = attribute(&element, b"idref")?;
-                    let linear = attribute(&element, b"linear")?.is_none_or(|value| value != "no");
-                    if let Some(idref) = idref {
-                        spine_refs.push((idref, linear));
-                    }
-                }
+                record_opf_element(
+                    &element,
+                    &name,
+                    opf_path,
+                    &mut manifest,
+                    &mut nav_path,
+                    &mut ncx_path,
+                    &mut spine_refs,
+                )?;
             }
             Event::Empty(element) => {
                 let name = local_name(element.name().as_ref());
-                if name == "item" {
-                    record_manifest_item(
-                        &element,
-                        opf_path,
-                        &mut manifest,
-                        &mut nav_path,
-                        &mut ncx_path,
-                    )?;
-                }
-                if name == "itemref" {
-                    let idref = attribute(&element, b"idref")?;
-                    let linear = attribute(&element, b"linear")?.is_none_or(|value| value != "no");
-                    if let Some(idref) = idref {
-                        spine_refs.push((idref, linear));
-                    }
-                }
+                record_opf_element(
+                    &element,
+                    &name,
+                    opf_path,
+                    &mut manifest,
+                    &mut nav_path,
+                    &mut ncx_path,
+                    &mut spine_refs,
+                )?;
             }
             Event::Text(text) => {
-                if let Some(tag) = &current_text_tag {
-                    let value = text
-                        .xml_content(quick_xml::XmlVersion::Implicit1_0)?
-                        .trim()
-                        .to_owned();
-                    if tag == "title" && title.is_empty() {
-                        title = value;
-                    } else if tag == "creator" && !value.is_empty() {
-                        authors.push(value);
-                    }
+                if current_text_tag.is_some() {
+                    current_text.push_str(&text.xml_content(quick_xml::XmlVersion::Implicit1_0)?);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if current_text_tag.is_some() {
+                    push_general_ref(&mut current_text, &reference);
                 }
             }
             Event::End(element) => {
                 let name = local_name(element.name().as_ref());
                 if matches!(name.as_str(), "title" | "creator") {
-                    current_text_tag = None;
+                    if let Some(tag) = current_text_tag.take() {
+                        let value = normalize_text(&current_text);
+                        if tag == "title" && title.is_empty() {
+                            title = value;
+                        } else if tag == "creator" && !value.is_empty() {
+                            authors.push(value);
+                        }
+                    }
                 }
             }
             Event::Eof => break,
@@ -353,6 +345,30 @@ fn parse_opf(xml: &str, opf_path: &str) -> Result<ParsedOpf, EpubError> {
     })
 }
 
+/// Handle one OPF manifest `item` or spine `itemref` element, which may be
+/// a start tag or self-closing.
+fn record_opf_element(
+    element: &quick_xml::events::BytesStart<'_>,
+    name: &str,
+    opf_path: &str,
+    manifest: &mut HashMap<String, String>,
+    nav_path: &mut Option<String>,
+    ncx_path: &mut Option<String>,
+    spine_refs: &mut Vec<(String, bool)>,
+) -> Result<(), EpubError> {
+    if name == "item" {
+        record_manifest_item(element, opf_path, manifest, nav_path, ncx_path)?;
+    }
+    if name == "itemref" {
+        let idref = attribute(element, b"idref")?;
+        let linear = attribute(element, b"linear")?.is_none_or(|value| value != "no");
+        if let Some(idref) = idref {
+            spine_refs.push((idref, linear));
+        }
+    }
+    Ok(())
+}
+
 fn record_manifest_item(
     element: &quick_xml::events::BytesStart<'_>,
     opf_path: &str,
@@ -381,7 +397,7 @@ fn record_manifest_item(
 /// Parse an EPUB 2 NCX document (`navMap` > `navPoint` > `navLabel`/`content`).
 fn parse_ncx(xml: &str, ncx_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEntry>, EpubError> {
     let mut reader = Reader::from_reader(Cursor::new(xml));
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut in_nav_map = false;
     let mut in_label = false;
@@ -401,7 +417,12 @@ fn parse_ncx(xml: &str, ncx_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEn
             },
             Event::Text(text) => {
                 if in_label {
-                    label.push_str(text.xml_content(quick_xml::XmlVersion::Implicit1_0)?.trim());
+                    label.push_str(&text.xml_content(quick_xml::XmlVersion::Implicit1_0)?);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if in_label {
+                    push_general_ref(&mut label, &reference);
                 }
             }
             Event::CData(data) => {
@@ -443,7 +464,7 @@ fn parse_ncx(xml: &str, ncx_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEn
 
 fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEntry>, EpubError> {
     let mut reader = Reader::from_reader(Cursor::new(xhtml));
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
     let mut depth = 0_usize;
     let mut toc_depth = None;
@@ -468,7 +489,12 @@ fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<Toc
             }
             Event::Text(text) => {
                 if let Some((_, label)) = &mut link {
-                    label.push_str(text.xml_content(quick_xml::XmlVersion::Implicit1_0)?.trim());
+                    label.push_str(&text.xml_content(quick_xml::XmlVersion::Implicit1_0)?);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some((_, label)) = &mut link {
+                    push_general_ref(label, &reference);
                 }
             }
             Event::CData(data) => {
@@ -546,28 +572,7 @@ pub fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
                 sibling_counts.push(HashMap::new());
             }
             Ok(Event::Empty(element)) => {
-                let name = local_name(element.name().as_ref());
-                if name == "img" || name == "image" || name == "svg" {
-                    let alt = attribute(&element, b"alt").ok().flatten();
-                    let href = if name == "img" {
-                        attribute(&element, b"src").ok().flatten()
-                    } else {
-                        attribute_local(&element, b"href").ok().flatten()
-                    };
-                    blocks.push(SourcedBlock {
-                        block: Block::Image { alt, href },
-                        source_path: source_path(&stack, &name, 1),
-                    });
-                } else if name == "hr" {
-                    blocks.push(SourcedBlock {
-                        block: Block::Rule,
-                        source_path: source_path(&stack, &name, 1),
-                    });
-                } else if name == "br" {
-                    if let Some(parent) = stack.last_mut() {
-                        parent.text.push('\n');
-                    }
-                }
+                empty_chapter_element(&element, &mut stack, &mut blocks);
             }
             Ok(Event::Text(text)) => {
                 if let Some(element) = stack.last_mut() {
@@ -581,6 +586,11 @@ pub fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
                     element
                         .text
                         .push_str(&String::from_utf8_lossy(&data.into_inner()));
+                }
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                if let Some(element) = stack.last_mut() {
+                    push_general_ref(&mut element.text, &reference);
                 }
             }
             Ok(Event::End(_)) => {
@@ -619,6 +629,37 @@ struct ElementState {
     text: String,
     alt: Option<String>,
     href: Option<String>,
+}
+
+/// Handle a self-closing element inside a chapter: `<img/>`, `<image/>`,
+/// `<svg/>`, `<hr/>`, and `<br/>`.
+fn empty_chapter_element(
+    element: &quick_xml::events::BytesStart<'_>,
+    stack: &mut [ElementState],
+    blocks: &mut Vec<SourcedBlock>,
+) {
+    let name = local_name(element.name().as_ref());
+    if name == "img" || name == "image" || name == "svg" {
+        let alt = attribute(element, b"alt").ok().flatten();
+        let href = if name == "img" {
+            attribute(element, b"src").ok().flatten()
+        } else {
+            attribute_local(element, b"href").ok().flatten()
+        };
+        blocks.push(SourcedBlock {
+            block: Block::Image { alt, href },
+            source_path: source_path(stack, &name, 1),
+        });
+    } else if name == "hr" {
+        blocks.push(SourcedBlock {
+            block: Block::Rule,
+            source_path: source_path(stack, &name, 1),
+        });
+    } else if name == "br" {
+        if let Some(parent) = stack.last_mut() {
+            parent.text.push('\n');
+        }
+    }
 }
 
 fn block_for_element(
@@ -673,6 +714,175 @@ fn normalize_pre_text(text: &str) -> String {
         lines.pop();
     }
     lines.join("\n")
+}
+
+/// Append a character reference (`&#N;`, `&name;`) to `text`.
+///
+/// quick-xml reports every reference — including `&amp;` — as its own
+/// `GeneralRef` event, so ignoring them silently loses characters and fuses
+/// the words around them. Unknown named references are kept verbatim.
+fn push_general_ref(text: &mut String, reference: &quick_xml::events::BytesRef<'_>) {
+    if let Ok(Some(character)) = reference.resolve_char_ref() {
+        text.push(character);
+        return;
+    }
+    let Ok(name) = reference.decode() else {
+        return;
+    };
+    if let Some(resolved) = named_entity(&name) {
+        text.push_str(resolved);
+    } else {
+        text.push('&');
+        text.push_str(&name);
+        text.push(';');
+    }
+}
+
+/// The XML predefined entities plus the HTML 4 named references that appear
+/// in real-world EPUB content (Latin-1 letters and common punctuation).
+#[allow(clippy::too_many_lines)]
+fn named_entity(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "quot" => "\"",
+        "apos" => "'",
+        "nbsp" => "\u{A0}",
+        "iexcl" => "¡",
+        "cent" => "¢",
+        "pound" => "£",
+        "curren" => "¤",
+        "yen" => "¥",
+        "brvbar" => "¦",
+        "sect" => "§",
+        "uml" => "¨",
+        "copy" => "©",
+        "ordf" => "ª",
+        "laquo" => "«",
+        "not" => "¬",
+        "shy" => "\u{AD}",
+        "reg" => "®",
+        "macr" => "¯",
+        "deg" => "°",
+        "plusmn" => "±",
+        "sup2" => "²",
+        "sup3" => "³",
+        "acute" => "´",
+        "micro" => "µ",
+        "para" => "¶",
+        "middot" => "·",
+        "cedil" => "¸",
+        "sup1" => "¹",
+        "ordm" => "º",
+        "raquo" => "»",
+        "frac14" => "¼",
+        "frac12" => "½",
+        "frac34" => "¾",
+        "iquest" => "¿",
+        "Agrave" => "À",
+        "Aacute" => "Á",
+        "Acirc" => "Â",
+        "Atilde" => "Ã",
+        "Auml" => "Ä",
+        "Aring" => "Å",
+        "AElig" => "Æ",
+        "Ccedil" => "Ç",
+        "Egrave" => "È",
+        "Eacute" => "É",
+        "Ecirc" => "Ê",
+        "Euml" => "Ë",
+        "Igrave" => "Ì",
+        "Iacute" => "Í",
+        "Icirc" => "Î",
+        "Iuml" => "Ï",
+        "ETH" => "Ð",
+        "Ntilde" => "Ñ",
+        "Ograve" => "Ò",
+        "Oacute" => "Ó",
+        "Ocirc" => "Ô",
+        "Otilde" => "Õ",
+        "Ouml" => "Ö",
+        "times" => "×",
+        "Oslash" => "Ø",
+        "Ugrave" => "Ù",
+        "Uacute" => "Ú",
+        "Ucirc" => "Û",
+        "Uuml" => "Ü",
+        "Yacute" => "Ý",
+        "THORN" => "Þ",
+        "szlig" => "ß",
+        "agrave" => "à",
+        "aacute" => "á",
+        "acirc" => "â",
+        "atilde" => "ã",
+        "auml" => "ä",
+        "aring" => "å",
+        "aelig" => "æ",
+        "ccedil" => "ç",
+        "egrave" => "è",
+        "eacute" => "é",
+        "ecirc" => "ê",
+        "euml" => "ë",
+        "igrave" => "ì",
+        "iacute" => "í",
+        "icirc" => "î",
+        "iuml" => "ï",
+        "eth" => "ð",
+        "ntilde" => "ñ",
+        "ograve" => "ò",
+        "oacute" => "ó",
+        "ocirc" => "ô",
+        "otilde" => "õ",
+        "ouml" => "ö",
+        "divide" => "÷",
+        "oslash" => "ø",
+        "ugrave" => "ù",
+        "uacute" => "ú",
+        "ucirc" => "û",
+        "uuml" => "ü",
+        "yacute" => "ý",
+        "thorn" => "þ",
+        "yuml" => "ÿ",
+        "OElig" => "Œ",
+        "oelig" => "œ",
+        "Scaron" => "Š",
+        "scaron" => "š",
+        "Yuml" => "Ÿ",
+        "fnof" => "ƒ",
+        "circ" => "ˆ",
+        "tilde" => "˜",
+        "ensp" => "\u{2002}",
+        "emsp" => "\u{2003}",
+        "thinsp" => "\u{2009}",
+        "zwnj" => "\u{200C}",
+        "zwj" => "\u{200D}",
+        "lrm" => "\u{200E}",
+        "rlm" => "\u{200F}",
+        "ndash" => "–",
+        "mdash" => "—",
+        "lsquo" => "\u{2018}",
+        "rsquo" => "\u{2019}",
+        "sbquo" => "\u{201A}",
+        "ldquo" => "\u{201C}",
+        "rdquo" => "\u{201D}",
+        "bdquo" => "\u{201E}",
+        "dagger" => "†",
+        "Dagger" => "‡",
+        "bull" => "•",
+        "hellip" => "…",
+        "permil" => "‰",
+        "prime" => "′",
+        "Prime" => "″",
+        "lsaquo" => "‹",
+        "rsaquo" => "›",
+        "oline" => "‾",
+        "frasl" => "⁄",
+        "euro" => "€",
+        "trade" => "™",
+        "minus" => "−",
+        _ => return None,
+    })
 }
 
 fn attribute(
@@ -809,6 +1019,51 @@ mod tests {
             blocks.last().map(|block| &block.block),
             Some(Block::Image { .. })
         ));
+    }
+
+    #[test]
+    fn entity_references_resolve_in_chapter_text() {
+        let blocks = parse_chapter(
+            "<html><body><p>War &amp; Peace&nbsp;&mdash; &#8220;quoted&#8221;, &unknown;.</p></body></html>",
+        );
+        assert!(matches!(
+            blocks.first().map(|block| &block.block),
+            Some(Block::Paragraph(text)) if text == "War & Peace — “quoted”, &unknown;."
+        ));
+    }
+
+    #[test]
+    fn entity_references_resolve_in_opf_metadata() -> Result<(), EpubError> {
+        let opf = r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <metadata>
+                <dc:title>Crime &amp; Punishment</dc:title>
+                <dc:creator>Simon &amp; Schuster</dc:creator>
+            </metadata>
+            <manifest/><spine/>
+        </package>"#;
+        let parsed = parse_opf(opf, "OPS/package.opf")?;
+        assert_eq!(parsed.metadata.title, "Crime & Punishment");
+        assert_eq!(parsed.metadata.authors, vec!["Simon & Schuster".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn entity_references_resolve_in_nav_labels() -> Result<(), EpubError> {
+        let spine = vec![SpineItem {
+            path: "OPS/one.xhtml".to_owned(),
+            linear: true,
+        }];
+        let nav = r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body>
+            <nav epub:type="toc"><ol>
+                <li><a href="one.xhtml">Cats &amp; Dogs&nbsp;&hellip;</a></li>
+            </ol></nav>
+        </body></html>"#;
+        let toc = parse_nav(nav, "OPS/nav.xhtml", &spine)?;
+        assert_eq!(
+            toc.first().map(|entry| entry.label.as_str()),
+            Some("Cats & Dogs …")
+        );
+        Ok(())
     }
 
     #[test]

@@ -410,7 +410,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        config: Config,
+        mut config: Config,
         config_backup: Option<PathBuf>,
         initial_book: Option<PathBuf>,
         offline: bool,
@@ -431,6 +431,14 @@ impl App {
                 }
                 Ok(None) => logging::warn("sync account configured but keyring has no userkey"),
                 Err(error) => logging::warn(&format!("keyring unavailable: {error}")),
+            }
+        }
+        // Configs from older versions or hand edits may lack a device id;
+        // without one, pushes would carry an empty `device_id`.
+        if config.sync.username.is_some() && config.sync.device_id.is_none() {
+            config.sync.device_id = Some(sync::generate_device_id());
+            if let Err(error) = config.save() {
+                logging::warn(&format!("could not save config: {error}"));
             }
         }
         let show_wizard =
@@ -586,7 +594,8 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(book) = Self::filtered_books(library).get(library.selection) {
-                    let _ = self.open_book(book.path.clone());
+                    let path = book.path.clone();
+                    self.open_book_or_status(path);
                 }
             }
             _ => {
@@ -1396,10 +1405,15 @@ impl App {
             }
             Action::HomeQuit => self.should_exit = true,
             Action::LibraryOpen(index) => {
-                if let Screen::Library(library) = &self.screen {
-                    if let Some(book) = Self::filtered_books(library).get(index) {
-                        let _ = self.open_book(book.path.clone());
-                    }
+                let path = if let Screen::Library(library) = &self.screen {
+                    Self::filtered_books(library)
+                        .get(index)
+                        .map(|book| book.path.clone())
+                } else {
+                    None
+                };
+                if let Some(path) = path {
+                    self.open_book_or_status(path);
                 }
             }
             Action::LibraryHome | Action::SettingsHome => {
@@ -1563,6 +1577,7 @@ impl App {
                     "Settings",
                     "  a/d         add / remove library",
                     "  w j m       max width / justify / ASCII mode",
+                    "  h           color theme",
                     "  u c         sync server / matching method",
                     "  f b t       forward / backward / auto sync",
                     "  g e         push every N pages / N minutes",
@@ -1681,6 +1696,7 @@ impl App {
         }
         rows.push(String::new());
         rows.push("Recent".to_owned());
+        let recent_start = rows.len();
         let mut missing_rows = Vec::new();
         while let Some((index, HomeItem::Recent(list_index))) = item_iter.peek().copied() {
             item_iter.next();
@@ -1692,6 +1708,9 @@ impl App {
                 missing_rows.push(rows.len());
             }
             rows.push(Self::selectable_row(home.selection, index, text));
+        }
+        if rows.len() == recent_start {
+            rows.push("  (nothing yet)".to_owned());
         }
         rows.push(String::new());
         rows.push("Libraries".to_owned());
@@ -2505,7 +2524,7 @@ impl App {
             Some(HomeItem::Continue) => {
                 let path = self.recents.most_recent().map(|recent| recent.path.clone());
                 if let Some(path) = path {
-                    let _ = self.open_book(path);
+                    self.open_book_or_status(path);
                 }
             }
             Some(HomeItem::Recent(list_index)) => {
@@ -2514,7 +2533,7 @@ impl App {
                 };
                 let path = recent.path.clone();
                 if path.exists() {
-                    let _ = self.open_book(path);
+                    self.open_book_or_status(path);
                 } else {
                     self.status = Some(
                         "Book file is missing — press Del to remove it from Recent.".to_owned(),
@@ -2599,7 +2618,8 @@ impl App {
     }
 
     fn open_book(&mut self, path: PathBuf) -> Result<()> {
-        let book = EpubBook::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let book =
+            EpubBook::open(&path).with_context(|| format!("could not open {}", path.display()))?;
         let position = self.positions.get(&path);
         let recent = RecentBook {
             path: path.clone(),
@@ -2627,6 +2647,14 @@ impl App {
         }
         self.next_screen = Some(Screen::Reader(Box::new(reader)));
         Ok(())
+    }
+
+    /// Open a book, surfacing failures (corrupt EPUBs, I/O errors) in the
+    /// status line instead of silently doing nothing.
+    fn open_book_or_status(&mut self, path: PathBuf) {
+        if let Err(error) = self.open_book(path) {
+            self.status = Some(format!("{error:#}"));
+        }
     }
 
     fn leave_reader(&mut self, reader: &mut ReaderScreen) {

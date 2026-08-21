@@ -57,6 +57,14 @@ impl TextInput {
                 }
                 false
             }
+            KeyCode::Home => {
+                self.cursor = 0;
+                false
+            }
+            KeyCode::End => {
+                self.cursor = self.value.len();
+                false
+            }
             KeyCode::Backspace => self.delete(false),
             KeyCode::Delete => self.delete(true),
             KeyCode::Char(character) => {

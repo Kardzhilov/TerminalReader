@@ -186,7 +186,11 @@ fn replace_current_exe(binary: &[u8]) -> Result<()> {
         let old = current.with_extension("old");
         let _ = fs::remove_file(&old);
         fs::rename(&current, &old)?;
-        fs::rename(&staged, &current)?;
+        if let Err(error) = fs::rename(&staged, &current) {
+            // Put the original binary back so the install stays usable.
+            let _ = fs::rename(&old, &current);
+            return Err(error.into());
+        }
     }
     Ok(())
 }

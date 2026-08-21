@@ -237,7 +237,7 @@ impl SyncController {
         config: &SyncConfig,
         update: ProgressUpdate,
         result: &Result<(), String>,
-        manual: bool,
+        _manual: bool,
     ) {
         match result {
             Ok(()) => {
@@ -258,7 +258,6 @@ impl SyncController {
                     "Sync failed ({} queued): {error}",
                     self.queue.len()
                 ));
-                let _ = manual;
             }
         }
     }
@@ -279,14 +278,9 @@ impl SyncController {
     }
 
     fn queue_remove(&mut self, document: &str) {
-        let mut remaining = ProgressQueue::default();
-        while let Some(item) = self.queue.pop_front() {
-            if item.update.document != document {
-                remaining.push(item.update);
-            }
+        if self.queue.remove_document(document) {
+            self.save_queue();
         }
-        self.queue = remaining;
-        self.save_queue();
     }
 
     fn save_queue(&self) {

@@ -337,6 +337,14 @@ impl ProgressQueue {
         self.items.pop_front()
     }
 
+    /// Drop any queued update for `document`, leaving other items — and
+    /// their original `queued_at` timestamps — untouched.
+    pub fn remove_document(&mut self, document: &str) -> bool {
+        let before = self.items.len();
+        self.items.retain(|item| item.update.document != document);
+        self.items.len() != before
+    }
+
     pub fn expire(&mut self) {
         let cutoff = unix_timestamp().saturating_sub(QUEUE_MAX_AGE_SECONDS);
         self.items.retain(|item| item.queued_at >= cutoff);
@@ -398,6 +406,20 @@ mod tests {
         });
         assert_eq!(queue.items().len(), 1);
         assert_eq!(queue.items().front().expect("entry").update.progress, "2");
+    }
+
+    #[test]
+    fn queue_remove_document_keeps_other_items_and_timestamps() {
+        let mut queue = ProgressQueue::default();
+        queue.push(update("a"));
+        queue.push(update("b"));
+        let kept_at = queue.items().back().expect("queued item").queued_at;
+        assert!(queue.remove_document("a"));
+        assert!(!queue.remove_document("missing"));
+        assert_eq!(queue.items().len(), 1);
+        let remaining = queue.items().front().expect("remaining item");
+        assert_eq!(remaining.update.document, "b");
+        assert_eq!(remaining.queued_at, kept_at);
     }
 
     fn temp_file(name: &str, contents: &[u8]) -> Result<std::path::PathBuf, SyncError> {
