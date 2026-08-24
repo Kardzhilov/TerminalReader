@@ -140,6 +140,7 @@ impl SyncController {
         };
         if !manual && should_defer(self.last_call, Instant::now()) {
             self.defer(update);
+            self.status = Some("Sync queued…".to_owned());
             return;
         }
         // This update supersedes anything deferred for the same document.
@@ -149,9 +150,13 @@ impl SyncController {
     }
 
     /// Coalesce a debounced push, keeping the newest update per document.
+    /// The update is mirrored into the persistent queue so it survives
+    /// unclean exits; a successful push removes it again.
     fn defer(&mut self, update: ProgressUpdate) {
         self.deferred
             .retain(|existing| existing.document != update.document);
+        self.queue.push(update.clone());
+        self.save_queue();
         self.deferred.push(update);
     }
 
@@ -242,7 +247,19 @@ impl SyncController {
         match result {
             Ok(()) => {
                 logging::info(&format!("sync push ok: {}", update.document));
-                self.queue_remove(&update.document);
+                // A newer update deferred while this one was in flight keeps
+                // its persisted mirror; otherwise the document is done.
+                if let Some(pending) = self
+                    .deferred
+                    .iter()
+                    .find(|pending| pending.document == update.document)
+                    .cloned()
+                {
+                    self.queue.push(pending);
+                    self.save_queue();
+                } else {
+                    self.queue_remove(&update.document);
+                }
                 self.status = Some(if self.queue.is_empty() {
                     "Synced.".to_owned()
                 } else {
@@ -263,6 +280,9 @@ impl SyncController {
     }
 
     /// After a successful call, retry the oldest queued update, if any.
+    ///
+    /// Queue entries mirroring a still-deferred update are skipped so the
+    /// debounce window keeps governing when those go out.
     pub fn drain_next(&mut self, config: &SyncConfig) {
         if self.in_flight > 0 {
             return;
@@ -271,7 +291,18 @@ impl SyncController {
             return;
         };
         self.queue.expire();
-        let Some(item) = self.queue.items().front().cloned() else {
+        let Some(item) = self
+            .queue
+            .items()
+            .iter()
+            .find(|item| {
+                !self
+                    .deferred
+                    .iter()
+                    .any(|pending| pending.document == item.update.document)
+            })
+            .cloned()
+        else {
             return;
         };
         self.spawn_push(&config.server_url, credentials, item.update, false);
@@ -310,13 +341,13 @@ impl SyncController {
             self.in_flight = self.in_flight.saturating_sub(1);
             if let SyncEvent::Push {
                 update,
-                result: Err(_),
-                ..
+                result,
+                manual,
             } = event
             {
-                // Persist failed pushes so the queue drains next session.
-                self.queue.push(update);
-                self.save_queue();
+                // Full bookkeeping: successes clear their persisted mirror
+                // (and drain the backlog), failures stay queued.
+                self.finish_push(config, update, &result, manual);
             }
         }
     }
@@ -478,7 +509,7 @@ fn byte_offset(text: &str, chars: usize) -> usize {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -584,5 +615,70 @@ mod tests {
             .map(|item| item.update.document.as_str())
             .collect();
         assert_eq!(remaining, vec!["doc-a", "doc-c"]);
+    }
+
+    fn signed_in_controller() -> SyncController {
+        let mut controller = SyncController::for_tests();
+        controller.set_credentials(Some(Credentials {
+            username: "user".to_owned(),
+            userkey: "key".to_owned(),
+        }));
+        controller
+    }
+
+    /// Unroutable server so spawned pushes fail fast without network access.
+    fn unreachable_config() -> SyncConfig {
+        SyncConfig {
+            server_url: "http://127.0.0.1:1".to_owned(),
+            ..SyncConfig::default()
+        }
+    }
+
+    #[test]
+    fn deferred_push_is_mirrored_in_the_queue_and_reports_status() {
+        let mut controller = signed_in_controller();
+        controller.last_call = Some(Instant::now());
+        controller.push(&unreachable_config(), update("doc-a", 0.4), false);
+        assert_eq!(controller.deferred.len(), 1);
+        assert_eq!(controller.queue.len(), 1, "deferred push is persisted");
+        assert_eq!(controller.status.as_deref(), Some("Sync queued…"));
+        assert_eq!(controller.in_flight, 0, "nothing was sent yet");
+    }
+
+    #[test]
+    fn drain_next_skips_documents_with_deferred_updates() {
+        let mut controller = signed_in_controller();
+        controller.queue.push(update("doc-a", 0.1));
+        controller.queue.push(update("doc-b", 0.2));
+        controller.deferred.push(update("doc-a", 0.3));
+        controller.drain_next(&unreachable_config());
+        assert_eq!(controller.in_flight, 1, "one push was spawned");
+        let event = controller
+            .rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("spawned push finishes");
+        match event {
+            SyncEvent::Push { update, .. } => {
+                assert_eq!(update.document, "doc-b", "deferred doc-a is skipped");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flush_sends_deferred_and_keeps_failures_queued() {
+        let mut controller = signed_in_controller();
+        controller.push(&unreachable_config(), update("doc-a", 0.4), false);
+        assert_eq!(controller.in_flight, 1, "first push goes out immediately");
+        controller.push(&unreachable_config(), update("doc-a", 0.5), false);
+        assert_eq!(controller.deferred.len(), 1, "second push is deferred");
+        controller.flush(&unreachable_config(), Duration::from_secs(10));
+        assert!(controller.deferred.is_empty(), "deferred pushes were sent");
+        assert_eq!(
+            controller.queue.len(),
+            1,
+            "failed push stays queued for the next session"
+        );
+        assert_eq!(controller.in_flight, 0);
     }
 }
