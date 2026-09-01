@@ -39,6 +39,12 @@ pub enum SyncEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushNotice {
+    pub message: String,
+    pub success: bool,
+}
+
 #[derive(Debug)]
 pub struct SyncController {
     tx: Sender<SyncEvent>,
@@ -51,6 +57,7 @@ pub struct SyncController {
     deferred: Vec<ProgressUpdate>,
     in_flight: usize,
     pub status: Option<String>,
+    push_notice: Option<PushNotice>,
 }
 
 impl SyncController {
@@ -72,6 +79,7 @@ impl SyncController {
             deferred: Vec::new(),
             in_flight: 0,
             status: None,
+            push_notice: None,
         }
     }
 
@@ -90,6 +98,15 @@ impl SyncController {
     #[must_use]
     pub fn queue_len(&self) -> usize {
         self.queue.len()
+    }
+
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.in_flight > 0 || !self.deferred.is_empty()
+    }
+
+    pub fn take_push_notice(&mut self) -> Option<PushNotice> {
+        self.push_notice.take()
     }
 
     /// Register (optionally) and authorize in the background.
@@ -260,10 +277,15 @@ impl SyncController {
                 } else {
                     self.queue_remove(&update.document);
                 }
-                self.status = Some(if self.queue.is_empty() {
+                let message = if self.queue.is_empty() {
                     "Synced.".to_owned()
                 } else {
                     format!("Synced; {} queued.", self.queue.len())
+                };
+                self.status = Some(message.clone());
+                self.push_notice = Some(PushNotice {
+                    message,
+                    success: true,
                 });
                 self.drain_next(config);
             }
@@ -271,10 +293,12 @@ impl SyncController {
                 logging::warn(&format!("sync push failed: {error}"));
                 self.queue.push(update);
                 self.save_queue();
-                self.status = Some(format!(
-                    "Sync failed ({} queued): {error}",
-                    self.queue.len()
-                ));
+                let message = format!("Sync failed ({} queued): {error}", self.queue.len());
+                self.status = Some(message.clone());
+                self.push_notice = Some(PushNotice {
+                    message,
+                    success: false,
+                });
             }
         }
     }
@@ -368,6 +392,7 @@ impl SyncController {
             deferred: Vec::new(),
             in_flight: 0,
             status: None,
+            push_notice: None,
         }
     }
 }
@@ -615,6 +640,34 @@ mod tests {
             .map(|item| item.update.document.as_str())
             .collect();
         assert_eq!(remaining, vec!["doc-a", "doc-c"]);
+    }
+
+    #[test]
+    fn finish_push_exposes_success_and_failure_notices() {
+        let mut controller = SyncController::for_tests();
+        let config = SyncConfig::default();
+        controller.finish_push(&config, update("ok", 0.5), &Ok(()), false);
+        assert_eq!(
+            controller.take_push_notice(),
+            Some(PushNotice {
+                message: "Synced.".to_owned(),
+                success: true,
+            })
+        );
+
+        controller.finish_push(
+            &config,
+            update("failed", 0.5),
+            &Err("offline".to_owned()),
+            false,
+        );
+        assert_eq!(
+            controller.take_push_notice(),
+            Some(PushNotice {
+                message: "Sync failed (1 queued): offline".to_owned(),
+                success: false,
+            })
+        );
     }
 
     fn signed_in_controller() -> SyncController {

@@ -1,5 +1,6 @@
 use std::{
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::mpsc::{Receiver, Sender, channel},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -17,6 +18,7 @@ use ratatui::{
         ScrollbarState, Wrap,
     },
 };
+use sha2::{Digest, Sha256};
 use tr_core::{
     Bookmark, BookmarkStore, Config, LibraryBook, PositionStore, RecentBook, RecentsStore,
     SavedPosition, ScanCache, StatsStore, SyncStrategy, credentials, logging, scan_library_cached,
@@ -41,6 +43,8 @@ const MIN_HEIGHT: u16 = 16;
 const STATUS_TTL: Duration = Duration::from_secs(5);
 const PROMPT_GO_LABEL: &str = "[Go to position]";
 const PROMPT_STAY_LABEL: &str = "[Stay here]";
+const LINK_OPEN_LABEL: &str = "[Open]";
+const LINK_CANCEL_LABEL: &str = "[Cancel]";
 /// Fraction of the book read at which it counts as finished.
 const FINISHED_PERCENT: f64 = 0.98;
 /// Selection jump for PageUp/PageDown in lists.
@@ -418,6 +422,24 @@ struct SyncPrompt {
     device: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct LinkPrompt {
+    url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPoint {
+    line: usize,
+    byte: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextSelection {
+    anchor: TextPoint,
+    head: TextPoint,
+    dragging: bool,
+}
+
 // Independent reader-state flags, not a state machine in disguise.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
@@ -431,6 +453,7 @@ struct ReaderScreen {
     source_paths: Vec<Vec<tr_epub::SourcePathStep>>,
     blocks_loaded: bool,
     lines: Vec<Line>,
+    selection: Option<TextSelection>,
     width: u16,
     height: u16,
     toc: Option<TocState>,
@@ -441,6 +464,7 @@ struct ReaderScreen {
     /// Progress string of the last push, to skip timed pushes when idle.
     last_pushed_progress: Option<String>,
     sync_prompt: Option<SyncPrompt>,
+    link_prompt: Option<LinkPrompt>,
     /// Open the next laid-out chapter at its last page (backward page turn).
     open_at_end: bool,
     /// In-book search input popup, when open.
@@ -494,12 +518,15 @@ enum Action {
     OpenImage(usize),
     /// Show the footnote behind inline span `1` of block `0`.
     Footnote(usize, usize),
+    /// Confirm opening the link behind inline span `1` of block `0`.
+    OpenLink(usize, usize),
     /// Behave as if this key was pressed on the current screen.
     Key(KeyCode),
     /// Move the focused text input's cursor to the clicked column.
     InputClick,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct App {
     config: Config,
@@ -522,6 +549,10 @@ pub struct App {
     status: Option<String>,
     /// The displayed status and when it appeared, for auto-expiry.
     status_seen: Option<(String, Instant)>,
+    pending_status: Option<String>,
+    session_summary_visible: bool,
+    temp_image_paths: Vec<PathBuf>,
+    needs_redraw: bool,
     help: bool,
     should_exit: bool,
     next_screen: Option<Screen>,
@@ -536,6 +567,7 @@ impl App {
         initial_book: Option<PathBuf>,
         offline: bool,
     ) -> Result<Self> {
+        cleanup_stale_temp_images(Duration::from_secs(24 * 60 * 60));
         let first_run = !Config::exists();
         let mut sync = SyncController::new();
         if offline {
@@ -590,6 +622,10 @@ impl App {
             scroll_offset: 0,
             status: None,
             status_seen: None,
+            pending_status: None,
+            session_summary_visible: false,
+            temp_image_paths: Vec::new(),
+            needs_redraw: true,
             help: false,
             should_exit: false,
             next_screen: None,
@@ -614,23 +650,46 @@ impl App {
     pub fn run(&mut self, mut terminal: DefaultTerminal) -> Result<()> {
         crate::update::clean_stale_backup();
         while !self.should_exit {
+            let previous_status = self.status_line();
             self.process_sync_events();
             self.process_update_events();
             self.process_scan_events();
             self.maybe_timed_push();
             self.expire_status();
-            terminal.draw(|frame| self.draw(frame))?;
-            if crossterm::event::poll(Duration::from_millis(50))? {
+            if previous_status != self.status_line() {
+                self.needs_redraw = true;
+            }
+            if self.needs_redraw {
+                terminal.draw(|frame| self.draw(frame))?;
+                self.needs_redraw = false;
+            }
+            let timeout = self.next_poll_timeout();
+            if crossterm::event::poll(timeout)? {
                 let event = crossterm::event::read()?;
                 self.handle_event(&event);
+                while crossterm::event::poll(Duration::ZERO)? {
+                    let event = crossterm::event::read()?;
+                    self.handle_event(&event);
+                }
+            } else if self.caret_visible() {
+                self.needs_redraw = true;
             }
         }
         // Give push-on-quit and queued retries a moment to finish.
         self.sync.flush(&self.config.sync, Duration::from_secs(3));
+        for path in self.temp_image_paths.drain(..) {
+            if let Err(error) = fs::remove_file(&path) {
+                logging::debug(&format!(
+                    "could not remove temp image {}: {error}",
+                    path.display()
+                ));
+            }
+        }
         Ok(())
     }
 
     fn handle_event(&mut self, event: &Event) {
+        self.needs_redraw = true;
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key.code),
             Event::Mouse(mouse) => {
@@ -646,6 +705,40 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn caret_visible(&self) -> bool {
+        if !self.config.theme.caret_blink {
+            return false;
+        }
+        match &self.screen {
+            Screen::Wizard(_) | Screen::Library(_) => true,
+            Screen::Settings(settings) => settings.mode != SettingsMode::Browse,
+            Screen::Reader(reader) => {
+                reader.search.is_some()
+                    || reader.goto_input.is_some()
+                    || reader.toc.is_some()
+                    || reader
+                        .bookmarks_open
+                        .as_ref()
+                        .is_some_and(|bookmarks| bookmarks.rename.is_some())
+            }
+            Screen::Home(_) => false,
+        }
+    }
+
+    fn next_poll_timeout(&self) -> Duration {
+        let mut timeout = Duration::from_secs(1);
+        if self.scanner.busy || self.sync.busy() || self.update.busy {
+            timeout = Duration::from_millis(100);
+        }
+        if self.caret_visible() {
+            timeout = timeout.min(Duration::from_millis(500));
+        }
+        if let Some((_, since)) = &self.status_seen {
+            timeout = timeout.min(STATUS_TTL.saturating_sub(since.elapsed()));
+        }
+        timeout.max(Duration::from_millis(10))
     }
 
     fn handle_key(&mut self, key: KeyCode) {
@@ -985,6 +1078,47 @@ impl App {
                     on_off(self.config.theme.caret_blink)
                 )));
             }
+            KeyCode::Char('1') => {
+                self.config.navigation.line_scroll = !self.config.navigation.line_scroll;
+                settings.message = Some(self.save_config_with(format!(
+                    "Line scrolling {}.",
+                    on_off(self.config.navigation.line_scroll)
+                )));
+            }
+            KeyCode::Char('2') => {
+                self.config.navigation.wheel_scroll = !self.config.navigation.wheel_scroll;
+                settings.message = Some(self.save_config_with(format!(
+                    "Wheel scrolling {}.",
+                    on_off(self.config.navigation.wheel_scroll)
+                )));
+            }
+            KeyCode::Char('3') => {
+                self.config.navigation.wheel_step = match self.config.navigation.wheel_step {
+                    1 => 3,
+                    3 => 5,
+                    5 => 10,
+                    _ => 1,
+                };
+                settings.message = Some(self.save_config_with(format!(
+                    "Wheel step: {} lines.",
+                    self.config.navigation.wheel_step
+                )));
+            }
+            KeyCode::Char('4') => {
+                self.config.navigation.click_to_turn = !self.config.navigation.click_to_turn;
+                settings.message = Some(self.save_config_with(format!(
+                    "Click to turn {}.",
+                    on_off(self.config.navigation.click_to_turn)
+                )));
+            }
+            KeyCode::Char('5') => {
+                self.config.navigation.invert_click_zones =
+                    !self.config.navigation.invert_click_zones;
+                settings.message = Some(self.save_config_with(format!(
+                    "Inverted click zones {}.",
+                    on_off(self.config.navigation.invert_click_zones)
+                )));
+            }
             KeyCode::Char('u') => {
                 settings.mode = SettingsMode::EditServer;
                 settings.input = TextInput::new(self.config.sync.server_url.clone());
@@ -1106,9 +1240,22 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_reader_key(&mut self, reader: &mut ReaderScreen, key: KeyCode) {
         if reader.stats_open {
             reader.stats_open = false;
+            return;
+        }
+        if reader.link_prompt.is_some() {
+            match key {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    if let Some(prompt) = reader.link_prompt.take() {
+                        self.status = Some(open_external_url(&prompt.url));
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => reader.link_prompt = None,
+                _ => {}
+            }
             return;
         }
         if reader.footnote.is_some() {
@@ -1148,6 +1295,28 @@ impl App {
             Self::handle_toc_key(reader, key);
             return;
         }
+        if reader.selection.is_some() {
+            match key {
+                KeyCode::Esc => reader.selection = None,
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let text = reader.selected_text();
+                    if text.is_empty() {
+                        self.status = Some("Nothing selected.".to_owned());
+                    } else {
+                        self.status = Some(copy_osc52(&text));
+                    }
+                    reader.selection = None;
+                }
+                KeyCode::Left => reader.move_selection(-1, 0),
+                KeyCode::Right => reader.move_selection(1, 0),
+                KeyCode::Up => reader.move_selection(0, -1),
+                KeyCode::Down => reader.move_selection(0, 1),
+                KeyCode::PageUp => reader.move_selection(0, -reader.content_height_isize()),
+                KeyCode::PageDown => reader.move_selection(0, reader.content_height_isize()),
+                _ => {}
+            }
+            return;
+        }
         match key {
             KeyCode::Esc => {
                 if reader.search_query.is_some() || !reader.search_matches.is_empty() {
@@ -1168,8 +1337,9 @@ impl App {
                 reader.previous_page();
                 Self::note_page_turn(&self.config, &mut self.sync, reader);
             }
-            KeyCode::Up => reader.scroll_lines(-1),
-            KeyCode::Down => reader.scroll_lines(1),
+            KeyCode::Char('v') => reader.start_selection(),
+            KeyCode::Up if self.config.navigation.line_scroll => reader.scroll_lines(-1),
+            KeyCode::Down if self.config.navigation.line_scroll => reader.scroll_lines(1),
             KeyCode::Char(character) => self.handle_reader_char(reader, character),
             _ => {}
         }
@@ -1663,6 +1833,12 @@ impl App {
                 }
                 return;
             }
+            if reader.link_prompt.is_some() {
+                if let Some(message) = Self::handle_link_prompt_mouse(reader, mouse) {
+                    self.status = Some(message);
+                }
+                return;
+            }
             if reader.footnote.is_some() {
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
                     reader.footnote = None;
@@ -1704,6 +1880,17 @@ impl App {
             if reader.toc.is_some() {
                 reader.handle_toc_mouse(mouse);
                 return;
+            }
+            if reader.selection.is_some() {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left) => {
+                        reader.handle_selection_mouse(mouse);
+                        return;
+                    }
+                    _ => {}
+                }
             }
         }
         if self.handle_screen_mouse(mouse) {
@@ -1757,6 +1944,32 @@ impl App {
         } else {
             reader.sync_prompt = None;
         }
+    }
+
+    fn handle_link_prompt_mouse(reader: &mut ReaderScreen, mouse: MouseEvent) -> Option<String> {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return None;
+        }
+        let area = reader.link_prompt_area();
+        let position = Position::new(mouse.column, mouse.row);
+        if !area.contains(position) {
+            reader.link_prompt = None;
+            return None;
+        }
+        let buttons_row = area.y + area.height.saturating_sub(2);
+        if mouse.row != buttons_row {
+            return None;
+        }
+        let open_start = area.x + 1;
+        let open_end = open_start + u16::try_from(LINK_OPEN_LABEL.len()).unwrap_or(0);
+        if (open_start..open_end).contains(&mouse.column) {
+            return reader
+                .link_prompt
+                .take()
+                .map(|prompt| open_external_url(&prompt.url));
+        }
+        reader.link_prompt = None;
+        None
     }
 
     /// Mouse in the bookmarks popup: wheel moves, click jumps, clicking
@@ -1895,12 +2108,16 @@ impl App {
                 _ => false,
             },
             Screen::Reader(reader) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    reader.scroll_lines(-3);
+                MouseEventKind::ScrollUp if self.config.navigation.wheel_scroll => {
+                    let step = isize::try_from(self.config.navigation.wheel_step.clamp(1, 10))
+                        .unwrap_or(3);
+                    reader.scroll_lines(-step);
                     true
                 }
-                MouseEventKind::ScrollDown => {
-                    reader.scroll_lines(3);
+                MouseEventKind::ScrollDown if self.config.navigation.wheel_scroll => {
+                    let step = isize::try_from(self.config.navigation.wheel_step.clamp(1, 10))
+                        .unwrap_or(3);
+                    reader.scroll_lines(step);
                     true
                 }
                 _ => false,
@@ -1966,7 +2183,8 @@ impl App {
                     if self.config.sync.auto_sync {
                         Self::push_progress(&self.config, &mut self.sync, reader, false);
                     }
-                    Self::record_session(&mut self.stats, &mut self.status, reader);
+                    self.session_summary_visible =
+                        Self::record_session(&mut self.stats, &mut self.status, reader);
                     let position = reader.position();
                     let recent = RecentBook {
                         path: reader.path.clone(),
@@ -1988,11 +2206,15 @@ impl App {
             }
             Action::OpenImage(block) => {
                 if let Screen::Reader(reader) = &mut self.screen {
-                    let message = open_reader_image(reader, block);
+                    let (message, path) = open_reader_image(reader, block);
+                    if let Some(path) = path {
+                        self.temp_image_paths.push(path);
+                    }
                     self.status = Some(message);
                 }
             }
             Action::Footnote(block, span) => self.open_footnote(block, span),
+            Action::OpenLink(block, span) => self.open_link(block, span),
             Action::SelectLibraryDir(index) => {
                 if let Screen::Settings(settings) = &mut self.screen {
                     settings.selection = index;
@@ -2015,9 +2237,31 @@ impl App {
             }) => href.clone(),
             _ => return,
         };
+        if is_external_link(&href) {
+            reader.link_prompt = Some(LinkPrompt { url: href });
+            return;
+        }
         match reader.footnote_text(&href) {
             Some(text) => reader.footnote = Some(text),
             None => self.status = Some("Could not find the footnote text.".to_owned()),
+        }
+    }
+
+    fn open_link(&mut self, block: usize, span: usize) {
+        let Screen::Reader(reader) = &mut self.screen else {
+            return;
+        };
+        let href = match reader.inline.get(block).and_then(|spans| spans.get(span)) {
+            Some(InlineSpan {
+                kind: InlineKind::Link(href),
+                ..
+            }) => href.clone(),
+            _ => return,
+        };
+        if is_external_link(&href) {
+            reader.link_prompt = Some(LinkPrompt { url: href });
+        } else {
+            self.status = Some("In-book link navigation is not supported yet.".to_owned());
         }
     }
 
@@ -2130,6 +2374,7 @@ impl App {
                 "  a/d         add / remove library",
                 "  w j m       max width / justify / ASCII mode",
                 "  h k         color theme / caret blink",
+                "  1-5         navigation preferences",
                 "  u c         sync server / matching method",
                 "  f b t       forward / backward / auto sync",
                 "  g e         push every N pages / N minutes",
@@ -2159,6 +2404,7 @@ impl App {
                     "  g              go to page or percent".to_owned(),
                     "  i              reading statistics".to_owned(),
                     "  z              zen mode (hide chrome)".to_owned(),
+                    "  v              select text; arrows extend, Enter copies".to_owned(),
                     format!(
                         "  {} {}            push / pull progress now",
                         keys.sync_push, keys.sync_pull
@@ -2167,7 +2413,7 @@ impl App {
                         "  {}              toggle sync for this book",
                         keys.sync_toggle
                     ),
-                    "  click sides    turn page; click notes/images to open".to_owned(),
+                    "  click sides    turn page; click notes/images/links".to_owned(),
                     "  Esc            clear search / save and go home".to_owned(),
                     format!("  {}              save and quit", keys.quit),
                 ]
@@ -2562,6 +2808,33 @@ impl App {
             on_off(self.config.theme.caret_blink)
         ));
         rows.push(String::new());
+        rows.push("Navigation".to_owned());
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('1')));
+        rows.push(format!(
+            "  [1] Line scrolling: {} — use up/down to move one line",
+            on_off(self.config.navigation.line_scroll)
+        ));
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('2')));
+        rows.push(format!(
+            "  [2] Wheel scrolling: {} — use the mouse wheel in the reader",
+            on_off(self.config.navigation.wheel_scroll)
+        ));
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('3')));
+        rows.push(format!(
+            "  [3] Wheel step: {} lines — cycle 1, 3, 5, or 10",
+            self.config.navigation.wheel_step
+        ));
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('4')));
+        rows.push(format!(
+            "  [4] Click to turn: {} — click the left or right page half",
+            on_off(self.config.navigation.click_to_turn)
+        ));
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('5')));
+        rows.push(format!(
+            "  [5] Invert click zones: {} — swap previous and next halves",
+            on_off(self.config.navigation.invert_click_zones)
+        ));
+        rows.push(String::new());
         rows.push("Progress sync (KOReader-compatible)".to_owned());
         self.register_row(area, rows.len(), Action::Key(KeyCode::Char('u')));
         rows.push(format!("  [u] Server: {}", self.config.sync.server_url));
@@ -2921,6 +3194,9 @@ impl App {
         if reader.sync_prompt.is_some() {
             self.draw_sync_prompt(frame, reader);
         }
+        if reader.link_prompt.is_some() {
+            self.draw_link_prompt(frame, reader);
+        }
     }
 
     /// Reader page lines with block styling, inline emphasis, and search
@@ -2929,7 +3205,8 @@ impl App {
         reader
             .visible_lines()
             .iter()
-            .map(|line| {
+            .enumerate()
+            .map(|(row, line)| {
                 let base = match reader.blocks.get(line.block) {
                     Some(tr_epub::Block::Heading { .. }) => self.palette.heading(),
                     Some(
@@ -2939,7 +3216,7 @@ impl App {
                     ) => self.palette.dim(),
                     _ => Style::new(),
                 };
-                let layers = self.reader_line_layers(reader, line);
+                let layers = self.reader_line_layers(reader, reader.top_line + row, line);
                 UiLine::from(styled_segments(&line.text, base, &layers))
             })
             .collect()
@@ -2947,7 +3224,12 @@ impl App {
 
     /// Style layers for one reader line: inline emphasis and note markers,
     /// plus highlighted search matches.
-    fn reader_line_layers(&self, reader: &ReaderScreen, line: &Line) -> Vec<(usize, usize, Style)> {
+    fn reader_line_layers(
+        &self,
+        reader: &ReaderScreen,
+        line_index: usize,
+        line: &Line,
+    ) -> Vec<(usize, usize, Style)> {
         let mut layers = Vec::new();
         if let (Some(block), Some(spans)) =
             (reader.blocks.get(line.block), reader.inline.get(line.block))
@@ -2958,6 +3240,9 @@ impl App {
                         Some(InlineKind::Emphasis) => Style::new().add_modifier(Modifier::ITALIC),
                         Some(InlineKind::Strong) => Style::new().add_modifier(Modifier::BOLD),
                         Some(InlineKind::Noteref(_)) => self.palette.noteref(),
+                        Some(InlineKind::Link(_)) => {
+                            self.palette.noteref().add_modifier(Modifier::UNDERLINED)
+                        }
                         None => Style::new(),
                     };
                     layers.push((start, end, style));
@@ -2968,6 +3253,9 @@ impl App {
             for (start, end) in find_matches(&line.text, query) {
                 layers.push((start, end, self.palette.search_mark()));
             }
+        }
+        if let Some((start, end)) = reader.selection_range(line_index) {
+            layers.push((start, end, self.palette.selection()));
         }
         layers
     }
@@ -3003,10 +3291,12 @@ impl App {
                 continue;
             };
             for (start, end, span) in line_inline_ranges(line, text, spans) {
-                if !matches!(
-                    spans.get(span).map(|span| &span.kind),
-                    Some(InlineKind::Noteref(_))
-                ) {
+                let action = match spans.get(span).map(|span| &span.kind) {
+                    Some(InlineKind::Noteref(_)) => Action::Footnote(line.block, span),
+                    Some(InlineKind::Link(_)) => Action::OpenLink(line.block, span),
+                    _ => continue,
+                };
+                if start >= end {
                     continue;
                 }
                 let prefix = UnicodeWidthStr::width(line.text.get(..start).unwrap_or_default());
@@ -3018,16 +3308,22 @@ impl App {
                         u16::try_from(width).unwrap_or(1).max(1),
                         1,
                     ),
-                    Action::Footnote(line.block, span),
+                    action,
                 ));
             }
         }
+        if !self.config.navigation.click_to_turn {
+            return;
+        }
         // Click the left/right half of the page to turn it.
         let half = inner.width / 2;
-        self.hit_targets.push((
-            Rect::new(inner.x, inner.y, half, inner.height),
-            Action::ReaderPrevious,
-        ));
+        let (left, right) = if self.config.navigation.invert_click_zones {
+            (Action::ReaderNext, Action::ReaderPrevious)
+        } else {
+            (Action::ReaderPrevious, Action::ReaderNext)
+        };
+        self.hit_targets
+            .push((Rect::new(inner.x, inner.y, half, inner.height), left));
         self.hit_targets.push((
             Rect::new(
                 inner.x + half,
@@ -3035,7 +3331,7 @@ impl App {
                 inner.width.saturating_sub(half),
                 inner.height,
             ),
-            Action::ReaderNext,
+            right,
         ));
     }
 
@@ -3336,6 +3632,55 @@ impl App {
             TuiBlock::default()
                 .borders(Borders::ALL)
                 .title(" Sync position "),
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(widget, popup);
+    }
+
+    fn draw_link_prompt(&self, frame: &mut Frame, reader: &ReaderScreen) {
+        let Some(prompt) = &reader.link_prompt else {
+            return;
+        };
+        let popup = reader.link_prompt_area();
+        let buttons_y = popup.y + popup.height.saturating_sub(2);
+        let hovered = |start: u16, length: usize| {
+            self.hover.is_some_and(|hover| {
+                hover.y == buttons_y
+                    && hover.x >= start
+                    && hover.x < start + u16::try_from(length).unwrap_or(0)
+            })
+        };
+        let open_x = popup.x + 1;
+        let cancel_x = open_x + u16::try_from(LINK_OPEN_LABEL.len() + 2).unwrap_or(0);
+        let style_for = |active: bool| {
+            if active {
+                self.palette.hover()
+            } else {
+                Style::new()
+            }
+        };
+        let text = Text::from(vec![
+            UiLine::from("Open this address in your browser?"),
+            UiLine::from(""),
+            UiLine::from(prompt.url.clone()).style(self.palette.title()),
+            UiLine::from(""),
+            UiLine::from(vec![
+                Span::styled(
+                    LINK_OPEN_LABEL,
+                    style_for(hovered(open_x, LINK_OPEN_LABEL.len())),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    LINK_CANCEL_LABEL,
+                    style_for(hovered(cancel_x, LINK_CANCEL_LABEL.len())),
+                ),
+                Span::raw("  (Enter / Esc)"),
+            ]),
+        ]);
+        let widget = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            TuiBlock::default()
+                .borders(Borders::ALL)
+                .title(" External link "),
         );
         frame.render_widget(Clear, popup);
         frame.render_widget(widget, popup);
@@ -3653,6 +3998,8 @@ impl App {
     }
 
     fn open_book(&mut self, path: PathBuf) -> Result<()> {
+        self.pending_status = None;
+        self.session_summary_visible = false;
         let book =
             EpubBook::open(&path).with_context(|| format!("could not open {}", path.display()))?;
         let position = self.positions.get(&path);
@@ -3696,7 +4043,8 @@ impl App {
         if self.config.sync.auto_sync {
             Self::push_progress(&self.config, &mut self.sync, reader, false);
         }
-        Self::record_session(&mut self.stats, &mut self.status, reader);
+        self.session_summary_visible =
+            Self::record_session(&mut self.stats, &mut self.status, reader);
         let position = reader.position();
         let recent = RecentBook {
             path: reader.path.clone(),
@@ -3728,6 +4076,10 @@ impl App {
                     self.status = None;
                     self.sync.status = None;
                     self.status_seen = None;
+                    if self.session_summary_visible {
+                        self.session_summary_visible = false;
+                        self.status = self.pending_status.take();
+                    }
                 }
             }
             _ => self.status_seen = Some((current, Instant::now())),
@@ -3782,21 +4134,22 @@ impl App {
         stats: &mut StatsStore,
         footer_status: &mut Option<String>,
         reader: &mut ReaderScreen,
-    ) {
+    ) -> bool {
         let seconds = reader.session_start.elapsed().as_secs();
         let pages = std::mem::take(&mut reader.session_pages);
         reader.session_start = Instant::now();
         if pages == 0 && seconds < 30 {
-            return;
+            return false;
         }
         if let Err(error) = stats.record(&reader.path, seconds, pages) {
             logging::warn(&format!("could not save reading stats: {error}"));
-            return;
+            return false;
         }
         *footer_status = Some(format!(
             "Read {} this session ({pages} pages).",
             format_duration(seconds)
         ));
+        true
     }
 
     /// Push on a timer so progress isn't lost when the app never exits
@@ -3893,6 +4246,18 @@ impl App {
     /// Handle finished background sync work (auth outcomes, pull results).
     fn process_sync_events(&mut self) {
         let events = self.sync.poll(&self.config.sync);
+        if let Some(notice) = self.sync.take_push_notice() {
+            if notice.success && self.session_summary_visible {
+                self.pending_status = Some(notice.message);
+                self.sync.status = None;
+            } else {
+                self.status = Some(notice.message);
+                if !notice.success {
+                    self.session_summary_visible = false;
+                    self.pending_status = None;
+                }
+            }
+        }
         if events.is_empty() {
             return;
         }
@@ -4361,31 +4726,145 @@ fn snippet_around(text: &str, start: usize, end: usize) -> String {
     )
 }
 
+fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
+    byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}
+
+fn previous_char_boundary(text: &str, byte: usize) -> usize {
+    text.get(..floor_char_boundary(text, byte))
+        .and_then(|head| head.char_indices().next_back().map(|(index, _)| index))
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(text: &str, byte: usize) -> usize {
+    let byte = floor_char_boundary(text, byte);
+    text.get(byte..)
+        .and_then(|tail| tail.chars().next())
+        .map_or(text.len(), |character| byte + character.len_utf8())
+}
+
+fn byte_at_display_column(text: &str, column: usize) -> usize {
+    let mut width = 0;
+    for (byte, character) in text.char_indices() {
+        let next = width + UnicodeWidthChar::width(character).unwrap_or(0);
+        if column < next {
+            return byte;
+        }
+        width = next;
+    }
+    text.len()
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let lookup = |index: usize| char::from(TABLE.get(index).copied().unwrap_or(b'='));
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk.first().copied().unwrap_or(0);
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(lookup(usize::from(first >> 2)));
+        encoded.push(lookup(usize::from((first & 0x03) << 4 | second >> 4)));
+        if chunk.len() > 1 {
+            encoded.push(lookup(usize::from((second & 0x0f) << 2 | third >> 6)));
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(lookup(usize::from(third & 0x3f)));
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+fn copy_osc52(text: &str) -> String {
+    let encoded = base64_encode(text.as_bytes());
+    let result = (|| -> std::io::Result<()> {
+        let mut stdout = std::io::stdout();
+        write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+        stdout.flush()
+    })();
+    match result {
+        Ok(()) => format!("Copied {} characters.", text.chars().count()),
+        Err(error) => format!("Could not copy selection: {error}"),
+    }
+}
+
 /// Extract the clicked image to a temp file and open it with the OS default
 /// handler for its file type. Returns a status message.
-fn open_reader_image(reader: &mut ReaderScreen, block: usize) -> String {
+fn open_reader_image(reader: &mut ReaderScreen, block: usize) -> (String, Option<PathBuf>) {
     let href = match reader.blocks.get(block) {
         Some(tr_epub::Block::Image {
             href: Some(href), ..
         }) => href.clone(),
-        _ => return "Image has no source to open.".to_owned(),
+        _ => return ("Image has no source to open.".to_owned(), None),
     };
     let (archive_path, bytes) = match reader.book.resource_bytes(reader.chapter_index, &href) {
         Ok(resource) => resource,
-        Err(error) => return format!("Could not read image: {error}"),
+        Err(error) => return (format!("Could not read image: {error}"), None),
     };
-    let name = sanitize_file_name(archive_path.rsplit('/').next().unwrap_or("image"));
+    let name = hashed_image_name(archive_path.rsplit('/').next().unwrap_or("image"), &bytes);
     let directory = env::temp_dir().join("terminalreader");
     if let Err(error) = fs::create_dir_all(&directory) {
-        return format!("Could not create temp folder: {error}");
+        return (format!("Could not create temp folder: {error}"), None);
     }
     let target = directory.join(&name);
-    if let Err(error) = fs::write(&target, bytes) {
-        return format!("Could not write image: {error}");
+    if !target.exists() {
+        if let Err(error) = fs::write(&target, bytes) {
+            return (format!("Could not write image: {error}"), None);
+        }
     }
     match open_with_system_viewer(&target) {
-        Ok(()) => format!("Opened {name} in the system viewer."),
-        Err(error) => format!("Could not open the system viewer: {error}"),
+        Ok(()) => (format!("Opened {name} in the system viewer."), Some(target)),
+        Err(error) => (
+            format!("Could not open the system viewer: {error}"),
+            Some(target),
+        ),
+    }
+}
+
+fn hashed_image_name(name: &str, bytes: &[u8]) -> String {
+    let sanitized = sanitize_file_name(name);
+    let digest = hex::encode(Sha256::digest(bytes));
+    let suffix = digest.get(..8).unwrap_or(&digest);
+    if let Some((stem, extension)) = sanitized.rsplit_once('.') {
+        format!("{stem}-{suffix}.{extension}")
+    } else {
+        format!("{sanitized}-{suffix}")
+    }
+}
+
+fn cleanup_stale_temp_images(max_age: Duration) {
+    let directory = env::temp_dir().join("terminalreader");
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let should_remove = entry.file_type().is_ok_and(|kind| kind.is_file())
+            && entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= max_age);
+        if should_remove {
+            if let Err(error) = fs::remove_file(entry.path()) {
+                logging::debug(&format!(
+                    "could not remove stale temp image {}: {error}",
+                    entry.path().display()
+                ));
+            }
+        }
     }
 }
 
@@ -4417,6 +4896,26 @@ fn open_with_system_viewer(path: &Path) -> std::io::Result<()> {
         .arg(path)
         .spawn()
         .map(|_| ())
+}
+
+fn is_external_link(href: &str) -> bool {
+    url::Url::parse(href).is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "mailto"))
+}
+
+fn open_external_url(url: &str) -> String {
+    if !is_external_link(url) {
+        return "Blocked an unsupported link scheme.".to_owned();
+    }
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let program = "xdg-open";
+    match std::process::Command::new(program).arg(url).spawn() {
+        Ok(_) => "Opened link in the system browser.".to_owned(),
+        Err(error) => format!("Could not open the system browser: {error}"),
+    }
 }
 
 /// One Recent list row: title — authors — ch. x/y — 2 days ago (missing).
@@ -4493,6 +4992,7 @@ impl ReaderScreen {
             source_paths: Vec::new(),
             blocks_loaded: false,
             lines: Vec::new(),
+            selection: None,
             width: 0,
             height: 0,
             toc: None,
@@ -4501,6 +5001,7 @@ impl ReaderScreen {
             last_push: Instant::now(),
             last_pushed_progress: None,
             sync_prompt: None,
+            link_prompt: None,
             open_at_end: false,
             search: None,
             search_matches: Vec::new(),
@@ -4567,6 +5068,7 @@ impl ReaderScreen {
     fn invalidate_layout(&mut self) {
         self.width = 0;
         self.lines.clear();
+        self.selection = None;
     }
     /// Invalidate layout *and* the loaded chapter blocks.
     fn invalidate_chapter(&mut self) {
@@ -4581,6 +5083,151 @@ impl ReaderScreen {
     fn content_height(&self) -> usize {
         let chrome = if self.zen { 0 } else { 2 };
         usize::from(self.height.saturating_sub(chrome)).max(1)
+    }
+    fn content_height_isize(&self) -> isize {
+        isize::try_from(self.content_height()).unwrap_or(isize::MAX)
+    }
+    fn start_selection(&mut self) {
+        let point = TextPoint {
+            line: self.top_line.min(self.lines.len().saturating_sub(1)),
+            byte: 0,
+        };
+        self.selection = Some(TextSelection {
+            anchor: point,
+            head: point,
+            dragging: false,
+        });
+    }
+    fn move_selection(&mut self, columns: isize, rows: isize) {
+        let Some(mut selection) = self.selection else {
+            return;
+        };
+        if self.lines.is_empty() {
+            return;
+        }
+        let last = self.lines.len().saturating_sub(1);
+        let line = if rows < 0 {
+            selection.head.line.saturating_sub(rows.unsigned_abs())
+        } else {
+            selection
+                .head
+                .line
+                .saturating_add(rows.unsigned_abs())
+                .min(last)
+        };
+        let Some(text) = self.lines.get(line).map(|line| line.text.as_str()) else {
+            return;
+        };
+        let mut byte = floor_char_boundary(text, selection.head.byte.min(text.len()));
+        if columns < 0 {
+            for _ in 0..columns.unsigned_abs() {
+                byte = previous_char_boundary(text, byte);
+            }
+        } else {
+            for _ in 0..columns.unsigned_abs() {
+                byte = next_char_boundary(text, byte);
+            }
+        }
+        if rows != 0 {
+            byte = floor_char_boundary(text, selection.head.byte.min(text.len()));
+        }
+        selection.head = TextPoint { line, byte };
+        self.selection = Some(selection);
+        if line < self.top_line {
+            self.top_line = line;
+        } else if line >= self.top_line + self.content_height() {
+            self.top_line = line + 1 - self.content_height();
+        }
+        self.update_anchor();
+    }
+    fn handle_selection_mouse(&mut self, mouse: MouseEvent) {
+        let inset = u16::from(!self.zen);
+        let x = mouse.column.saturating_sub(inset);
+        let y = mouse.row.saturating_sub(inset);
+        if y >= u16::try_from(self.content_height()).unwrap_or(u16::MAX) {
+            return;
+        }
+        let line_index = self.top_line + usize::from(y);
+        let Some(line) = self.lines.get(line_index) else {
+            return;
+        };
+        let point = TextPoint {
+            line: line_index,
+            byte: byte_at_display_column(&line.text, usize::from(x)),
+        };
+        let Some(selection) = &mut self.selection else {
+            return;
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                selection.anchor = point;
+                selection.head = point;
+                selection.dragging = true;
+            }
+            MouseEventKind::Drag(MouseButton::Left) if selection.dragging => {
+                selection.head = point;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                selection.head = point;
+                selection.dragging = false;
+            }
+            _ => {}
+        }
+    }
+    fn selection_range(&self, line_index: usize) -> Option<(usize, usize)> {
+        let selection = self.selection?;
+        let (start, end) = if selection.anchor <= selection.head {
+            (selection.anchor, selection.head)
+        } else {
+            (selection.head, selection.anchor)
+        };
+        let line = self.lines.get(line_index)?;
+        if line_index < start.line || line_index > end.line || start == end {
+            return None;
+        }
+        let range_start = if line_index == start.line {
+            start.byte
+        } else {
+            0
+        };
+        let range_end = if line_index == end.line {
+            end.byte
+        } else {
+            line.text.len()
+        };
+        (range_start < range_end).then_some((range_start, range_end))
+    }
+    fn selected_text(&self) -> String {
+        let Some(selection) = self.selection else {
+            return String::new();
+        };
+        let (start, end) = if selection.anchor <= selection.head {
+            (selection.anchor, selection.head)
+        } else {
+            (selection.head, selection.anchor)
+        };
+        if start == end {
+            return String::new();
+        }
+        let mut selected = Vec::new();
+        for line_index in start.line..=end.line {
+            let Some(line) = self.lines.get(line_index) else {
+                continue;
+            };
+            let from = if line_index == start.line {
+                start.byte
+            } else {
+                0
+            };
+            let to = if line_index == end.line {
+                end.byte
+            } else {
+                line.text.len()
+            };
+            let text = line.text.get(from..to).unwrap_or_default();
+            selected.push(collapse_whitespace(text));
+        }
+        selected.join("\n")
     }
     fn clamp_top(&mut self) {
         self.top_line = self.top_line.min(self.lines.len().saturating_sub(1));
@@ -4816,6 +5463,16 @@ impl ReaderScreen {
             height,
         )
     }
+    fn link_prompt_area(&self) -> Rect {
+        let width = self.width.saturating_sub(8).clamp(44, 72);
+        let height = 8;
+        Rect::new(
+            (self.width.saturating_sub(width)) / 2,
+            (self.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        )
+    }
     fn search_area(&self) -> Rect {
         let width = self.width.saturating_sub(8).clamp(30, 50);
         let height = 4;
@@ -4874,6 +5531,7 @@ impl ReaderScreen {
             || self.stats_open
             || self.footnote.is_some()
             || self.sync_prompt.is_some()
+            || self.link_prompt.is_some()
     }
     /// Text of the note a noteref span points at, if it can be found.
     fn footnote_text(&mut self, href: &str) -> Option<String> {
@@ -5027,6 +5685,42 @@ mod tests {
         );
         assert_eq!(find_matches("aaa", "aa"), vec![(0, 2), (1, 3)]);
         assert!(find_matches("abc", "").is_empty());
+    }
+
+    #[test]
+    fn external_link_policy_allows_only_browser_safe_schemes() {
+        assert!(is_external_link("https://example.com/path"));
+        assert!(is_external_link("http://example.com"));
+        assert!(is_external_link("mailto:reader@example.com"));
+        assert!(!is_external_link("file:///etc/passwd"));
+        assert!(!is_external_link("javascript:alert(1)"));
+        assert!(!is_external_link("../chapter.xhtml#part"));
+    }
+
+    #[test]
+    fn selection_helpers_keep_utf8_boundaries_and_encode_clipboard_data() {
+        assert_eq!(byte_at_display_column("a日b", 0), 0);
+        assert_eq!(byte_at_display_column("a日b", 1), 1);
+        assert_eq!(byte_at_display_column("a日b", 3), 4);
+        assert_eq!(previous_char_boundary("a日b", 4), 1);
+        assert_eq!(next_char_boundary("a日b", 1), 4);
+        assert_eq!(collapse_whitespace("  one   two\tthree "), "one two three");
+        assert_eq!(base64_encode(b"TerminalReader"), "VGVybWluYWxSZWFkZXI=");
+    }
+
+    #[test]
+    fn image_names_are_content_addressed_and_keep_extensions() {
+        let first = hashed_image_name("cover art.jpg", b"first");
+        let again = hashed_image_name("cover art.jpg", b"first");
+        let second = hashed_image_name("cover art.jpg", b"second");
+        assert_eq!(first, again);
+        assert_ne!(first, second);
+        assert!(
+            Path::new(&first)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jpg"))
+        );
     }
 
     #[test]

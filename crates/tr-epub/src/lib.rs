@@ -97,6 +97,8 @@ pub enum InlineKind {
     Strong,
     /// An `epub:type="noteref"` link; the payload is the target href.
     Noteref(String),
+    /// An ordinary anchor; the payload is the target href.
+    Link(String),
 }
 
 #[derive(Debug)]
@@ -745,6 +747,10 @@ fn merge_inline_element(parent: &mut ElementState, mut element: ElementState) {
             return;
         }
     }
+    let link = (element.name == "a")
+        .then(|| element.href.take())
+        .flatten()
+        .filter(|_| !element.text.is_empty());
     for span in element.spans.drain(..) {
         parent.spans.push(InlineSpan {
             start: base + span.start,
@@ -765,6 +771,13 @@ fn merge_inline_element(parent: &mut ElementState, mut element: ElementState) {
                 kind,
             });
         }
+    }
+    if let Some(href) = link {
+        parent.spans.push(InlineSpan {
+            start: base,
+            end: base + element.text.len(),
+            kind: InlineKind::Link(href),
+        });
     }
     parent.text.push_str(&element.text);
 }
@@ -1301,6 +1314,23 @@ mod tests {
             start: 8,
             end: 11,
             kind: InlineKind::Noteref("notes.xhtml#fn1".to_owned()),
+        }));
+    }
+
+    #[test]
+    fn ordinary_links_preserve_href_and_normalized_offsets() {
+        let blocks = parse_chapter(
+            r#"<html><body><p>Read <a href="https://example.com/a?x=1&amp;y=2">the  site</a>.</p></body></html>"#,
+        );
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0].block,
+            Block::Paragraph(text) if text == "Read the site."
+        ));
+        assert!(blocks[0].inline.contains(&InlineSpan {
+            start: 5,
+            end: 13,
+            kind: InlineKind::Link("https://example.com/a?x=1&y=2".to_owned()),
         }));
     }
 

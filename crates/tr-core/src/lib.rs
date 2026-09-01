@@ -153,6 +153,38 @@ impl Default for ReadingConfig {
     }
 }
 
+/// Input preferences for moving through a book.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NavigationConfig {
+    #[serde(default = "default_true")]
+    pub line_scroll: bool,
+    #[serde(default = "default_true")]
+    pub wheel_scroll: bool,
+    #[serde(default = "default_wheel_step")]
+    pub wheel_step: u16,
+    #[serde(default = "default_true")]
+    pub click_to_turn: bool,
+    #[serde(default)]
+    pub invert_click_zones: bool,
+}
+
+fn default_wheel_step() -> u16 {
+    3
+}
+
+impl Default for NavigationConfig {
+    fn default() -> Self {
+        Self {
+            line_scroll: true,
+            wheel_scroll: true,
+            wheel_step: default_wheel_step(),
+            click_to_turn: true,
+            invert_click_zones: false,
+        }
+    }
+}
+
 /// Color and light/dark preferences for the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeConfig {
@@ -335,6 +367,8 @@ pub struct Config {
     #[serde(default)]
     pub reading: ReadingConfig,
     #[serde(default)]
+    pub navigation: NavigationConfig,
+    #[serde(default)]
     pub theme: ThemeConfig,
     #[serde(default)]
     pub keys: KeyBindings,
@@ -354,6 +388,7 @@ impl Default for Config {
             schema_version: config_schema_version(),
             library: LibraryConfig::default(),
             reading: ReadingConfig::default(),
+            navigation: NavigationConfig::default(),
             theme: ThemeConfig::default(),
             keys: KeyBindings::default(),
             sync: SyncConfig::default(),
@@ -911,6 +946,13 @@ mod tests {
                 paragraph_spacing: 0,
                 indent: 4,
             },
+            navigation: NavigationConfig {
+                line_scroll: false,
+                wheel_scroll: false,
+                wheel_step: 5,
+                click_to_turn: false,
+                invert_click_zones: true,
+            },
             theme: ThemeConfig {
                 preset: "gruvbox".to_owned(),
                 accent: "green".to_owned(),
@@ -946,6 +988,11 @@ mod tests {
         assert_eq!(parsed.reading.line_spacing, 2);
         assert_eq!(parsed.reading.paragraph_spacing, 0);
         assert_eq!(parsed.reading.indent, 4);
+        assert!(!parsed.navigation.line_scroll);
+        assert!(!parsed.navigation.wheel_scroll);
+        assert_eq!(parsed.navigation.wheel_step, 5);
+        assert!(!parsed.navigation.click_to_turn);
+        assert!(parsed.navigation.invert_click_zones);
         assert_eq!(parsed.theme.preset, "gruvbox");
         assert_eq!(parsed.theme.accent, "green");
         assert!(parsed.theme.light);
@@ -971,6 +1018,11 @@ mod tests {
         assert_eq!(parsed.reading.line_spacing, 1);
         assert_eq!(parsed.reading.paragraph_spacing, 1);
         assert_eq!(parsed.reading.indent, 0);
+        assert!(parsed.navigation.line_scroll);
+        assert!(parsed.navigation.wheel_scroll);
+        assert_eq!(parsed.navigation.wheel_step, 3);
+        assert!(parsed.navigation.click_to_turn);
+        assert!(!parsed.navigation.invert_click_zones);
         assert_eq!(parsed.theme.preset, "custom");
         assert_eq!(parsed.theme.accent, "cyan");
         assert!(!parsed.theme.light);

@@ -112,13 +112,32 @@ terminalreader update          # self-update (--check to only check)
 | Reader   | `t`                 | Table of contents (type to filter)        |
 | Reader   | `/` then `n` / `N`  | Search the book, next / previous match    |
 | Reader   | `m` / `M`           | Add a bookmark / open bookmarks           |
+| Reader   | `v`, arrows, `Enter` | Select visible text and copy it            |
 | Reader   | `s` / `p`           | Push / pull sync progress now             |
 | Reader   | `x`                 | Toggle sync for this book                 |
 | Reader   | `Esc` / `q`         | Save position and go home / quit          |
 
 Reader keys are remappable in the `[keys]` section of `config.toml`.
 Everything is also mouse-clickable, with hover highlighting; in the reader the
-mouse only operates the bottom bar and image boxes, never the page.
+mouse can turn pages, scroll, open images and notes, and confirm external links.
+
+### Navigation settings
+
+Open Settings and use `1` through `5` to toggle line scrolling, wheel scrolling,
+cycle the wheel step, toggle click-to-turn, and invert the page-turn halves.
+The same values can be edited directly:
+
+```toml
+[navigation]
+line_scroll = true
+wheel_scroll = true
+wheel_step = 3
+click_to_turn = true
+invert_click_zones = false
+```
+
+Text selection uses OSC 52 clipboard writes. Terminal clipboard support must be
+enabled; terminal multiplexers such as tmux may require clipboard passthrough.
 
 ## Progress sync
 
