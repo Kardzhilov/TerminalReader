@@ -25,3 +25,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Other
+docs/implementation/
+todo.md
