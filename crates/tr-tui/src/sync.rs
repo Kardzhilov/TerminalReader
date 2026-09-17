@@ -26,17 +26,25 @@ pub enum SyncEvent {
         userkey: String,
         result: Result<(), String>,
         registered: bool,
+        generation: u64,
     },
     Push {
         update: ProgressUpdate,
         result: Result<(), String>,
         manual: bool,
+        book_path: Option<PathBuf>,
     },
     Pull {
         document: String,
         result: Result<Option<ProgressRecord>, String>,
         manual: bool,
     },
+}
+
+#[derive(Debug, Clone)]
+struct DeferredUpdate {
+    update: ProgressUpdate,
+    book_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,11 +62,12 @@ pub struct SyncController {
     queue_path: Option<PathBuf>,
     last_call: Option<Instant>,
     /// Debounced pushes awaiting the window, at most one per document.
-    deferred: Vec<ProgressUpdate>,
+    deferred: Vec<DeferredUpdate>,
     in_flight: usize,
     pub status: Option<String>,
     push_notice: Option<PushNotice>,
     offline: bool,
+    auth_generation: u64,
 }
 
 impl SyncController {
@@ -82,6 +91,7 @@ impl SyncController {
             status: None,
             push_notice: None,
             offline,
+            auth_generation: 0,
         }
     }
 
@@ -90,6 +100,17 @@ impl SyncController {
             logging::register_secret(&credentials.userkey);
         }
         self.credentials = credentials;
+    }
+
+    /// Invalidate background authentication started before logout or a server change.
+    pub fn invalidate_auth(&mut self) {
+        self.auth_generation = self.auth_generation.wrapping_add(1);
+        self.credentials = None;
+    }
+
+    #[must_use]
+    pub fn auth_generation_current(&self, generation: u64) -> bool {
+        self.auth_generation == generation
     }
 
     #[must_use]
@@ -122,6 +143,8 @@ impl SyncController {
         let server = config.server_url.clone();
         let password = password.to_owned();
         let tx = self.tx.clone();
+        self.auth_generation = self.auth_generation.wrapping_add(1);
+        let generation = self.auth_generation;
         self.in_flight += 1;
         self.status = Some(if register {
             "Registering…".to_owned()
@@ -148,14 +171,33 @@ impl SyncController {
                 userkey,
                 result,
                 registered: register,
+                generation,
             });
         });
     }
 
     /// Push progress; automatic pushes within the debounce window are
     /// deferred and coalesced per document, manual pushes go out immediately.
+    #[cfg(test)]
     pub fn push(&mut self, config: &SyncConfig, update: ProgressUpdate, manual: bool) {
+        self.push_for_book(config, update, manual, None);
+    }
+
+    /// Push progress while retaining the local identity needed for exclusions.
+    pub fn push_for_book(
+        &mut self,
+        config: &SyncConfig,
+        update: ProgressUpdate,
+        manual: bool,
+        book_path: Option<PathBuf>,
+    ) {
         if !self.allowed(config, manual) {
+            return;
+        }
+        if book_path
+            .as_deref()
+            .is_some_and(|path| config.excluded_books.contains(&path.to_path_buf()))
+        {
             return;
         }
         let Some(credentials) = self.credentials.clone() else {
@@ -165,25 +207,25 @@ impl SyncController {
             return;
         };
         if !manual && should_defer(self.last_call, Instant::now()) {
-            self.defer(update);
+            self.defer(update, book_path);
             self.status = Some("Sync queued…".to_owned());
             return;
         }
         // This update supersedes anything deferred for the same document.
         self.deferred
-            .retain(|existing| existing.document != update.document);
-        self.spawn_push(&config.server_url, credentials, update, manual);
+            .retain(|existing| existing.update.document != update.document);
+        self.spawn_push(&config.server_url, credentials, update, manual, book_path);
     }
 
     /// Coalesce a debounced push, keeping the newest update per document.
     /// The update is mirrored into the persistent queue so it survives
     /// unclean exits; a successful push removes it again.
-    fn defer(&mut self, update: ProgressUpdate) {
+    fn defer(&mut self, update: ProgressUpdate, book_path: Option<PathBuf>) {
         self.deferred
-            .retain(|existing| existing.document != update.document);
-        self.queue.push(update.clone());
+            .retain(|existing| existing.update.document != update.document);
+        self.queue.push_with_book(update.clone(), book_path.clone());
         self.save_queue();
-        self.deferred.push(update);
+        self.deferred.push(DeferredUpdate { update, book_path });
     }
 
     /// Pull the server's progress record for `document` in the background.
@@ -222,6 +264,7 @@ impl SyncController {
         credentials: Credentials,
         update: ProgressUpdate,
         manual: bool,
+        book_path: Option<PathBuf>,
     ) {
         let server = server.to_owned();
         let tx = self.tx.clone();
@@ -236,6 +279,7 @@ impl SyncController {
                 update,
                 result,
                 manual,
+                book_path,
             });
         });
     }
@@ -248,8 +292,8 @@ impl SyncController {
         let expired = !should_defer(self.last_call, Instant::now());
         if expired && config.auto_sync && !self.offline && !self.deferred.is_empty() {
             // One per window; the rest go out on later polls.
-            let update = self.deferred.remove(0);
-            self.push(config, update, false);
+            let deferred = self.deferred.remove(0);
+            self.push_for_book(config, deferred.update, false, deferred.book_path);
         }
         let mut events = Vec::new();
         while let Ok(event) = self.rx.try_recv() {
@@ -259,7 +303,8 @@ impl SyncController {
                     update,
                     result,
                     manual,
-                } => self.finish_push(config, update, &result, manual),
+                    book_path,
+                } => self.finish_push(config, update, &result, manual, book_path),
                 event => events.push(event),
             }
         }
@@ -272,6 +317,7 @@ impl SyncController {
         update: ProgressUpdate,
         result: &Result<(), String>,
         _manual: bool,
+        book_path: Option<PathBuf>,
     ) {
         match result {
             Ok(()) => {
@@ -281,10 +327,10 @@ impl SyncController {
                 if let Some(pending) = self
                     .deferred
                     .iter()
-                    .find(|pending| pending.document == update.document)
+                    .find(|pending| pending.update.document == update.document)
                     .cloned()
                 {
-                    self.queue.push(pending);
+                    self.queue.push_with_book(pending.update, pending.book_path);
                     self.save_queue();
                 } else {
                     self.queue_remove(&update.document);
@@ -303,7 +349,7 @@ impl SyncController {
             }
             Err(error) => {
                 logging::warn(&format!("sync push failed: {error}"));
-                self.queue.push(update);
+                self.queue.push_with_book(update, book_path);
                 self.save_queue();
                 let message = format!("Sync failed ({} queued): {error}", self.queue.len());
                 self.status = Some(message.clone());
@@ -335,16 +381,25 @@ impl SyncController {
             .items()
             .iter()
             .find(|item| {
-                !self
-                    .deferred
-                    .iter()
-                    .any(|pending| pending.document == item.update.document)
+                item.book_path
+                    .as_deref()
+                    .is_some_and(|path| !config.excluded_books.contains(&path.to_path_buf()))
+                    && !self
+                        .deferred
+                        .iter()
+                        .any(|pending| pending.update.document == item.update.document)
             })
             .cloned()
         else {
             return;
         };
-        self.spawn_push(&config.server_url, credentials, item.update, false);
+        self.spawn_push(
+            &config.server_url,
+            credentials,
+            item.update,
+            false,
+            item.book_path,
+        );
     }
 
     fn queue_remove(&mut self, document: &str) {
@@ -366,8 +421,14 @@ impl SyncController {
     pub fn flush(&mut self, config: &SyncConfig, timeout: Duration) {
         if self.allowed(config, false) {
             if let Some(credentials) = self.credentials.clone() {
-                for update in std::mem::take(&mut self.deferred) {
-                    self.spawn_push(&config.server_url, credentials.clone(), update, false);
+                for deferred in std::mem::take(&mut self.deferred) {
+                    self.spawn_push(
+                        &config.server_url,
+                        credentials.clone(),
+                        deferred.update,
+                        false,
+                        deferred.book_path,
+                    );
                 }
             }
         }
@@ -384,11 +445,12 @@ impl SyncController {
                 update,
                 result,
                 manual,
+                book_path,
             } = event
             {
                 // Full bookkeeping: successes clear their persisted mirror
                 // (and drain the backlog), failures stay queued.
-                self.finish_push(config, update, &result, manual);
+                self.finish_push(config, update, &result, manual, book_path);
             }
         }
     }
@@ -426,6 +488,7 @@ impl SyncController {
             status: None,
             push_notice: None,
             offline,
+            auth_generation: 0,
         }
     }
 }
@@ -647,16 +710,19 @@ mod tests {
     #[test]
     fn defer_coalesces_to_the_newest_update_per_document() {
         let mut controller = SyncController::for_tests();
-        controller.defer(update("doc-a", 0.1));
-        controller.defer(update("doc-b", 0.2));
-        controller.defer(update("doc-a", 0.5));
+        controller.defer(update("doc-a", 0.1), None);
+        controller.defer(update("doc-b", 0.2), None);
+        controller.defer(update("doc-a", 0.5), None);
         assert_eq!(controller.deferred.len(), 2);
         let doc_a = controller
             .deferred
             .iter()
-            .find(|deferred| deferred.document == "doc-a")
+            .find(|deferred| deferred.update.document == "doc-a")
             .unwrap();
-        assert!((doc_a.percentage - 0.5).abs() < 1e-12, "newest update wins");
+        assert!(
+            (doc_a.update.percentage - 0.5).abs() < 1e-12,
+            "newest update wins"
+        );
     }
 
     #[test]
@@ -679,7 +745,7 @@ mod tests {
     fn finish_push_exposes_success_and_failure_notices() {
         let mut controller = SyncController::for_tests();
         let config = SyncConfig::default();
-        controller.finish_push(&config, update("ok", 0.5), &Ok(()), false);
+        controller.finish_push(&config, update("ok", 0.5), &Ok(()), false, None);
         assert_eq!(
             controller.take_push_notice(),
             Some(PushNotice {
@@ -693,6 +759,7 @@ mod tests {
             update("failed", 0.5),
             &Err("offline".to_owned()),
             false,
+            None,
         );
         assert_eq!(
             controller.take_push_notice(),
@@ -767,22 +834,38 @@ mod tests {
     #[test]
     fn disabled_auto_sync_keeps_deferred_updates_paused() {
         let mut controller = signed_in_controller();
-        controller.deferred.push(update("doc-a", 0.4));
+        controller.deferred.push(DeferredUpdate {
+            update: update("doc-a", 0.4),
+            book_path: None,
+        });
         let config = SyncConfig {
             auto_sync: false,
             ..SyncConfig::default()
         };
         controller.poll(&config);
         assert_eq!(controller.deferred.len(), 1);
-        assert_eq!(controller.deferred[0].document, "doc-a");
+        assert_eq!(
+            controller
+                .deferred
+                .first()
+                .map(|deferred| deferred.update.document.as_str()),
+            Some("doc-a")
+        );
     }
 
     #[test]
     fn drain_next_skips_documents_with_deferred_updates() {
         let mut controller = signed_in_controller();
-        controller.queue.push(update("doc-a", 0.1));
-        controller.queue.push(update("doc-b", 0.2));
-        controller.deferred.push(update("doc-a", 0.3));
+        controller
+            .queue
+            .push_with_book(update("doc-a", 0.1), Some(PathBuf::from("a.epub")));
+        controller
+            .queue
+            .push_with_book(update("doc-b", 0.2), Some(PathBuf::from("b.epub")));
+        controller.deferred.push(DeferredUpdate {
+            update: update("doc-a", 0.3),
+            book_path: Some(PathBuf::from("a.epub")),
+        });
         controller.drain_next(&unreachable_config());
         assert_eq!(controller.in_flight, 1, "one push was spawned");
         let event = controller

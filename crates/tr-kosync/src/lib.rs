@@ -6,7 +6,7 @@ use std::{
     collections::VecDeque,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -284,6 +284,9 @@ pub struct ProgressQueue {
 pub struct QueuedProgress {
     pub update: ProgressUpdate,
     pub queued_at: u64,
+    /// Normalized local book identity, absent in legacy queue entries.
+    #[serde(default)]
+    pub book_path: Option<PathBuf>,
 }
 
 impl ProgressQueue {
@@ -316,12 +319,18 @@ impl ProgressQueue {
     }
 
     pub fn push(&mut self, update: ProgressUpdate) {
+        self.push_with_book(update, None);
+    }
+
+    /// Queue progress with the local book identity used for exclusion checks.
+    pub fn push_with_book(&mut self, update: ProgressUpdate, book_path: Option<PathBuf>) {
         self.expire();
         self.items
             .retain(|item| item.update.document != update.document);
         self.items.push_back(QueuedProgress {
             update,
             queued_at: unix_timestamp(),
+            book_path,
         });
         while self.items.len() > QUEUE_MAX_ITEMS {
             let _ = self.items.pop_front();
@@ -406,6 +415,35 @@ mod tests {
         });
         assert_eq!(queue.items().len(), 1);
         assert_eq!(queue.items().front().expect("entry").update.progress, "2");
+    }
+
+    #[test]
+    fn queue_preserves_book_identity_and_reads_legacy_entries() -> Result<(), SyncError> {
+        let mut queue = ProgressQueue::default();
+        queue.push_with_book(update("a"), Some(PathBuf::from("C:/Books/a.epub")));
+        let encoded = serde_json::to_vec(&queue)
+            .map_err(|error| SyncError::Io(std::io::Error::other(error)))?;
+        let decoded: ProgressQueue = serde_json::from_slice(&encoded)
+            .map_err(|error| SyncError::Io(std::io::Error::other(error)))?;
+        assert_eq!(
+            decoded
+                .items()
+                .front()
+                .and_then(|item| item.book_path.as_deref()),
+            Some(Path::new("C:/Books/a.epub"))
+        );
+
+        let legacy = br#"{"items":[{"update":{"document":"a","progress":"1","percentage":0.1,"device":"test","device_id":"device"},"queued_at":1}]}"#;
+        let decoded: ProgressQueue = serde_json::from_slice(legacy)
+            .map_err(|error| SyncError::Io(std::io::Error::other(error)))?;
+        assert!(
+            decoded
+                .items()
+                .front()
+                .and_then(|item| item.book_path.as_ref())
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

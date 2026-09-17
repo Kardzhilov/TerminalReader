@@ -912,7 +912,7 @@ impl App {
                     url::Url::parse(&value).map_err(|error| format!("Invalid URL: {error}"))?;
                     if app.config.sync.server_url != value {
                         app.config.sync.server_url = value;
-                        app.sync.set_credentials(None);
+                        app.sync.invalidate_auth();
                         return Ok("Server changed; sign in again.".to_owned());
                     }
                     Ok("Server unchanged.".to_owned())
@@ -1197,7 +1197,7 @@ impl App {
                     {
                         logging::warn(&format!("keyring delete failed: {error}"));
                     }
-                    self.sync.set_credentials(None);
+                    self.sync.invalidate_auth();
                     settings.message = Some(self.save_config_with("Signed out.".to_owned()));
                 } else {
                     settings.message = Some("Not signed in.".to_owned());
@@ -1812,6 +1812,7 @@ impl App {
                 }
             }
             self.status = Some(self.save_config_with("Sync enabled for this book.".to_owned()));
+            self.sync.drain_next(&self.config.sync);
         } else {
             self.config.sync.excluded_books.push(path);
             reader.document_digest = None;
@@ -4129,7 +4130,7 @@ impl App {
                 .unwrap_or_else(|| "terminalreader".to_owned()),
             device_id: config.sync.device_id.clone().unwrap_or_default(),
         };
-        sync.push(&config.sync, update, manual);
+        sync.push_for_book(&config.sync, update, manual, Some(reader.path.clone()));
     }
 
     /// Count a page turn and push when the configured interval is reached.
@@ -4284,7 +4285,15 @@ impl App {
                     userkey,
                     result,
                     registered,
-                } => self.finish_auth(&mut screen, username, userkey, result, registered),
+                    generation,
+                } => self.finish_auth(
+                    &mut screen,
+                    username,
+                    userkey,
+                    result,
+                    registered,
+                    generation,
+                ),
                 SyncEvent::Pull {
                     document,
                     result,
@@ -4322,7 +4331,11 @@ impl App {
         userkey: String,
         result: Result<(), String>,
         registered: bool,
+        generation: u64,
     ) {
+        if !self.sync.auth_generation_current(generation) {
+            return;
+        }
         let message = match result {
             Ok(()) => {
                 self.config.sync.username = Some(username.clone());
