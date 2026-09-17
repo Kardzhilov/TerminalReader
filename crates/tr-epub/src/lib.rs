@@ -43,6 +43,8 @@ pub struct SpineItem {
 pub struct TocEntry {
     pub label: String,
     pub spine_index: usize,
+    /// Decoded fragment identifier within the target spine item.
+    pub fragment: Option<String>,
     /// Nesting level in the navigation tree (0 = top level).
     pub depth: usize,
 }
@@ -174,13 +176,31 @@ impl EpubBook {
     /// the current chapter.
     #[must_use]
     pub fn spine_index_for(&self, chapter_index: usize, href: &str) -> Option<usize> {
-        let file = href.split('#').next().unwrap_or_default();
+        self.internal_target(chapter_index, href)
+            .map(|(index, _)| index)
+    }
+
+    /// Resolve an in-book href to its spine item and decoded fragment.
+    #[must_use]
+    pub fn internal_target(
+        &self,
+        chapter_index: usize,
+        href: &str,
+    ) -> Option<(usize, Option<String>)> {
+        let (file, fragment) = href
+            .split_once('#')
+            .map_or((href, None), |(file, fragment)| {
+                (file, Some(percent_decode(fragment)))
+            });
         if file.is_empty() {
-            return Some(chapter_index);
+            return Some((chapter_index, fragment));
         }
         let base = &self.spine.get(chapter_index)?.path;
         let target = resolve_path(base, file);
-        self.spine.iter().position(|item| item.path == target)
+        self.spine
+            .iter()
+            .position(|item| item.path == target)
+            .map(|index| (index, fragment))
     }
 }
 
@@ -479,14 +499,19 @@ fn parse_ncx(xml: &str, ncx_path: &str, spine: &[SpineItem]) -> Result<Vec<TocEn
                     if let (Some(label), Some(src)) =
                         (pending_label.take(), attribute(&element, b"src")?)
                     {
-                        let target =
-                            resolve_path(ncx_path, src.split('#').next().unwrap_or_default());
+                        let (file, fragment) = src
+                            .split_once('#')
+                            .map_or((src.as_str(), None), |(file, fragment)| {
+                                (file, Some(percent_decode(fragment)))
+                            });
+                        let target = resolve_path(ncx_path, file);
                         if let Some(spine_index) = spine.iter().position(|item| item.path == target)
                         {
                             if !label.is_empty() {
                                 entries.push(TocEntry {
                                     label,
                                     spine_index,
+                                    fragment,
                                     depth: point_depth.saturating_sub(1),
                                 });
                             }
@@ -559,8 +584,12 @@ fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<Toc
                 let name = local_name(element.name().as_ref());
                 if name == "a" {
                     if let Some((href, label, entry_depth)) = link.take() {
-                        let target_path =
-                            resolve_path(nav_path, href.split('#').next().unwrap_or_default());
+                        let (file, fragment) = href
+                            .split_once('#')
+                            .map_or((href.as_str(), None), |(file, fragment)| {
+                                (file, Some(percent_decode(fragment)))
+                            });
+                        let target_path = resolve_path(nav_path, file);
                         if let Some(spine_index) =
                             spine.iter().position(|item| item.path == target_path)
                         {
@@ -569,6 +598,7 @@ fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<Toc
                                 entries.push(TocEntry {
                                     label,
                                     spine_index,
+                                    fragment,
                                     depth: entry_depth,
                                 });
                             }
@@ -1446,9 +1476,11 @@ mod tests {
         let toc = parse_nav(nav, "OPS/nav.xhtml", &spine)?;
         assert_eq!(toc.len(), 2);
         assert_eq!(toc[0].label, "Chapter 1: Dawn");
+        assert_eq!(toc[0].fragment, None);
         assert_eq!(toc[0].depth, 0);
         assert_eq!(toc[1].spine_index, 1);
         assert_eq!(toc[1].label, "The Time I Fought 30 Snakes");
+        assert_eq!(toc[1].fragment.as_deref(), Some("section"));
         Ok(())
     }
 
@@ -1507,9 +1539,11 @@ mod tests {
         assert_eq!(toc.len(), 2);
         assert_eq!(toc[0].label, "First Steps");
         assert_eq!(toc[0].spine_index, 0);
+        assert_eq!(toc[0].fragment, None);
         assert_eq!(toc[0].depth, 0);
         assert_eq!(toc[1].label, "Nested Finale");
         assert_eq!(toc[1].spine_index, 1);
+        assert_eq!(toc[1].fragment.as_deref(), Some("part"));
         assert_eq!(toc[1].depth, 1);
         Ok(())
     }

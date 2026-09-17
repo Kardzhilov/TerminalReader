@@ -498,6 +498,9 @@ struct ReaderScreen {
     session_start: Instant,
     /// Pages turned this session, for statistics.
     session_pages: u64,
+    /// In-book navigation history, bounded to avoid unbounded memory growth.
+    back_history: Vec<SavedPosition>,
+    forward_history: Vec<SavedPosition>,
     /// Whether the current position has changed since the last checkpoint.
     position_dirty: bool,
     last_position_checkpoint: Instant,
@@ -1477,6 +1480,14 @@ impl App {
             reader.stats_open = true;
         } else if character == 'z' {
             reader.zen = !reader.zen;
+        } else if character == 'B' {
+            if !reader.go_back() {
+                self.status = Some("No previous in-book location.".to_owned());
+            }
+        } else if character == 'F' {
+            if !reader.go_forward() {
+                self.status = Some("No forward in-book location.".to_owned());
+            }
         } else if character == ']' {
             reader.next_chapter();
         } else if character == '[' {
@@ -2280,8 +2291,8 @@ impl App {
         };
         if is_external_link(&href) {
             reader.link_prompt = Some(LinkPrompt { url: href });
-        } else {
-            self.status = Some("In-book link navigation is not supported yet.".to_owned());
+        } else if !reader.jump_to_href(&href) {
+            self.status = Some("Could not find the in-book link target.".to_owned());
         }
     }
 
@@ -2430,6 +2441,7 @@ impl App {
                         keys.bookmark_add, keys.bookmarks
                     ),
                     "  g              go to page or percent".to_owned(),
+                    "  B / F          back / forward in-book navigation".to_owned(),
                     "  i              reading statistics".to_owned(),
                     "  z              zen mode (hide chrome)".to_owned(),
                     "  v              select text; arrows extend, Enter copies".to_owned(),
@@ -3729,7 +3741,7 @@ impl App {
         let Some(toc) = &mut reader.toc else { return };
         let mut rows = vec![toc.filter.render_caret("Search: ", blink)];
         let mut selected_row = None;
-        for (index, (spine_index, label, depth)) in
+        for (index, (spine_index, label, depth, _fragment)) in
             entries.iter().enumerate().skip(toc.top).take(rows_count)
         {
             let state = match spine_index.cmp(&current) {
@@ -5101,6 +5113,8 @@ impl ReaderScreen {
             bookmarks_open: None,
             session_start: Instant::now(),
             session_pages: 0,
+            back_history: Vec::new(),
+            forward_history: Vec::new(),
             position_dirty: false,
             last_position_checkpoint: Instant::now(),
         }
@@ -5505,6 +5519,65 @@ impl ReaderScreen {
         self.toc = None;
         self.invalidate_chapter();
     }
+
+    fn navigate_to(&mut self, position: &SavedPosition) {
+        self.back_history.push(self.position());
+        if self.back_history.len() > 50 {
+            self.back_history.remove(0);
+        }
+        self.forward_history.clear();
+        self.apply_position(position);
+    }
+
+    fn go_back(&mut self) -> bool {
+        let Some(position) = self.back_history.pop() else {
+            return false;
+        };
+        self.forward_history.push(self.position());
+        self.apply_position(&position);
+        true
+    }
+
+    fn go_forward(&mut self) -> bool {
+        let Some(position) = self.forward_history.pop() else {
+            return false;
+        };
+        self.back_history.push(self.position());
+        self.apply_position(&position);
+        true
+    }
+
+    fn position_for_fragment(
+        &mut self,
+        chapter: usize,
+        fragment: Option<&str>,
+    ) -> Option<SavedPosition> {
+        let fragment = fragment?;
+        let blocks = self.book.chapter_blocks(chapter).ok()?;
+        let block = blocks
+            .iter()
+            .position(|block| block.ids.iter().any(|id| id == fragment))?;
+        Some(SavedPosition {
+            chapter_index: chapter,
+            block_index: block,
+            ..SavedPosition::default()
+        })
+    }
+
+    fn jump_to_href(&mut self, href: &str) -> bool {
+        let Some((chapter, fragment)) = self.book.internal_target(self.chapter_index, href) else {
+            return false;
+        };
+        let position = fragment
+            .as_deref()
+            .and_then(|fragment| self.position_for_fragment(chapter, Some(fragment)))
+            .unwrap_or(SavedPosition {
+                chapter_index: chapter,
+                ..SavedPosition::default()
+            });
+        self.navigate_to(&position);
+        true
+    }
     fn open_toc(&mut self) {
         self.toc = Some(TocState {
             filter: TextInput::default(),
@@ -5512,28 +5585,36 @@ impl ReaderScreen {
             top: 0,
         });
     }
-    fn filtered_toc(&self) -> Vec<(usize, String, usize)> {
+    fn filtered_toc(&self) -> Vec<(usize, String, usize, Option<String>)> {
         let needle = self
             .toc
             .as_ref()
             .map_or("", |toc| toc.filter.value())
             .to_lowercase();
-        (0..self.book.spine.len())
-            .filter_map(|index| {
-                let entry = self
-                    .book
-                    .toc
-                    .iter()
-                    .find(|entry| entry.spine_index == index);
-                let label = entry.map_or_else(
-                    || format!("Chapter {}", index + 1),
-                    |entry| entry.label.clone(),
-                );
-                let depth = entry.map_or(0, |entry| entry.depth);
-                (needle.is_empty()
+        let mut entries: Vec<(usize, String, usize, Option<String>)> = self
+            .book
+            .toc
+            .iter()
+            .map(|entry| {
+                (
+                    entry.spine_index,
+                    entry.label.clone(),
+                    entry.depth,
+                    entry.fragment.clone(),
+                )
+            })
+            .collect();
+        for index in 0..self.book.spine.len() {
+            if !entries.iter().any(|entry| entry.0 == index) {
+                entries.push((index, format!("Chapter {}", index + 1), 0, None));
+            }
+        }
+        entries
+            .into_iter()
+            .filter(|(index, label, _, _)| {
+                needle.is_empty()
                     || (index + 1).to_string().contains(&needle)
-                    || label.to_lowercase().contains(&needle))
-                .then_some((index, label, depth))
+                    || label.to_lowercase().contains(&needle)
             })
             .collect()
     }
@@ -5672,12 +5753,16 @@ impl ReaderScreen {
         self.select_filtered_toc(toc.selection);
     }
     fn select_filtered_toc(&mut self, selection: usize) {
-        if let Some((chapter, _, _)) = self.filtered_toc().get(selection) {
-            self.chapter_index = *chapter;
-            self.top_line = 0;
-            self.anchor = (0, 0);
+        if let Some((chapter, _, _, fragment)) = self.filtered_toc().get(selection).cloned() {
+            let position = fragment
+                .as_deref()
+                .and_then(|fragment| self.position_for_fragment(chapter, Some(fragment)))
+                .unwrap_or(SavedPosition {
+                    chapter_index: chapter,
+                    ..SavedPosition::default()
+                });
+            self.navigate_to(&position);
             self.toc = None;
-            self.invalidate_chapter();
         }
     }
     fn handle_toc_mouse(&mut self, mouse: MouseEvent) {
