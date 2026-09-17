@@ -701,6 +701,10 @@ pub struct Bookmark {
     pub chapter_index: usize,
     pub block_index: usize,
     pub char_offset: usize,
+    #[serde(default)]
+    pub end_block_index: Option<usize>,
+    #[serde(default)]
+    pub end_char_offset: Option<usize>,
     pub label: String,
     #[serde(default)]
     pub note: Option<String>,
@@ -801,6 +805,16 @@ impl BookmarkStore {
                 bookmark.block_index + 1,
                 bookmark.char_offset
             );
+            if let (Some(end_block), Some(end_offset)) =
+                (bookmark.end_block_index, bookmark.end_char_offset)
+            {
+                let _ = writeln!(
+                    output,
+                    "  - Range end: block {}, offset {}",
+                    end_block + 1,
+                    end_offset
+                );
+            }
             if let Some(note) = &bookmark.note {
                 let _ = writeln!(output, "  - Note: {}", escape_markdown(note));
             }
@@ -819,6 +833,25 @@ impl BookmarkStore {
             return Ok(false);
         };
         entry.label = label;
+        self.save()?;
+        Ok(true)
+    }
+
+    pub fn set_note(
+        &mut self,
+        path: &Path,
+        index: usize,
+        note: Option<String>,
+    ) -> Result<bool, CoreError> {
+        let path = normalize_book_path(path);
+        let Some(entry) = self
+            .books
+            .get_mut(&path)
+            .and_then(|entries| entries.get_mut(index))
+        else {
+            return Ok(false);
+        };
+        entry.note = note.filter(|note| !note.trim().is_empty());
         self.save()?;
         Ok(true)
     }
@@ -1322,8 +1355,13 @@ fn unix_timestamp() -> u64 {
 
 fn bookmark_id(bookmark: &Bookmark) -> String {
     format!(
-        "{}-{}-{}-{}",
-        bookmark.chapter_index, bookmark.block_index, bookmark.char_offset, bookmark.created
+        "{}-{}-{}-{}-{:?}-{:?}",
+        bookmark.chapter_index,
+        bookmark.block_index,
+        bookmark.char_offset,
+        bookmark.created,
+        bookmark.end_block_index,
+        bookmark.end_char_offset
     )
 }
 
@@ -1526,6 +1564,8 @@ mod tests {
             chapter_index: 1,
             block_index: 2,
             char_offset: 3,
+            end_block_index: None,
+            end_char_offset: None,
             label: "A *place*".to_owned(),
             note: Some("Remember [this] passage".to_owned()),
             created: 4,

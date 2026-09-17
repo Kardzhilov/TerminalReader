@@ -465,6 +465,7 @@ struct BookmarkState {
     top: usize,
     /// Label editor for the selected bookmark, when renaming.
     rename: Option<TextInput>,
+    note: Option<TextInput>,
 }
 
 /// Selection state of a scrollable popup list.
@@ -1672,6 +1673,8 @@ impl App {
             self.add_bookmark(reader);
         } else if character == keys.bookmarks {
             reader.bookmarks_open = Some(BookmarkState::default());
+        } else if character == 'H' {
+            self.add_selection_bookmark(reader);
         } else if character == keys.sync_push {
             if self.offline {
                 self.status = Some("Offline mode — sync is disabled.".to_owned());
@@ -1970,6 +1973,8 @@ impl App {
             chapter_index: reader.chapter_index,
             block_index: reader.anchor.0,
             char_offset: reader.anchor.1,
+            end_block_index: None,
+            end_char_offset: None,
             label,
             note: None,
             created: 0,
@@ -1980,11 +1985,54 @@ impl App {
         });
     }
 
+    fn add_selection_bookmark(&mut self, reader: &mut ReaderScreen) {
+        let Some(selection) = reader.selection else {
+            self.status = Some("Select text before creating a highlight.".to_owned());
+            return;
+        };
+        let (start, end) = if selection.anchor <= selection.head {
+            (selection.anchor, selection.head)
+        } else {
+            (selection.head, selection.anchor)
+        };
+        if start == end {
+            self.status = Some("Select text before creating a highlight.".to_owned());
+            return;
+        }
+        let Some(start_line) = reader.lines.get(start.line) else {
+            return;
+        };
+        let Some(end_line) = reader.lines.get(end.line) else {
+            return;
+        };
+        let label = reader.selected_text().chars().take(80).collect::<String>();
+        let bookmark = Bookmark {
+            id: String::new(),
+            chapter_index: reader.chapter_index,
+            block_index: start_line.block,
+            char_offset: start_line.char_offset.saturating_add(start.byte),
+            end_block_index: Some(end_line.block),
+            end_char_offset: Some(end_line.char_offset.saturating_add(end.byte)),
+            label,
+            note: None,
+            created: 0,
+        };
+        self.status = Some(match self.bookmarks.add(&reader.path, bookmark) {
+            Ok(()) => "Highlight saved.".to_owned(),
+            Err(error) => format!("Could not save highlight: {error}"),
+        });
+        reader.selection = None;
+    }
+
     /// Keys for the bookmarks popup.
+    #[allow(clippy::too_many_lines)]
     fn handle_bookmarks_key(&mut self, reader: &mut ReaderScreen, key: KeyCode) {
         let count = self.bookmarks.list(&reader.path).len();
         let rows = reader.popup_visible_rows();
         if self.handle_bookmark_rename_key(reader, key) {
+            return;
+        }
+        if self.handle_bookmark_note_key(reader, key) {
             return;
         }
         match key {
@@ -2032,6 +2080,21 @@ impl App {
                     .unwrap_or_default();
                 if let Some(state) = &mut reader.bookmarks_open {
                     state.rename = Some(TextInput::new(label));
+                }
+            }
+            KeyCode::Char('n') if count > 0 => {
+                let selection = reader
+                    .bookmarks_open
+                    .as_ref()
+                    .map_or(0, |state| state.selection);
+                let note = self
+                    .bookmarks
+                    .list(&reader.path)
+                    .get(selection)
+                    .and_then(|bookmark| bookmark.note.clone())
+                    .unwrap_or_default();
+                if let Some(state) = &mut reader.bookmarks_open {
+                    state.note = Some(TextInput::new(note));
                 }
             }
             KeyCode::Enter => {
@@ -2095,6 +2158,34 @@ impl App {
                         },
                     );
                 }
+            }
+            _ => {
+                let _ = input.handle_key(key);
+            }
+        }
+        true
+    }
+
+    fn handle_bookmark_note_key(&mut self, reader: &mut ReaderScreen, key: KeyCode) -> bool {
+        let Some(state) = &mut reader.bookmarks_open else {
+            return false;
+        };
+        let Some(input) = &mut state.note else {
+            return false;
+        };
+        match key {
+            KeyCode::Esc => state.note = None,
+            KeyCode::Enter => {
+                let note = input.value().to_owned();
+                let selection = state.selection;
+                state.note = None;
+                self.status = Some(
+                    match self.bookmarks.set_note(&reader.path, selection, Some(note)) {
+                        Ok(true) => "Bookmark note saved.".to_owned(),
+                        Ok(false) => "Bookmark no longer exists.".to_owned(),
+                        Err(error) => format!("Could not save bookmark note: {error}"),
+                    },
+                );
             }
             _ => {
                 let _ = input.handle_key(key);
