@@ -7,11 +7,12 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use directories::ProjectDirs;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tr_epub::{BookMetadata, EpubBook};
 
@@ -41,6 +42,7 @@ pub struct SavedPosition {
 
 /// Newest saved positions kept on disk; the stalest are evicted beyond this.
 const MAX_POSITIONS: usize = 500;
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A saved position plus bookkeeping that only the store cares about.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,11 +61,11 @@ pub struct PositionStore {
 
 impl PositionStore {
     pub fn load() -> Result<Self, CoreError> {
-        let path = state_file("positions.json")?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
+        Ok(Self::load_or_backup()?.0)
+    }
+
+    pub fn load_or_backup() -> Result<(Self, Option<PathBuf>), CoreError> {
+        load_json_or_backup("positions.json")
     }
 
     #[must_use]
@@ -484,12 +486,12 @@ pub struct RecentsStore {
 
 impl RecentsStore {
     pub fn load() -> Result<Self, CoreError> {
-        let path = state_file("recents.json")?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let file: RecentsFile = serde_json::from_slice(&fs::read(path)?)?;
-        Ok(Self { items: file.items })
+        Ok(Self::load_or_backup()?.0)
+    }
+
+    pub fn load_or_backup() -> Result<(Self, Option<PathBuf>), CoreError> {
+        let (file, backup): (RecentsFile, Option<PathBuf>) = load_json_or_backup("recents.json")?;
+        Ok((Self { items: file.items }, backup))
     }
 
     #[must_use]
@@ -563,12 +565,13 @@ pub struct BookmarkStore {
 
 impl BookmarkStore {
     pub fn load() -> Result<Self, CoreError> {
-        let path = state_file("bookmarks.json")?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let file: BookmarksFile = serde_json::from_slice(&fs::read(path)?)?;
-        Ok(Self { books: file.books })
+        Ok(Self::load_or_backup()?.0)
+    }
+
+    pub fn load_or_backup() -> Result<(Self, Option<PathBuf>), CoreError> {
+        let (file, backup): (BookmarksFile, Option<PathBuf>) =
+            load_json_or_backup("bookmarks.json")?;
+        Ok((Self { books: file.books }, backup))
     }
 
     #[must_use]
@@ -648,12 +651,12 @@ pub struct StatsStore {
 
 impl StatsStore {
     pub fn load() -> Result<Self, CoreError> {
-        let path = state_file("stats.json")?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let file: StatsFile = serde_json::from_slice(&fs::read(path)?)?;
-        Ok(Self { books: file.books })
+        Ok(Self::load_or_backup()?.0)
+    }
+
+    pub fn load_or_backup() -> Result<(Self, Option<PathBuf>), CoreError> {
+        let (file, backup): (StatsFile, Option<PathBuf>) = load_json_or_backup("stats.json")?;
+        Ok((Self { books: file.books }, backup))
     }
 
     #[must_use]
@@ -886,10 +889,60 @@ fn write_text_atomic(destination: &Path, value: String) -> Result<(), CoreError>
 }
 
 fn write_bytes_atomic(destination: &Path, bytes: Vec<u8>) -> Result<(), CoreError> {
-    let temporary = destination.with_extension("tmp");
+    let temporary = destination.with_file_name(format!(
+        ".{}.tmp-{}-{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("state"),
+        std::process::id(),
+        TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::write(&temporary, bytes)?;
-    fs::rename(temporary, destination)?;
+    let result = fs::rename(&temporary, destination);
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
     Ok(())
+}
+
+fn load_json_or_backup<T>(name: &str) -> Result<(T, Option<PathBuf>), CoreError>
+where
+    T: DeserializeOwned + Default,
+{
+    let path = state_file(name)?;
+    load_json_or_backup_at(&path)
+}
+
+fn load_json_or_backup_at<T>(path: &Path) -> Result<(T, Option<PathBuf>), CoreError>
+where
+    T: DeserializeOwned + Default,
+{
+    if !path.exists() {
+        return Ok((T::default(), None));
+    }
+    let bytes = fs::read(path)?;
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok((value, None)),
+        Err(error) => {
+            let backup = unique_backup_path(path);
+            fs::rename(path, &backup)?;
+            let _ = error;
+            Ok((T::default(), Some(backup)))
+        }
+    }
+}
+
+fn unique_backup_path(path: &Path) -> PathBuf {
+    let stamp = unix_timestamp();
+    let mut candidate = path.with_extension(format!("bad-{}-{}", std::process::id(), stamp));
+    let mut suffix = 0_u32;
+    while candidate.exists() {
+        suffix = suffix.saturating_add(1);
+        candidate = path.with_extension(format!("bad-{stamp}-{suffix}"));
+    }
+    candidate
 }
 
 fn normalize_book_dir(path: &Path) -> Result<PathBuf, CoreError> {
@@ -1074,6 +1127,26 @@ mod tests {
         cache.prune(&root, std::slice::from_ref(&kept));
         assert!(cache.lookup(&deleted, 1, 2).is_none());
         assert!(cache.lookup(&kept, 10, 20).is_some());
+    }
+
+    #[test]
+    fn corrupt_json_is_backed_up_and_replaced_with_defaults() -> Result<(), CoreError> {
+        let path = std::env::temp_dir().join(format!(
+            "terminalreader-state-test-{}-{}.json",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::write(&path, b"not json")?;
+        let (file, backup) = load_json_or_backup_at::<RecentsFile>(&path)?;
+        assert!(file.items.is_empty());
+        let Some(backup) = backup else {
+            return Err(std::io::Error::other("corrupt state was not backed up").into());
+        };
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&backup)?, "not json");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(backup);
+        Ok(())
     }
 
     #[test]

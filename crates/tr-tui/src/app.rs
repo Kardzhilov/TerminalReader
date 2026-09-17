@@ -41,6 +41,7 @@ const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 16;
 /// How long footer status messages stay on screen.
 const STATUS_TTL: Duration = Duration::from_secs(5);
+const POSITION_CHECKPOINT: Duration = Duration::from_secs(30);
 const PROMPT_GO_LABEL: &str = "[Go to position]";
 const PROMPT_STAY_LABEL: &str = "[Stay here]";
 const LINK_OPEN_LABEL: &str = "[Open]";
@@ -496,6 +497,9 @@ struct ReaderScreen {
     session_start: Instant,
     /// Pages turned this session, for statistics.
     session_pages: u64,
+    /// Whether the current position has changed since the last checkpoint.
+    position_dirty: bool,
+    last_position_checkpoint: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -597,14 +601,28 @@ impl App {
         let show_wizard =
             first_run && config.library.book_dirs.is_empty() && initial_book.is_none();
         let palette = Palette::detect(&config.theme);
+        let (positions, positions_backup) = PositionStore::load_or_backup()?;
+        let (recents, recents_backup) = RecentsStore::load_or_backup()?;
+        let (bookmarks, bookmarks_backup) = BookmarkStore::load_or_backup()?;
+        let (stats, stats_backup) = StatsStore::load_or_backup()?;
+        let recovered = [
+            positions_backup,
+            recents_backup,
+            bookmarks_backup,
+            stats_backup,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
         let mut app = Self {
             config,
-            positions: PositionStore::load()?,
-            recents: RecentsStore::load()?,
+            positions,
+            recents,
             scan_cache: ScanCache::load(),
             scanner: LibraryScanner::new(),
-            bookmarks: BookmarkStore::load()?,
-            stats: StatsStore::load()?,
+            bookmarks,
+            stats,
             sync,
             update: UpdateController::new(),
             palette,
@@ -632,7 +650,12 @@ impl App {
             #[cfg(feature = "inline-images")]
             inline_images: images::InlineImages::detect(),
         };
-        if let Some(backup) = config_backup {
+        if !recovered.is_empty() {
+            app.status = Some(format!(
+                "State was corrupt and reset; backups: {}",
+                recovered.join(", ")
+            ));
+        } else if let Some(backup) = config_backup {
             app.status = Some(format!(
                 "Config file was invalid and was reset; backup: {}",
                 backup.display()
@@ -655,6 +678,7 @@ impl App {
             self.process_update_events();
             self.process_scan_events();
             self.maybe_timed_push();
+            self.maybe_checkpoint();
             self.expire_status();
             if previous_status != self.status_line() {
                 self.needs_redraw = true;
@@ -2187,25 +2211,12 @@ impl App {
                 }
             }
             Action::ReaderHome => {
-                if let Screen::Reader(reader) = &mut self.screen {
-                    if self.config.sync.auto_sync {
-                        Self::push_progress(&self.config, &mut self.sync, reader, false);
-                    }
-                    self.session_summary_visible =
-                        Self::record_session(&mut self.stats, &mut self.status, reader);
-                    let position = reader.position();
-                    let recent = RecentBook {
-                        path: reader.path.clone(),
-                        title: reader.book.metadata.title.clone(),
-                        authors: reader.book.metadata.authors.join(", "),
-                        spine_count: reader.book.spine.len(),
-                        last_chapter: reader.chapter_index,
-                        last_opened: 0,
-                    };
-                    let _ = self.positions.save_position(reader.path.clone(), position);
-                    let _ = self.recents.touch(recent);
+                let mut screen =
+                    std::mem::replace(&mut self.screen, Screen::Home(HomeScreen::default()));
+                if let Screen::Reader(reader) = &mut screen {
+                    self.leave_reader(reader);
                 }
-                self.next_screen = Some(Screen::Home(HomeScreen::default()));
+                self.screen = screen;
             }
             Action::TocSelect(index) => {
                 if let Screen::Reader(reader) = &mut self.screen {
@@ -4061,6 +4072,11 @@ impl App {
         }
         self.session_summary_visible =
             Self::record_session(&mut self.stats, &mut self.status, reader);
+        self.persist_reader_state(reader);
+        self.next_screen = Some(Screen::Home(HomeScreen::default()));
+    }
+
+    fn persist_reader_state(&mut self, reader: &mut ReaderScreen) {
         let position = reader.position();
         let recent = RecentBook {
             path: reader.path.clone(),
@@ -4070,9 +4086,43 @@ impl App {
             last_chapter: reader.chapter_index,
             last_opened: 0,
         };
-        let _ = self.positions.save_position(reader.path.clone(), position);
-        let _ = self.recents.touch(recent);
-        self.next_screen = Some(Screen::Home(HomeScreen::default()));
+        let mut errors = Vec::new();
+        match self.positions.save_position(reader.path.clone(), position) {
+            Ok(()) => reader.position_dirty = false,
+            Err(error) => errors.push(format!("position: {error}")),
+        }
+        if let Err(error) = self.recents.touch(recent) {
+            errors.push(format!("recent book: {error}"));
+        }
+        if errors.is_empty() {
+            reader.last_position_checkpoint = Instant::now();
+        } else {
+            self.status = Some(format!(
+                "Could not save reading state: {}",
+                errors.join("; ")
+            ));
+        }
+    }
+
+    fn maybe_checkpoint(&mut self) {
+        let mut screen = std::mem::replace(&mut self.screen, Screen::Home(HomeScreen::default()));
+        if let Screen::Reader(reader) = &mut screen {
+            if reader.position_dirty
+                && reader.last_position_checkpoint.elapsed() >= POSITION_CHECKPOINT
+            {
+                let position = reader.position();
+                match self.positions.save_position(reader.path.clone(), position) {
+                    Ok(()) => {
+                        reader.position_dirty = false;
+                        reader.last_position_checkpoint = Instant::now();
+                    }
+                    Err(error) => {
+                        self.status = Some(format!("Could not checkpoint position: {error}"));
+                    }
+                }
+            }
+        }
+        self.screen = screen;
     }
 
     /// Combined app/sync status for footers.
@@ -5046,6 +5096,8 @@ impl ReaderScreen {
             bookmarks_open: None,
             session_start: Instant::now(),
             session_pages: 0,
+            position_dirty: false,
+            last_position_checkpoint: Instant::now(),
         }
     }
 
@@ -5267,6 +5319,7 @@ impl ReaderScreen {
             .and_then(|rest| rest.iter().find(|line| !line.is_separator()))
         {
             self.anchor = (line.block, line.char_offset);
+            self.position_dirty = true;
         }
     }
     fn visible_lines(&self) -> &[Line] {
