@@ -1414,11 +1414,17 @@ impl App {
                 }
             }
             KeyCode::Char('v') if !self.update.busy => {
-                self.update.check_in_background();
-                settings.message = Some("Checking for updates…".to_owned());
+                if self.offline {
+                    settings.message = Some("Offline mode — update checks are disabled.".to_owned());
+                } else {
+                    self.update.check_in_background();
+                    settings.message = Some("Checking for updates…".to_owned());
+                }
             }
             KeyCode::Char('i') => {
-                if self.update.available.is_some() {
+                if self.offline {
+                    settings.message = Some("Offline mode — updates are disabled.".to_owned());
+                } else if self.update.available.is_some() {
                     if !self.update.busy {
                         self.update.apply_in_background();
                         settings.message = Some("Downloading and installing update…".to_owned());

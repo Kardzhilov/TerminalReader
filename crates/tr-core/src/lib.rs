@@ -288,8 +288,10 @@ impl KeyBindings {
                     "reader key '{key}' is assigned more than once ({name})"
                 ));
             }
-            if matches!(key, '?' | 'v' | 'g' | 'i' | 'z' | '[' | ']' | 'B' | 'F') {
-                errors.push(format!("reader key '{key}' for {name} is reserved"));
+            if matches!(key, ' ' | '?' | 'v' | 'g' | 'i' | 'z' | '[' | ']' | 'B' | 'F') {
+                errors.push(format!(
+                    "reader key '{key}' for {name} is reserved (Space is reserved for page turns)"
+                ));
             }
         }
         errors
@@ -1241,7 +1243,13 @@ pub fn normalize_book_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     let path = {
         let display = path.to_string_lossy().into_owned();
-        display.strip_prefix(r"\\?\").map_or(path, PathBuf::from)
+        if let Some(stripped) = display.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = display.strip_prefix(r"\\?") {
+            return PathBuf::from(stripped);
+        }
+        path
     };
     path
 }
@@ -1395,6 +1403,22 @@ mod tests {
                 .any(|warning| warning.contains("assigned more than once"))
         );
         assert!(warnings.iter().any(|warning| warning.contains("reserved")));
+    }
+
+    #[test]
+    fn key_bindings_reject_space_as_reserved_reader_key() {
+        let warnings = KeyBindings {
+            contents: Some(' '),
+            ..KeyBindings::default()
+        }
+        .validate();
+        assert!(warnings.iter().any(|warning| warning.contains("Space")) || warnings.iter().any(|warning| warning.contains("reserved")));
+    }
+
+    #[test]
+    fn normalize_book_path_keeps_windows_unc_prefixes_in_a_safe_form() {
+        let path = normalize_book_path(Path::new(r"\\?\UNC\audit.invalid\share\missing.epub"));
+        assert_eq!(path, Path::new(r"\\audit.invalid\share\missing.epub"));
     }
 
     #[test]

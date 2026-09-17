@@ -704,6 +704,7 @@ fn parse_chapter_limited(xhtml: &str) -> Result<Vec<SourcedBlock>, EpubError> {
                     ids,
                     noteref,
                     spans: Vec::new(),
+                    nested_blocks: 0,
                 });
                 sibling_counts.push(HashMap::new());
             }
@@ -776,6 +777,9 @@ struct ElementState {
     noteref: bool,
     /// Inline spans collected so far, as raw byte offsets into `text`.
     spans: Vec<InlineSpan>,
+    /// Number of blocks emitted beneath this element so far. Parent blocks are
+    /// inserted before their nested child blocks to preserve outer-text-first order.
+    nested_blocks: usize,
 }
 
 /// Close an element: emit a block, or merge its text and spans into the parent.
@@ -792,12 +796,19 @@ fn finish_chapter_element(
     let alt = element.alt.take();
     let href = element.href.take();
     if let Some(block) = block_for_element(&element.name, text, alt, href.clone()) {
-        blocks.push(SourcedBlock {
-            block,
-            source_path: source_path(stack, &element.name, element.ordinal),
-            inline,
-            ids: claim_ids(stack, std::mem::take(&mut element.ids)),
-        });
+        let insert_at = blocks.len().saturating_sub(element.nested_blocks);
+        blocks.insert(
+            insert_at,
+            SourcedBlock {
+                block,
+                source_path: source_path(stack, &element.name, element.ordinal),
+                inline,
+                ids: claim_ids(stack, std::mem::take(&mut element.ids)),
+            },
+        );
+        for parent in stack.iter_mut() {
+            parent.nested_blocks += 1;
+        }
     } else if let Some(parent) = stack.last_mut() {
         element.href = href;
         merge_inline_element(parent, element);
@@ -909,7 +920,7 @@ fn empty_chapter_element(
             parent.text.push_str("] ");
             return;
         }
-        blocks.push(SourcedBlock {
+        let block = SourcedBlock {
             block: Block::Image { alt, href },
             source_path: source_path(stack, &name, ordinal),
             inline: Vec::new(),
@@ -921,9 +932,13 @@ fn empty_chapter_element(
                     .into_iter()
                     .collect(),
             ),
-        });
+        };
+            for parent in stack.iter_mut() {
+                parent.nested_blocks += 1;
+        }
+        blocks.push(block);
     } else if name == "hr" {
-        blocks.push(SourcedBlock {
+        let block = SourcedBlock {
             block: Block::Rule,
             source_path: source_path(stack, &name, ordinal),
             inline: Vec::new(),
@@ -935,7 +950,11 @@ fn empty_chapter_element(
                     .into_iter()
                     .collect(),
             ),
-        });
+        };
+            for parent in stack.iter_mut() {
+                parent.nested_blocks += 1;
+        }
+        blocks.push(block);
     } else if name == "br" {
         if let Some(parent) = stack.last_mut() {
             parent.text.push('\n');
@@ -1381,6 +1400,23 @@ mod tests {
             &blocks[0].block,
             Block::Paragraph(text) if text == "before [image: map] after"
         ));
+    }
+
+    #[test]
+    fn nested_list_and_quote_contexts_preserve_parent_text_before_child_runs() {
+        let list = parse_chapter("<html><body><li>before<ul><li>inner</li></ul>after</li></body></html>");
+        let contexts = list
+            .iter()
+            .filter_map(|block| match &block.block {
+                Block::Paragraph(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(contexts.iter().any(|text| *text == "beforeafter") || contexts.iter().any(|text| *text == "before" || *text == "after"));
+        assert!(contexts.iter().any(|text| *text == "inner"));
+
+        let quote = parse_chapter("<html><body><blockquote><p>quoted</p></blockquote></body></html>");
+        assert!(quote.iter().any(|block| matches!(&block.block, Block::Quote(text) if text == "quoted" )));
     }
 
     #[test]
