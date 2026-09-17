@@ -679,7 +679,13 @@ pub fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
                 sibling_counts.push(HashMap::new());
             }
             Ok(Event::Empty(element)) => {
-                empty_chapter_element(&element, &mut stack, &mut blocks);
+                let name = local_name(element.name().as_ref());
+                let ordinal = sibling_counts.last_mut().map_or(1, |counts| {
+                    let count = counts.entry(name.clone()).or_insert(0);
+                    *count += 1;
+                    *count
+                });
+                empty_chapter_element(&element, ordinal, &mut stack, &mut blocks);
             }
             Ok(Event::Text(text)) => {
                 if let Some(element) = stack.last_mut() {
@@ -828,6 +834,7 @@ fn claim_ids(stack: &mut [ElementState], own: Vec<String>) -> Vec<String> {
 /// `<svg/>`, `<hr/>`, and `<br/>`.
 fn empty_chapter_element(
     element: &quick_xml::events::BytesStart<'_>,
+    ordinal: usize,
     stack: &mut [ElementState],
     blocks: &mut Vec<SourcedBlock>,
 ) {
@@ -839,9 +846,29 @@ fn empty_chapter_element(
         } else {
             attribute_local(element, b"href").ok().flatten()
         };
+        if let Some(parent) = stack.last_mut()
+            && matches!(
+                parent.name.as_str(),
+                "p" | "li" | "td" | "figcaption" | "blockquote"
+            )
+            && name != "svg"
+        {
+            parent.ids.extend(attribute(element, b"id").ok().flatten());
+            let label = alt
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    href.as_deref()
+                        .and_then(|value| value.rsplit('/').next().map(str::to_owned))
+                })
+                .unwrap_or_else(|| "image".to_owned());
+            parent.text.push_str(" [image: ");
+            parent.text.push_str(&label);
+            parent.text.push_str("] ");
+            return;
+        }
         blocks.push(SourcedBlock {
             block: Block::Image { alt, href },
-            source_path: source_path(stack, &name, 1),
+            source_path: source_path(stack, &name, ordinal),
             inline: Vec::new(),
             ids: claim_ids(
                 stack,
@@ -855,7 +882,7 @@ fn empty_chapter_element(
     } else if name == "hr" {
         blocks.push(SourcedBlock {
             block: Block::Rule,
-            source_path: source_path(stack, &name, 1),
+            source_path: source_path(stack, &name, ordinal),
             inline: Vec::new(),
             ids: claim_ids(
                 stack,
@@ -1284,6 +1311,39 @@ mod tests {
             blocks.last().map(|block| &block.block),
             Some(Block::Image { .. })
         ));
+    }
+
+    #[test]
+    fn nested_images_preserve_parent_text_order() {
+        let blocks = parse_chapter("<html><body><p>before<img alt='map'/>after</p></body></html>");
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0].block,
+            Block::Paragraph(text) if text == "before [image: map] after"
+        ));
+    }
+
+    #[test]
+    fn self_closing_siblings_receive_distinct_source_ordinals() {
+        let blocks =
+            parse_chapter("<html><body><img alt='one'/><img alt='two'/><hr/><hr/></body></html>");
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(
+            blocks[0].source_path.last().map(|step| step.ordinal),
+            Some(1)
+        );
+        assert_eq!(
+            blocks[1].source_path.last().map(|step| step.ordinal),
+            Some(2)
+        );
+        assert_eq!(
+            blocks[2].source_path.last().map(|step| step.ordinal),
+            Some(1)
+        );
+        assert_eq!(
+            blocks[3].source_path.last().map(|step| step.ordinal),
+            Some(2)
+        );
     }
 
     #[test]
