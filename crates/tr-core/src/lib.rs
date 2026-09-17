@@ -1519,7 +1519,10 @@ mod tests {
     #[test]
     fn normalize_book_path_keeps_windows_unc_prefixes_in_a_safe_form() {
         let path = normalize_book_path(Path::new(r"\\?\UNC\audit.invalid\share\missing.epub"));
+        #[cfg(windows)]
         assert_eq!(path, Path::new(r"\\audit.invalid\share\missing.epub"));
+        #[cfg(not(windows))]
+        assert_eq!(path, Path::new(r"\\?\UNC\audit.invalid\share\missing.epub"));
     }
 
     #[test]
