@@ -74,7 +74,23 @@ src="$tmpdir/terminalreader-${tag}-${target}/$BINARY"
 [ -f "$src" ] || fail "archive did not contain the $BINARY binary"
 
 mkdir -p "$INSTALL_DIR"
-install -m 755 "$src" "$INSTALL_DIR/$BINARY"
+destination="$INSTALL_DIR/$BINARY"
+staged="$tmpdir/$BINARY.new"
+backup="$tmpdir/$BINARY.previous"
+cp "$src" "$staged"
+chmod 755 "$staged"
+had_previous=0
+if [ -e "$destination" ]; then
+    mv "$destination" "$backup" || fail "could not stage the existing installation"
+    had_previous=1
+fi
+if ! mv "$staged" "$destination"; then
+    if [ "$had_previous" -eq 1 ]; then
+        mv "$backup" "$destination" || fail "replacement failed and rollback also failed"
+    fi
+    fail "could not replace $destination"
+fi
+if [ "$had_previous" -eq 1 ]; then rm -f "$backup"; fi
 say "Installed $BINARY $tag to $INSTALL_DIR/$BINARY"
 
 # --- PATH hint --------------------------------------------------------------

@@ -7,7 +7,7 @@
 [![CI](https://github.com/Kardzhilov/TerminalReader/actions/workflows/ci.yml/badge.svg)](https://github.com/Kardzhilov/TerminalReader/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Kardzhilov/TerminalReader?logo=github)](https://github.com/Kardzhilov/TerminalReader/releases/latest)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
-[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust)](rust-toolchain.toml)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](rust-toolchain.toml)
 
 Read your books where you live: the terminal. Keep your place in sync with your
 Kobo, Kindle, or any [KOReader](https://koreader.rocks/) device through
@@ -75,7 +75,7 @@ and adds it to your user `PATH`:
 irm https://raw.githubusercontent.com/Kardzhilov/TerminalReader/main/install.ps1 | iex
 ```
 
-**From source** (Rust 1.85+; on Linux install `libdbus-1-dev` and `pkg-config`
+**From source** (Rust 1.88+; on Linux install `libdbus-1-dev` and `pkg-config`
 first):
 
 ```sh

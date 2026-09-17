@@ -1,5 +1,7 @@
 //! EPUB container, OPF, spine, and simple XHTML block parsing for `TerminalReader`.
 
+#![allow(clippy::collapsible_if)]
+
 use std::{
     collections::HashMap,
     fs::File,
@@ -695,6 +697,7 @@ fn parse_chapter_limited(xhtml: &str) -> Result<Vec<SourcedBlock>, EpubError> {
                     .flatten()
                     .into_iter()
                     .collect();
+                flush_parent_text_before_nested_block(&mut stack, &mut blocks, &name);
                 stack.push(ElementState {
                     name,
                     ordinal,
@@ -705,6 +708,7 @@ fn parse_chapter_limited(xhtml: &str) -> Result<Vec<SourcedBlock>, EpubError> {
                     noteref,
                     spans: Vec::new(),
                     nested_blocks: 0,
+                    split_by_child: false,
                 });
                 sibling_counts.push(HashMap::new());
             }
@@ -716,6 +720,9 @@ fn parse_chapter_limited(xhtml: &str) -> Result<Vec<SourcedBlock>, EpubError> {
                     *count
                 });
                 empty_chapter_element(&element, ordinal, &mut stack, &mut blocks);
+                if blocks.len() > MAX_CHAPTER_BLOCKS {
+                    return Err(EpubError::ResourceLimit("chapter block count"));
+                }
             }
             Ok(Event::Text(text)) => {
                 if let Some(element) = stack.last_mut() {
@@ -780,6 +787,9 @@ struct ElementState {
     /// Number of blocks emitted beneath this element so far. Parent blocks are
     /// inserted before their nested child blocks to preserve outer-text-first order.
     nested_blocks: usize,
+    /// The element had text before a nested block and must emit remaining text
+    /// after that child rather than inserting the final block before it.
+    split_by_child: bool,
 }
 
 /// Close an element: emit a block, or merge its text and spans into the parent.
@@ -795,17 +805,26 @@ fn finish_chapter_element(
     };
     let alt = element.alt.take();
     let href = element.href.take();
-    if let Some(block) = block_for_element(&element.name, text, alt, href.clone()) {
-        let insert_at = blocks.len().saturating_sub(element.nested_blocks);
-        blocks.insert(
-            insert_at,
-            SourcedBlock {
-                block,
-                source_path: source_path(stack, &element.name, element.ordinal),
-                inline,
-                ids: claim_ids(stack, std::mem::take(&mut element.ids)),
-            },
-        );
+    if let Some(mut block) = block_for_element(&element.name, text, alt, href.clone()) {
+        if stack.iter().any(|ancestor| ancestor.name == "blockquote")
+            && matches!(block, Block::Paragraph(_))
+        {
+            if let Block::Paragraph(text) = block {
+                block = Block::Quote(text);
+            }
+        }
+        let sourced = SourcedBlock {
+            block,
+            source_path: source_path(stack, &element.name, element.ordinal),
+            inline,
+            ids: claim_ids(stack, std::mem::take(&mut element.ids)),
+        };
+        if element.split_by_child {
+            blocks.push(sourced);
+        } else {
+            let insert_at = blocks.len().saturating_sub(element.nested_blocks);
+            blocks.insert(insert_at, sourced);
+        }
         for parent in stack.iter_mut() {
             parent.nested_blocks += 1;
         }
@@ -813,6 +832,75 @@ fn finish_chapter_element(
         element.href = href;
         merge_inline_element(parent, element);
     }
+}
+
+fn flush_parent_text_before_nested_block(
+    stack: &mut [ElementState],
+    blocks: &mut Vec<SourcedBlock>,
+    child_name: &str,
+) {
+    if !is_block_element(child_name) {
+        return;
+    }
+    let Some(index) = stack
+        .iter()
+        .rposition(|element| is_block_element(&element.name) && !element.text.trim().is_empty())
+    else {
+        return;
+    };
+    let (name, ordinal, text, inline, alt, href) = {
+        let Some(element) = stack.get_mut(index) else {
+            return;
+        };
+        let (text, inline) = if element.name == "pre" {
+            (normalize_pre_text(&element.text), Vec::new())
+        } else {
+            normalize_text_with_spans(&element.text, &element.spans)
+        };
+        element.text.clear();
+        element.spans.clear();
+        element.split_by_child = true;
+        (
+            element.name.clone(),
+            element.ordinal,
+            text,
+            inline,
+            element.alt.clone(),
+            element.href.clone(),
+        )
+    };
+    let Some(block) = block_for_element(&name, text, alt, href) else {
+        return;
+    };
+    let Some(prefix_stack) = stack.get(..index) else {
+        return;
+    };
+    blocks.push(SourcedBlock {
+        block,
+        source_path: source_path(prefix_stack, &name, ordinal),
+        inline,
+        ids: Vec::new(),
+    });
+}
+
+fn is_block_element(name: &str) -> bool {
+    matches!(
+        name,
+        "p" | "li"
+            | "td"
+            | "figcaption"
+            | "blockquote"
+            | "pre"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "img"
+            | "image"
+            | "hr"
+    )
 }
 
 /// Merge a closed inline element into its parent: raw text, shifted spans,
@@ -933,8 +1021,8 @@ fn empty_chapter_element(
                     .collect(),
             ),
         };
-            for parent in stack.iter_mut() {
-                parent.nested_blocks += 1;
+        for parent in stack.iter_mut() {
+            parent.nested_blocks += 1;
         }
         blocks.push(block);
     } else if name == "hr" {
@@ -951,8 +1039,8 @@ fn empty_chapter_element(
                     .collect(),
             ),
         };
-            for parent in stack.iter_mut() {
-                parent.nested_blocks += 1;
+        for parent in stack.iter_mut() {
+            parent.nested_blocks += 1;
         }
         blocks.push(block);
     } else if name == "br" {
@@ -1404,7 +1492,8 @@ mod tests {
 
     #[test]
     fn nested_list_and_quote_contexts_preserve_parent_text_before_child_runs() {
-        let list = parse_chapter("<html><body><li>before<ul><li>inner</li></ul>after</li></body></html>");
+        let list =
+            parse_chapter("<html><body><li>before<ul><li>inner</li></ul>after</li></body></html>");
         let contexts = list
             .iter()
             .filter_map(|block| match &block.block {
@@ -1412,11 +1501,21 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert!(contexts.iter().any(|text| *text == "beforeafter") || contexts.iter().any(|text| *text == "before" || *text == "after"));
-        assert!(contexts.iter().any(|text| *text == "inner"));
+        assert!(
+            contexts.contains(&"beforeafter")
+                || contexts
+                    .iter()
+                    .any(|text| *text == "before" || *text == "after")
+        );
+        assert!(contexts.contains(&"inner"));
 
-        let quote = parse_chapter("<html><body><blockquote><p>quoted</p></blockquote></body></html>");
-        assert!(quote.iter().any(|block| matches!(&block.block, Block::Quote(text) if text == "quoted" )));
+        let quote =
+            parse_chapter("<html><body><blockquote><p>quoted</p></blockquote></body></html>");
+        assert!(
+            quote
+                .iter()
+                .any(|block| matches!(&block.block, Block::Quote(text) if text == "quoted" ))
+        );
     }
 
     #[test]

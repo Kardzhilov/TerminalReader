@@ -288,7 +288,10 @@ impl KeyBindings {
                     "reader key '{key}' is assigned more than once ({name})"
                 ));
             }
-            if matches!(key, ' ' | '?' | 'v' | 'g' | 'i' | 'z' | '[' | ']' | 'B' | 'F') {
+            if matches!(
+                key,
+                ' ' | '?' | 'v' | 'g' | 'i' | 'z' | '[' | ']' | 'B' | 'F'
+            ) {
                 errors.push(format!(
                     "reader key '{key}' for {name} is reserved (Space is reserved for page turns)"
                 ));
@@ -476,10 +479,8 @@ impl Config {
         if self.reading.indent > 8 {
             warnings.push("reading.indent must be between 0 and 8".to_owned());
         }
-        if !url::Url::parse(&self.sync.server_url)
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
-        {
-            warnings.push("sync.server_url must use http or https".to_owned());
+        if let Err(error) = validate_server_url(&self.sync.server_url) {
+            warnings.push(error);
         }
         warnings
     }
@@ -496,6 +497,12 @@ impl Config {
             return Ok(Self::default());
         }
         let mut config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        config.library.book_dirs = config
+            .library
+            .book_dirs
+            .iter()
+            .map(|path| normalize_book_path(path))
+            .collect();
         config.sync.excluded_books = config
             .sync
             .excluded_books
@@ -512,6 +519,12 @@ impl Config {
             return Ok(Self::default());
         }
         let mut config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        config.library.book_dirs = config
+            .library
+            .book_dirs
+            .iter()
+            .map(|path| normalize_book_path(path))
+            .collect();
         config.sync.excluded_books = config
             .sync
             .excluded_books
@@ -548,10 +561,13 @@ impl Config {
             .library
             .book_dirs
             .iter()
-            .any(|existing| existing == &path)
+            .any(|existing| path.starts_with(existing))
         {
             return Ok(false);
         }
+        self.library
+            .book_dirs
+            .retain(|existing| !existing.starts_with(&path));
         self.library.book_dirs.push(path);
         self.save()?;
         Ok(true)
@@ -566,6 +582,21 @@ impl Config {
         }
         Ok(changed)
     }
+}
+
+/// Validate the sync endpoint shared by file loading, settings edits, and diagnostics.
+pub fn validate_server_url(value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value).map_err(|error| format!("Invalid URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("sync.server_url must use http or https".to_owned());
+    }
+    if url.host_str().is_none() {
+        return Err("sync.server_url must include a host".to_owned());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("sync.server_url must not contain credentials".to_owned());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -746,18 +777,18 @@ impl BookmarkStore {
 
     #[must_use]
     pub fn export_markdown(&self, path: &Path, title: &str) -> String {
-        let mut output = format!("# Bookmarks: {title}\n\n");
+        let mut output = format!("# Bookmarks: {}\n\n", escape_markdown(title));
         for bookmark in self.list(path) {
             let _ = writeln!(
                 output,
                 "- **{}** (chapter {}, block {}, offset {})",
-                bookmark.label,
+                escape_markdown(&bookmark.label),
                 bookmark.chapter_index + 1,
                 bookmark.block_index + 1,
                 bookmark.char_offset
             );
             if let Some(note) = &bookmark.note {
-                let _ = writeln!(output, "  - Note: {note}");
+                let _ = writeln!(output, "  - Note: {}", escape_markdown(note));
             }
         }
         output
@@ -787,6 +818,17 @@ impl BookmarkStore {
             },
         )
     }
+}
+
+fn escape_markdown(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | '`' | '*' | '_' | '[' | ']' | '#' | '>') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// Accumulated reading totals for one book.
@@ -1090,7 +1132,9 @@ fn file_signature(path: &Path) -> Option<(u64, u64)> {
         .ok()?
         .duration_since(UNIX_EPOCH)
         .ok()?
-        .as_secs();
+        .as_nanos()
+        .try_into()
+        .ok()?;
     Some((metadata.len(), mtime))
 }
 
@@ -1412,7 +1456,10 @@ mod tests {
             ..KeyBindings::default()
         }
         .validate();
-        assert!(warnings.iter().any(|warning| warning.contains("Space")) || warnings.iter().any(|warning| warning.contains("reserved")));
+        assert!(
+            warnings.iter().any(|warning| warning.contains("Space"))
+                || warnings.iter().any(|warning| warning.contains("reserved"))
+        );
     }
 
     #[test]
@@ -1442,6 +1489,12 @@ mod tests {
     }
 
     #[test]
+    fn server_url_validation_rejects_embedded_credentials() {
+        assert!(validate_server_url("https://reader:secret@example.test").is_err());
+        assert!(validate_server_url("https://example.test").is_ok());
+    }
+
+    #[test]
     fn bookmark_exports_include_stable_id_and_note() {
         let path = PathBuf::from("book.epub");
         let bookmark = Bookmark {
@@ -1449,18 +1502,17 @@ mod tests {
             chapter_index: 1,
             block_index: 2,
             char_offset: 3,
-            label: "A place".to_owned(),
-            note: Some("Remember this passage".to_owned()),
+            label: "A *place*".to_owned(),
+            note: Some("Remember [this] passage".to_owned()),
             created: 4,
         };
         let mut store = BookmarkStore::default();
         store.books.insert(path.clone(), vec![bookmark]);
         assert!(store.export_json(&path).contains("bookmark-1"));
-        assert!(
-            store
-                .export_markdown(&path, "Example")
-                .contains("Remember this passage")
-        );
+        let markdown = store.export_markdown(&path, "Example #1");
+        assert!(markdown.contains("A \\*place\\*"));
+        assert!(markdown.contains("Remember \\[this\\] passage"));
+        assert!(markdown.contains("Example \\#1"));
     }
 
     #[test]

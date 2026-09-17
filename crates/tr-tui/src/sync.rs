@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tr_core::{MatchingMethod, SyncConfig, logging};
+use tr_core::{MatchingMethod, SyncConfig, logging, normalize_book_path};
 use tr_epub::{Block, SourcePathStep, SourcedBlock};
 use tr_kosync::{
     ChecksumMethod, Credentials, KOSyncClient, ProgressQueue, ProgressRecord, ProgressUpdate,
@@ -40,6 +40,7 @@ pub enum SyncEvent {
         document: String,
         result: Result<Option<ProgressRecord>, String>,
         manual: bool,
+        generation: u64,
     },
 }
 
@@ -82,7 +83,20 @@ impl SyncController {
         let queue_path = tr_core::state_file(QUEUE_FILE).ok();
         let queue = queue_path
             .as_deref()
-            .map(ProgressQueue::load)
+            .map(|path| match ProgressQueue::load_or_backup(path) {
+                Ok((queue, Some(backup))) => {
+                    logging::warn(&format!(
+                        "sync queue was backed up after corruption: {}",
+                        backup.display()
+                    ));
+                    queue
+                }
+                Ok((queue, None)) => queue,
+                Err(error) => {
+                    logging::warn(&format!("could not load sync queue: {error}"));
+                    ProgressQueue::default()
+                }
+            })
             .unwrap_or_default();
         let next_generation = queue
             .items()
@@ -206,12 +220,10 @@ impl SyncController {
         if !self.allowed(config, manual) {
             return;
         }
-        if book_path
-            .as_deref()
-            .is_some_and(|path| config.excluded_books.contains(&path.to_path_buf()))
-        {
+        if Self::is_excluded(config, book_path.as_deref()) {
             return;
         }
+        let book_path = book_path.map(|path| normalize_book_path(&path));
         let Some(credentials) = self.credentials.clone() else {
             if manual {
                 self.status = Some("Not signed in.".to_owned());
@@ -231,7 +243,9 @@ impl SyncController {
         let generation =
             self.queue
                 .push_with_generation(update.clone(), book_path.clone(), generation);
-        self.save_queue();
+        if !self.save_queue() {
+            return;
+        }
         if self.push_in_flight.contains(&update.document) {
             self.status = Some("Sync queued…".to_owned());
             return;
@@ -256,12 +270,15 @@ impl SyncController {
         self.next_generation = self.next_generation.saturating_add(1);
         self.queue
             .push_with_generation(update.clone(), book_path.clone(), generation);
-        self.save_queue();
+        let persisted = self.save_queue();
         self.deferred.push(DeferredUpdate {
             update,
             book_path,
             generation,
         });
+        if !persisted {
+            self.status = Some("Sync queued in memory; persistence failed.".to_owned());
+        }
     }
 
     /// Pull the server's progress record for `document` in the background.
@@ -280,6 +297,7 @@ impl SyncController {
         }
         let server = config.server_url.clone();
         let tx = self.tx.clone();
+        let generation = self.auth_generation;
         self.in_flight += 1;
         self.last_call = Some(Instant::now());
         std::thread::spawn(move || {
@@ -290,6 +308,7 @@ impl SyncController {
                 document,
                 result,
                 manual,
+                generation,
             });
         });
     }
@@ -335,7 +354,7 @@ impl SyncController {
             let eligible = deferred
                 .book_path
                 .as_deref()
-                .is_none_or(|path| !config.excluded_books.contains(&path.to_path_buf()));
+                .is_none_or(|path| !Self::is_excluded(config, Some(path)));
             if eligible && !self.push_in_flight.contains(&deferred.update.document) {
                 if let Some(credentials) = self.credentials.clone() {
                     self.spawn_push(
@@ -382,7 +401,18 @@ impl SyncController {
         match result {
             Ok(()) => {
                 logging::info(&format!("sync push ok: {}", update.document));
-                self.queue_remove_generation(&update.document, generation);
+                let queue_persisted = self.queue_remove_generation(&update.document, generation);
+                if !queue_persisted {
+                    let message =
+                        "Synced remotely, but local queue cleanup failed; retry may repeat it."
+                            .to_owned();
+                    self.status = Some(message.clone());
+                    self.push_notice = Some(PushNotice {
+                        message,
+                        success: false,
+                    });
+                    return;
+                }
                 let message = if self.queue.is_empty() {
                     "Synced.".to_owned()
                 } else {
@@ -436,7 +466,7 @@ impl SyncController {
             .find(|item| {
                 item.book_path
                     .as_deref()
-                    .is_some_and(|path| !config.excluded_books.contains(&path.to_path_buf()))
+                    .is_some_and(|path| !Self::is_excluded(config, Some(path)))
                     && ProgressQueue::retry_due(item)
                     && !self.push_in_flight.contains(&item.update.document)
                     && !self
@@ -458,18 +488,22 @@ impl SyncController {
         );
     }
 
-    fn queue_remove_generation(&mut self, document: &str, generation: u64) {
+    fn queue_remove_generation(&mut self, document: &str, generation: u64) -> bool {
         if self.queue.remove_generation(document, generation) {
-            self.save_queue();
+            return self.save_queue();
         }
+        true
     }
 
-    fn save_queue(&self) {
+    fn save_queue(&mut self) -> bool {
         if let Some(path) = &self.queue_path {
             if let Err(error) = self.queue.save(path) {
                 logging::warn(&format!("could not persist sync queue: {error}"));
+                self.status = Some(format!("Could not persist sync queue: {error}"));
+                return false;
             }
         }
+        true
     }
 
     /// Send any deferred pushes immediately and wait briefly for in-flight
@@ -525,6 +559,17 @@ impl SyncController {
             return false;
         }
         true
+    }
+
+    fn is_excluded(config: &SyncConfig, book_path: Option<&std::path::Path>) -> bool {
+        book_path.is_some_and(|path| {
+            let path = normalize_book_path(path);
+            config
+                .excluded_books
+                .iter()
+                .map(|excluded| normalize_book_path(excluded))
+                .any(|excluded| excluded == path)
+        })
     }
 }
 
@@ -906,6 +951,24 @@ mod tests {
         assert_eq!(controller.queue.len(), 1, "deferred push is persisted");
         assert_eq!(controller.status.as_deref(), Some("Sync queued…"));
         assert_eq!(controller.in_flight, 0, "nothing was sent yet");
+    }
+
+    #[test]
+    fn queue_persistence_failure_is_visible() {
+        let mut controller = SyncController::for_tests();
+        controller.queue_path = Some(
+            std::env::temp_dir()
+                .join(format!("terminalreader-missing-{}", std::process::id()))
+                .join("sync_queue.json"),
+        );
+        controller.defer(update("doc-a", 0.4), None);
+        assert_eq!(controller.queue.len(), 1);
+        assert!(
+            controller
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("persistence failed"))
+        );
     }
 
     #[test]

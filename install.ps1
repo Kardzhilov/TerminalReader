@@ -54,7 +54,20 @@ try {
     if (-not (Test-Path $binary)) { throw "Archive did not contain terminalreader.exe." }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item $binary (Join-Path $InstallDir "terminalreader.exe") -Force
+    $destination = Join-Path $InstallDir "terminalreader.exe"
+    $staged = Join-Path $tmp "terminalreader.new.exe"
+    $backup = Join-Path $tmp "terminalreader.previous.exe"
+    Copy-Item $binary $staged -Force
+    $hadPrevious = Test-Path $destination
+    if ($hadPrevious) { Move-Item $destination $backup -Force }
+    try {
+        Move-Item $staged $destination -Force
+    }
+    catch {
+        if ($hadPrevious -and (Test-Path $backup)) { Move-Item $backup $destination -Force }
+        throw "Could not replace ${destination}: $($_.Exception.Message)"
+    }
+    if ($hadPrevious) { Remove-Item $backup -Force -ErrorAction SilentlyContinue }
     Write-Host "Installed terminalreader $tag to $InstallDir"
 
     # Persist on the user PATH so new terminals can find it.

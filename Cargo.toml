@@ -14,7 +14,7 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 publish = false
 repository = "https://github.com/Kardzhilov/TerminalReader"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1.0"

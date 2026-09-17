@@ -6,7 +6,7 @@
 
 use ratatui::{Frame, layout::Rect};
 use ratatui_image::{Image, Resize, picker::Picker, protocol::Protocol};
-use std::path::PathBuf;
+use std::{io::Cursor, path::PathBuf};
 use unicode_width::UnicodeWidthStr;
 
 use super::ReaderScreen;
@@ -23,6 +23,7 @@ struct Cached {
     chapter: usize,
     block: usize,
     href: String,
+    document_digest: Option<String>,
     area: Rect,
     protocol: Option<Protocol>,
 }
@@ -63,6 +64,7 @@ impl InlineImages {
                 && cached.chapter == reader.chapter_index
                 && cached.block == block
                 && cached.href == href
+                && cached.document_digest == reader.document_digest
                 && cached.area == area
         });
         if !reusable {
@@ -71,6 +73,7 @@ impl InlineImages {
                 chapter: reader.chapter_index,
                 block,
                 href,
+                document_digest: reader.document_digest.clone(),
                 area,
                 protocol: load_protocol(picker, reader, block, area),
             });
@@ -138,11 +141,23 @@ fn load_protocol(
         .book
         .resource_bytes(reader.chapter_index, &href)
         .ok()?;
-    let decoded = image::load_from_memory(&bytes).ok()?;
-    let pixels = u64::from(decoded.width()).saturating_mul(u64::from(decoded.height()));
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(InlineImages::MAX_IMAGE_PIXELS.saturating_mul(4));
+    let reader = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (width, height) = reader.into_dimensions().ok()?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
     if pixels > InlineImages::MAX_IMAGE_PIXELS {
         return None;
     }
+    let mut reader = image::ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits);
+    let decoded = reader.decode().ok()?;
     picker
         .new_protocol(decoded, area.as_size(), Resize::Fit(None))
         .ok()

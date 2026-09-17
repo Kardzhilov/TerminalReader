@@ -72,10 +72,10 @@ pub fn register_secret(secret: &str) {
     if secret.is_empty() {
         return;
     }
-    if let Ok(mut secrets) = SECRETS.lock() {
-        if !secrets.iter().any(|existing| existing == secret) {
-            secrets.push(secret.to_owned());
-        }
+    if let Ok(mut secrets) = SECRETS.lock()
+        && !secrets.iter().any(|existing| existing == secret)
+    {
+        secrets.push(secret.to_owned());
     }
 }
 

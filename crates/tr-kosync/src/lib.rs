@@ -28,6 +28,7 @@ const QUEUE_MAX_ITEMS: usize = 200;
 const QUEUE_MAX_AGE_SECONDS: u64 = 28 * 24 * 60 * 60;
 const RETRY_BASE_SECONDS: u64 = 30;
 const RETRY_MAX_SECONDS: u64 = 30 * 60;
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum SyncError {
@@ -147,7 +148,7 @@ impl KOSyncClient {
             .timeout(PROGRESS_TIMEOUT)
             .json(update)
             .send()?;
-        parse_progress_response(response, &[StatusCode::OK, StatusCode::ACCEPTED])
+        parse_push_response(response, &[StatusCode::OK, StatusCode::ACCEPTED])
     }
 
     /// Fetch the server's progress record; `Ok(None)` when the document has
@@ -207,7 +208,40 @@ fn parse_progress_response(
     if !expected.contains(&status) {
         return Err(SyncError::Http(status));
     }
-    record_from_body(&response.text()?)
+    record_from_body(&read_response_body(response)?)
+}
+
+fn parse_push_response(
+    response: Response,
+    expected: &[StatusCode],
+) -> Result<ProgressRecord, SyncError> {
+    let status = response.status();
+    if !expected.contains(&status) {
+        return Err(SyncError::Http(status));
+    }
+    push_ack_from_body(&read_response_body(response)?)
+}
+
+fn read_response_body(response: Response) -> Result<String, SyncError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES)
+    {
+        return Err(SyncError::Protocol(
+            "sync response body exceeds the 64 KiB limit".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_RESPONSE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(SyncError::Protocol(
+            "sync response body exceeds the 64 KiB limit".to_owned(),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| SyncError::Protocol(format!("sync response is not UTF-8: {error}")))
 }
 
 /// Decode a progress body leniently: some servers answer with an empty body,
@@ -228,6 +262,16 @@ fn record_from_body(body: &str) -> Result<ProgressRecord, SyncError> {
         ));
     }
     Ok(record)
+}
+
+fn push_ack_from_body(body: &str) -> Result<ProgressRecord, SyncError> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(ProgressRecord::default());
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .map(|_| ProgressRecord::default())
+        .map_err(|error| SyncError::Protocol(error.to_string()))
 }
 
 #[must_use]
@@ -318,13 +362,30 @@ pub struct QueuedProgress {
 }
 
 impl ProgressQueue {
-    /// Load the persisted queue; missing or corrupt files yield an empty queue.
+    /// Load the persisted queue; retained for callers that cannot surface a
+    /// recovery warning directly.
     #[must_use]
     pub fn load(path: &Path) -> Self {
-        fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        Self::load_or_backup(path)
+            .map(|(queue, _)| queue)
             .unwrap_or_default()
+    }
+
+    /// Load the persisted queue and retain corrupt state for recovery.
+    pub fn load_or_backup(path: &Path) -> Result<(Self, Option<PathBuf>), SyncError> {
+        if !path.exists() {
+            return Ok((Self::default(), None));
+        }
+        let bytes = fs::read(path)?;
+        match serde_json::from_slice(&bytes) {
+            Ok(queue) => Ok((queue, None)),
+            Err(error) => {
+                let backup = unique_backup_path(path);
+                fs::rename(path, &backup)?;
+                let _ = error;
+                Ok((Self::default(), Some(backup)))
+            }
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<(), SyncError> {
@@ -447,6 +508,17 @@ impl ProgressQueue {
     }
 }
 
+fn unique_backup_path(path: &Path) -> PathBuf {
+    let stamp = unix_timestamp();
+    let mut candidate = path.with_extension(format!("bad-{}-{stamp}", std::process::id()));
+    let mut suffix = 0_u32;
+    while candidate.exists() {
+        suffix = suffix.saturating_add(1);
+        candidate = path.with_extension(format!("bad-{stamp}-{suffix}"));
+    }
+    candidate
+}
+
 fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -498,6 +570,18 @@ mod tests {
             record_from_body(r#"{"percentage":2.0}"#),
             Err(SyncError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn push_ack_parser_does_not_require_progress_fields() -> Result<(), SyncError> {
+        assert_eq!(push_ack_from_body("")?, ProgressRecord::default());
+        assert_eq!(push_ack_from_body("{}")?, ProgressRecord::default());
+        assert_eq!(
+            push_ack_from_body(r#"{"ok":true}"#)?,
+            ProgressRecord::default()
+        );
+        assert!(push_ack_from_body("not-json").is_err());
+        Ok(())
     }
 
     #[test]
@@ -656,6 +740,23 @@ mod tests {
             Some("doc-a")
         );
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_queue_is_backed_up_during_recovery() -> Result<(), SyncError> {
+        let path = std::env::temp_dir().join(format!(
+            "terminalreader-{}-queue-corrupt.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"not-json")?;
+        let (queue, backup) = ProgressQueue::load_or_backup(&path)?;
+        let backup = backup.expect("corrupt queue gets a backup path");
+        assert!(queue.is_empty());
+        assert!(!path.exists());
+        assert!(backup.exists());
+        std::fs::remove_file(backup)?;
         Ok(())
     }
 

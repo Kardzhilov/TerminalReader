@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src\lib.rs (target\debug\deps\tr_epub-11a068604a51edb3.exe)
+
+running 1 test
+
+thread 'tests::nested_list_and_quote_contexts_preserve_parent_text_before_child_runs' (5264) panicked at crates\tr-epub\src\lib.rs:1415:9:
+assertion failed: contexts.iter().any(|text| *text == "before" || *text == "after")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::nested_list_and_quote_contexts_preserve_parent_text_before_child_runs ... FAILED
+
+failures:
+
+failures:
+    tests::nested_list_and_quote_contexts_preserve_parent_text_before_child_runs
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p tr-epub --lib`

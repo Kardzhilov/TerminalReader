@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tr_core::{
     Bookmark, BookmarkStore, Config, LibraryBook, PositionStore, RecentBook, RecentsStore,
     SavedPosition, ScanCache, StatsStore, SyncStrategy, credentials, logging, normalize_book_path,
-    scan_library_cached_report,
+    scan_library_cached_report, validate_server_url,
 };
 use tr_epub::{EpubBook, InlineKind, InlineSpan};
 use tr_kosync::{Credentials, ProgressRecord, ProgressUpdate, xpointer::XPointer};
@@ -512,6 +512,7 @@ struct ReaderScreen {
     source_paths: Vec<Vec<tr_epub::SourcePathStep>>,
     blocks_loaded: bool,
     lines: Vec<Line>,
+    layout_options: LayoutOptions,
     selection: Option<TextSelection>,
     width: u16,
     height: u16,
@@ -570,6 +571,7 @@ struct ReaderSession {
     started: Instant,
     pages: u64,
     active_seconds: u64,
+    active_millis: u64,
     last_activity: Instant,
 }
 
@@ -580,6 +582,7 @@ impl ReaderSession {
             started: now,
             pages: 0,
             active_seconds: 0,
+            active_millis: 0,
             last_activity: now,
         }
     }
@@ -587,7 +590,9 @@ impl ReaderSession {
     fn record_activity(&mut self) {
         let elapsed = self.last_activity.elapsed();
         if elapsed <= READING_IDLE_LIMIT {
-            self.active_seconds = self.active_seconds.saturating_add(elapsed.as_secs());
+            self.active_millis = self
+                .active_millis
+                .saturating_add(elapsed.as_millis().try_into().unwrap_or(u64::MAX));
         }
         self.last_activity = Instant::now();
     }
@@ -595,6 +600,7 @@ impl ReaderSession {
     fn active_seconds_now(&self) -> u64 {
         let elapsed = self.last_activity.elapsed();
         self.active_seconds
+            .saturating_add(self.active_millis / 1_000)
             .saturating_add(if elapsed <= READING_IDLE_LIMIT {
                 elapsed.as_secs()
             } else {
@@ -605,7 +611,8 @@ impl ReaderSession {
     fn finish(&mut self) -> (u64, u64) {
         self.record_activity();
         let result = (
-            std::mem::take(&mut self.active_seconds),
+            std::mem::take(&mut self.active_seconds)
+                .saturating_add(std::mem::take(&mut self.active_millis) / 1_000),
             std::mem::take(&mut self.pages),
         );
         self.started = Instant::now();
@@ -1011,7 +1018,7 @@ impl App {
                 library.selection = 0;
                 library.top = 0;
             }
-            KeyCode::Char('f') => {
+            KeyCode::Char('F') => {
                 library.status = library.status.next();
                 library.selection = 0;
                 library.top = 0;
@@ -1096,7 +1103,7 @@ impl App {
             SettingsMode::EditServer => {
                 self.handle_settings_edit(settings, key, SettingsMode::EditServer, |app, value| {
                     let value = value.trim_end_matches('/').to_owned();
-                    url::Url::parse(&value).map_err(|error| format!("Invalid URL: {error}"))?;
+                    validate_server_url(&value)?;
                     if app.config.sync.server_url != value {
                         app.config.sync.server_url = value;
                         app.sync.invalidate_auth();
@@ -1407,15 +1414,16 @@ impl App {
                     {
                         logging::warn(&format!("keyring delete failed: {error}"));
                     }
-                    self.sync.invalidate_auth();
                     settings.message = Some(self.save_config_with("Signed out.".to_owned()));
                 } else {
                     settings.message = Some("Not signed in.".to_owned());
                 }
+                self.sync.invalidate_auth();
             }
             KeyCode::Char('v') if !self.update.busy => {
                 if self.offline {
-                    settings.message = Some("Offline mode — update checks are disabled.".to_owned());
+                    settings.message =
+                        Some("Offline mode — update checks are disabled.".to_owned());
                 } else {
                     self.update.check_in_background();
                     settings.message = Some("Checking for updates…".to_owned());
@@ -1536,11 +1544,7 @@ impl App {
         match key {
             KeyCode::Esc => {
                 if reader.search_query.is_some() || !reader.search_matches.is_empty() {
-                    reader.search_query = None;
-                    reader.search_matches.clear();
-                    reader.search_match_ends.clear();
-                    reader.search_snippets.clear();
-                    reader.search_index = 0;
+                    self.invalidate_search(reader);
                     self.status = Some("Search cleared.".to_owned());
                 } else {
                     self.leave_reader(reader);
@@ -1689,7 +1693,11 @@ impl App {
     /// Keys for the search input popup.
     fn handle_search_key(&mut self, reader: &mut ReaderScreen, key: KeyCode) {
         match key {
-            KeyCode::Esc => reader.search = None,
+            KeyCode::Esc => {
+                reader.search = None;
+                self.search_generation = self.search_generation.wrapping_add(1);
+                self.search_busy = false;
+            }
             KeyCode::Enter => {
                 let query = reader
                     .search
@@ -1865,6 +1873,17 @@ impl App {
             };
             let _ = tx.send(event);
         });
+    }
+
+    fn invalidate_search(&mut self, reader: &mut ReaderScreen) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_busy = false;
+        reader.search_query = None;
+        reader.search_matches.clear();
+        reader.search_match_ends.clear();
+        reader.search_snippets.clear();
+        reader.search_index = 0;
+        reader.results_open = None;
     }
 
     /// Jump to the next or previous search match, wrapping around.
@@ -2932,7 +2951,7 @@ impl App {
             rows.push("No matching EPUBs.".to_owned());
         }
         let footer = format!(
-            " [Home]  type: search | f: status ({}) | Enter: open | Tab: sort | Esc: home ",
+            " [Home]  type: search | F: status ({}) | Enter: open | Tab: sort | Esc: home ",
             library.status.label()
         );
         self.register_footer(area, &footer, &[("[Home]", Action::LibraryHome)]);
@@ -4297,6 +4316,8 @@ impl App {
     }
 
     fn open_book(&mut self, path: &Path) -> Result<()> {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_busy = false;
         self.pending_status = None;
         self.session_summary_visible = false;
         let path = normalize_book_path(path);
@@ -4691,7 +4712,11 @@ impl App {
                     document,
                     result,
                     manual,
+                    generation,
                 } => {
+                    if !self.sync.auth_generation_current(generation) {
+                        continue;
+                    }
                     if let Screen::Reader(reader) = &mut screen {
                         if reader.document_digest.as_deref() == Some(document.as_str()) {
                             match result {
@@ -5494,6 +5519,7 @@ impl ReaderScreen {
             source_paths: Vec::new(),
             blocks_loaded: false,
             lines: Vec::new(),
+            layout_options: LayoutOptions::default(),
             selection: None,
             width: 0,
             height: 0,
@@ -5535,6 +5561,7 @@ impl ReaderScreen {
 
     fn ensure_layout(&mut self, width: u16, height: u16, options: LayoutOptions) {
         self.height = height;
+        self.layout_options = options;
         if self.width == width && !self.lines.is_empty() {
             return;
         }
@@ -5587,7 +5614,6 @@ impl ReaderScreen {
     }
 
     fn invalidate_layout(&mut self) {
-        self.width = 0;
         self.lines.clear();
         self.inline_ranges.clear();
         self.selection = None;
@@ -5801,10 +5827,11 @@ impl ReaderScreen {
         )
     }
     fn next_page(&mut self) {
-        // A chapter transition clears layout until the next draw. Do not treat
-        // that pending state as an empty chapter and advance again.
         if self.lines.is_empty() {
-            return;
+            self.ensure_layout(self.width, self.height, self.layout_options);
+            if self.lines.is_empty() {
+                return;
+            }
         }
         let step = self.content_height();
         if self.top_line + step < self.lines.len() {
@@ -5832,7 +5859,10 @@ impl ReaderScreen {
     }
     fn previous_page(&mut self) {
         if self.lines.is_empty() {
-            return;
+            self.ensure_layout(self.width, self.height, self.layout_options);
+            if self.lines.is_empty() {
+                return;
+            }
         }
         if self.top_line > 0 {
             self.top_line = self.top_line.saturating_sub(self.content_height());
@@ -5954,6 +5984,25 @@ impl ReaderScreen {
     )]
     fn position_for_percentage(&mut self, percentage: f64) -> SavedPosition {
         let total: usize = self.chapter_weights.iter().sum::<usize>().max(1);
+        if percentage >= 1.0 {
+            let chapter = self.chapter_weights.len().saturating_sub(1);
+            let Ok(blocks) = self.book.chapter_blocks(chapter) else {
+                return SavedPosition {
+                    chapter_index: chapter,
+                    ..SavedPosition::default()
+                };
+            };
+            let block_index = blocks.len().saturating_sub(1);
+            return SavedPosition {
+                chapter_index: chapter,
+                block_index,
+                char_offset: blocks
+                    .get(block_index)
+                    .and_then(|block| sync::block_text(&block.block))
+                    .map_or(0, str::len),
+                percent: 1.0,
+            };
+        }
         let target = (percentage.clamp(0.0, 1.0) * total as f64) as usize;
         let mut completed = 0_usize;
         let mut chapter = self.chapter_weights.len().saturating_sub(1);
@@ -6007,7 +6056,24 @@ impl ReaderScreen {
         self.chapter_index = position
             .chapter_index
             .min(self.book.spine.len().saturating_sub(1));
-        self.anchor = (position.block_index, position.char_offset);
+        let blocks = self
+            .book
+            .chapter_blocks(self.chapter_index)
+            .unwrap_or_default();
+        let block_index = position.block_index.min(blocks.len().saturating_sub(1));
+        let mut char_offset = position.char_offset;
+        if let Some(text) = blocks
+            .get(block_index)
+            .and_then(|block| sync::block_text(&block.block))
+        {
+            char_offset = char_offset.min(text.len());
+            while !text.is_char_boundary(char_offset) {
+                char_offset = char_offset.saturating_sub(1);
+            }
+        } else {
+            char_offset = 0;
+        }
+        self.anchor = (block_index, char_offset);
         self.top_line = 0;
         self.toc = None;
         self.invalidate_chapter();

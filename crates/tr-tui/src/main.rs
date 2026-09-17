@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_is_multiple_of)]
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -306,17 +308,29 @@ fn doctor(book: Option<&Path>, offline: bool) -> Result<()> {
 
 fn doctor_sync(config: &Config, offline: bool) {
     match url::Url::parse(&config.sync.server_url) {
-        Ok(_) => println!("Sync server URL: OK ({})", config.sync.server_url),
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            println!("Sync server URL: OK ({url})");
+        }
         Err(error) => {
             println!("Sync server URL: INVALID ({error})");
             return;
         }
     }
-    let queue_len = tr_core::state_path_read_only("sync_queue.json")
-        .ok()
-        .filter(|path| path.exists())
-        .map_or(0, |path| ProgressQueue::load(&path).len());
-    println!("Sync queue: {queue_len} pending");
+    match tr_core::state_path_read_only("sync_queue.json") {
+        Ok(path) if path.exists() => match ProgressQueue::load_or_backup(&path) {
+            Ok((queue, Some(backup))) => println!(
+                "Sync queue: {} pending (corrupt file backed up to {})",
+                queue.len(),
+                backup.display()
+            ),
+            Ok((queue, None)) => println!("Sync queue: {} pending", queue.len()),
+            Err(error) => println!("Sync queue: unavailable ({error})"),
+        },
+        Ok(_) => println!("Sync queue: 0 pending"),
+        Err(error) => println!("Sync queue: unavailable ({error})"),
+    }
     if offline {
         println!("Sync network: skipped (--offline)");
         return;
