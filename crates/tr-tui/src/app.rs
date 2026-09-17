@@ -4438,7 +4438,7 @@ impl App {
             last_opened: 0,
         };
         let mut errors = Vec::new();
-        match self.positions.save_position(reader.path.clone(), position) {
+        match self.positions.save_position(&reader.path, position) {
             Ok(()) => reader.position_dirty = false,
             Err(error) => errors.push(format!("position: {error}")),
         }
@@ -4464,7 +4464,7 @@ impl App {
                 && reader.last_position_checkpoint.elapsed() >= POSITION_CHECKPOINT
             {
                 let position = reader.position();
-                match self.positions.save_position(reader.path.clone(), position) {
+                match self.positions.save_position(&reader.path, position) {
                     Ok(()) => {
                         reader.position_dirty = false;
                         reader.last_position_checkpoint = Instant::now();

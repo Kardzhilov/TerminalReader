@@ -86,17 +86,15 @@ impl PositionStore {
 
     #[must_use]
     pub fn get(&self, path: &Path) -> SavedPosition {
+        let path = normalize_book_path(path);
         self.positions
-            .get(path)
+            .get(&path)
             .map(|stored| stored.position.clone())
             .unwrap_or_default()
     }
 
-    pub fn save_position(
-        &mut self,
-        path: PathBuf,
-        position: SavedPosition,
-    ) -> Result<(), CoreError> {
+    pub fn save_position(&mut self, path: &Path, position: SavedPosition) -> Result<(), CoreError> {
+        let path = normalize_book_path(path);
         self.positions.insert(
             path,
             StoredPosition {
@@ -660,12 +658,14 @@ impl RecentsStore {
     }
 
     pub fn touch(&mut self, mut recent: RecentBook) -> Result<(), CoreError> {
+        recent.path = normalize_book_path(&recent.path);
         recent.last_opened = unix_timestamp();
         self.insert_recent(recent);
         self.save()
     }
 
     pub fn remove(&mut self, path: &Path) -> Result<bool, CoreError> {
+        let path = normalize_book_path(path);
         let original_len = self.items.len();
         self.items.retain(|item| item.path != path);
         let changed = self.items.len() != original_len;
@@ -752,22 +752,25 @@ impl BookmarkStore {
 
     #[must_use]
     pub fn list(&self, path: &Path) -> &[Bookmark] {
-        self.books.get(path).map_or(&[], Vec::as_slice)
+        let path = normalize_book_path(path);
+        self.books.get(&path).map_or(&[], Vec::as_slice)
     }
 
     pub fn add(&mut self, path: &Path, mut bookmark: Bookmark) -> Result<(), CoreError> {
+        let path = normalize_book_path(path);
         bookmark.created = unix_timestamp();
         if bookmark.id.is_empty() {
             bookmark.id = bookmark_id(&bookmark);
         }
-        let entries = self.books.entry(path.to_path_buf()).or_default();
+        let entries = self.books.entry(path).or_default();
         entries.push(bookmark);
         entries.sort_by_key(|entry| (entry.chapter_index, entry.block_index, entry.char_offset));
         self.save()
     }
 
     pub fn remove(&mut self, path: &Path, index: usize) -> Result<bool, CoreError> {
-        let Some(entries) = self.books.get_mut(path) else {
+        let path = normalize_book_path(path);
+        let Some(entries) = self.books.get_mut(&path) else {
             return Ok(false);
         };
         if index >= entries.len() {
@@ -775,7 +778,7 @@ impl BookmarkStore {
         }
         entries.remove(index);
         if entries.is_empty() {
-            self.books.remove(path);
+            self.books.remove(&path);
         }
         self.save()?;
         Ok(true)
@@ -807,9 +810,10 @@ impl BookmarkStore {
 
     /// Change the label of the bookmark at `index`.
     pub fn rename(&mut self, path: &Path, index: usize, label: String) -> Result<bool, CoreError> {
+        let path = normalize_book_path(path);
         let Some(entry) = self
             .books
-            .get_mut(path)
+            .get_mut(&path)
             .and_then(|entries| entries.get_mut(index))
         else {
             return Ok(false);
@@ -881,7 +885,8 @@ impl StatsStore {
 
     #[must_use]
     pub fn get(&self, path: &Path) -> BookStats {
-        self.books.get(path).copied().unwrap_or_default()
+        let path = normalize_book_path(path);
+        self.books.get(&path).copied().unwrap_or_default()
     }
 
     /// Add a finished reading session to the book's totals.
@@ -889,7 +894,8 @@ impl StatsStore {
         if seconds == 0 && pages == 0 {
             return Ok(());
         }
-        let stats = self.books.entry(path.to_path_buf()).or_default();
+        let path = normalize_book_path(path);
+        let stats = self.books.entry(path).or_default();
         stats.seconds = stats.seconds.saturating_add(seconds);
         stats.pages = stats.pages.saturating_add(pages);
         self.save()
