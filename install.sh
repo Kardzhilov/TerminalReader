@@ -47,6 +47,7 @@ tag=$(fetch "https://api.github.com/repos/$REPO/releases/latest" |
 
 asset="terminalreader-${tag}-${target}.tar.gz"
 url="https://github.com/$REPO/releases/download/$tag/$asset"
+checksums_url="https://github.com/$REPO/releases/download/$tag/SHA256SUMS.txt"
 
 # --- Download and install --------------------------------------------------
 tmpdir=$(mktemp -d)
@@ -54,6 +55,19 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 say "Downloading $asset ($tag)…"
 fetch_to "$url" "$tmpdir/$asset" || fail "download failed: $url"
+fetch_to "$checksums_url" "$tmpdir/SHA256SUMS.txt" || fail "could not download release checksums"
+
+expected=$(awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print $1 }' "$tmpdir/SHA256SUMS.txt")
+[ "$(printf '%s\n' "$expected" | sed '/^$/d' | wc -l | tr -d ' ')" = "1" ] ||
+    fail "no unique checksum found for $asset"
+printf '%s' "$expected" | grep -Eq '^[0-9A-Fa-f]{64}$' || fail "invalid checksum for $asset"
+actual=$(sha256sum "$tmpdir/$asset" 2>/dev/null | awk '{print $1}' || true)
+if [ -z "$actual" ] && command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmpdir/$asset" | awk '{print $1}')
+fi
+[ -n "$actual" ] || fail "sha256sum or shasum is required to verify downloads"
+[ "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" ] ||
+    fail "checksum mismatch for $asset"
 tar xzf "$tmpdir/$asset" -C "$tmpdir"
 
 src="$tmpdir/terminalreader-${tag}-${target}/$BINARY"

@@ -27,6 +27,7 @@ if (-not $tag) { throw "Could not determine the latest release tag." }
 
 $asset = "terminalreader-$tag-$Target.zip"
 $url = "https://github.com/$Repo/releases/download/$tag/$asset"
+$checksumsUrl = "https://github.com/$Repo/releases/download/$tag/SHA256SUMS.txt"
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "tr-install-$([guid]::NewGuid())"
 New-Item -ItemType Directory -Path $tmp | Out-Null
@@ -34,6 +35,19 @@ try {
     Write-Host "Downloading $asset ($tag)..."
     $zip = Join-Path $tmp $asset
     Invoke-WebRequest -Uri $url -OutFile $zip
+    $checksums = Join-Path $tmp "SHA256SUMS.txt"
+    Invoke-WebRequest -Uri $checksumsUrl -OutFile $checksums
+    $matches = @(
+        Get-Content $checksums | ForEach-Object {
+            $parts = $_ -split '\s+'
+            if ($parts.Count -ge 2 -and $parts[1].TrimStart('*') -eq $asset) { $parts[0] }
+        }
+    )
+    if ($matches.Count -ne 1 -or $matches[0] -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "SHA256SUMS.txt has no unique valid checksum for $asset."
+    }
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
+    if ($actual -ine $matches[0]) { throw "Checksum mismatch for $asset." }
     Expand-Archive -Path $zip -DestinationPath $tmp
 
     $binary = Join-Path $tmp "terminalreader-$tag-$Target\terminalreader.exe"
