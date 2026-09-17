@@ -675,7 +675,7 @@ impl App {
     ) -> Result<Self> {
         cleanup_stale_temp_images(Duration::from_secs(24 * 60 * 60));
         let first_run = !Config::exists();
-        let key_warnings = config.keys.validate();
+        let config_warnings = config.validate();
         let mut sync = SyncController::new(offline);
         if offline {
             // Leave the controller signed out so nothing touches the network.
@@ -758,8 +758,11 @@ impl App {
             #[cfg(feature = "inline-images")]
             inline_images: images::InlineImages::detect(),
         };
-        if !key_warnings.is_empty() {
-            app.status = Some(format!("Key binding warning: {}", key_warnings.join("; ")));
+        if !config_warnings.is_empty() {
+            app.status = Some(format!(
+                "Configuration warning: {}",
+                config_warnings.join("; ")
+            ));
         } else if !recovered.is_empty() {
             app.status = Some(format!(
                 "State was corrupt and reset; backups: {}",
@@ -1255,6 +1258,29 @@ impl App {
                 settings.message = Some(self.save_config_with(format!(
                     "Inverted click zones {}.",
                     on_off(self.config.navigation.invert_click_zones)
+                )));
+            }
+            KeyCode::Char('6') => {
+                self.config.reading.line_spacing =
+                    (self.config.reading.line_spacing % 3).saturating_add(1);
+                settings.message = Some(self.save_config_with(format!(
+                    "Line spacing: {}.",
+                    self.config.reading.line_spacing
+                )));
+            }
+            KeyCode::Char('7') => {
+                self.config.reading.paragraph_spacing =
+                    (self.config.reading.paragraph_spacing + 1) % 4;
+                settings.message = Some(self.save_config_with(format!(
+                    "Paragraph spacing: {}.",
+                    self.config.reading.paragraph_spacing
+                )));
+            }
+            KeyCode::Char('8') => {
+                self.config.reading.indent = (self.config.reading.indent + 1) % 9;
+                settings.message = Some(self.save_config_with(format!(
+                    "Paragraph indent: {}.",
+                    self.config.reading.indent
                 )));
             }
             KeyCode::Char('u') => {
@@ -2545,7 +2571,7 @@ impl App {
                 "  a/d         add / remove library",
                 "  w j m       max width / justify / ASCII mode",
                 "  h k         color theme / caret blink",
-                "  1-5         navigation preferences",
+                "  1-8         navigation and typography preferences",
                 "  u c         sync server / matching method",
                 "  f b t       forward / backward / auto sync",
                 "  g e         push every N pages / N minutes",
@@ -2967,6 +2993,21 @@ impl App {
         rows.push(format!(
             "  [m] ASCII mode: {} — swap curly quotes/dashes for plain ones",
             on_off(self.config.reading.ascii_only)
+        ));
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('6')));
+        rows.push(format!(
+            "  [6] Line spacing: {} — rows per text line",
+            self.config.reading.line_spacing
+        ));
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('7')));
+        rows.push(format!(
+            "  [7] Paragraph spacing: {} — blank rows between blocks",
+            self.config.reading.paragraph_spacing
+        ));
+        self.register_row(area, rows.len(), Action::Key(KeyCode::Char('8')));
+        rows.push(format!(
+            "  [8] Paragraph indent: {} — first-line columns",
+            self.config.reading.indent
         ));
         self.register_row(area, rows.len(), Action::Key(KeyCode::Char('h')));
         let theme_row = rows.len();

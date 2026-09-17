@@ -447,6 +447,40 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Report configuration values that are parseable but outside supported ranges.
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = self.keys.validate();
+        if self.schema_version > config_schema_version() {
+            warnings.push(format!(
+                "unsupported config schema version {}",
+                self.schema_version
+            ));
+        }
+        if self
+            .reading
+            .max_width
+            .is_some_and(|width| !(20..=400).contains(&width))
+        {
+            warnings.push("reading.max_width must be between 20 and 400".to_owned());
+        }
+        if self.reading.line_spacing == 0 || self.reading.line_spacing > 3 {
+            warnings.push("reading.line_spacing must be between 1 and 3".to_owned());
+        }
+        if self.reading.paragraph_spacing > 3 {
+            warnings.push("reading.paragraph_spacing must be between 0 and 3".to_owned());
+        }
+        if self.reading.indent > 8 {
+            warnings.push("reading.indent must be between 0 and 8".to_owned());
+        }
+        if !url::Url::parse(&self.sync.server_url)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+        {
+            warnings.push("sync.server_url must use http or https".to_owned());
+        }
+        warnings
+    }
+
     /// Whether a config file has been written before (`false` on first run).
     #[must_use]
     pub fn exists() -> bool {
@@ -1254,6 +1288,26 @@ mod tests {
                 .any(|warning| warning.contains("assigned more than once"))
         );
         assert!(warnings.iter().any(|warning| warning.contains("reserved")));
+    }
+
+    #[test]
+    fn config_validation_reports_hand_edited_values() {
+        let mut config = Config::default();
+        config.reading.line_spacing = 0;
+        config.reading.indent = 9;
+        config.sync.server_url = "ftp://example.test".to_owned();
+        let warnings = config.validate();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("line_spacing"))
+        );
+        assert!(warnings.iter().any(|warning| warning.contains("indent")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("server_url"))
+        );
     }
 
     #[test]
