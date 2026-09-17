@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fs,
     io::Write,
     path::{Path, PathBuf},
@@ -311,6 +312,7 @@ struct LibraryScreen {
     selection: usize,
     top: usize,
     sort: LibrarySort,
+    search_fields: HashMap<PathBuf, (String, String)>,
 }
 
 /// Sort order of the library list.
@@ -358,6 +360,21 @@ fn sort_books(books: &mut [LibraryBook], sort: LibrarySort) {
                 .then_with(|| left.metadata.title.cmp(&right.metadata.title))
         }),
     }
+}
+
+fn library_search_fields(books: &[LibraryBook]) -> HashMap<PathBuf, (String, String)> {
+    books
+        .iter()
+        .map(|book| {
+            (
+                book.path.clone(),
+                (
+                    book.metadata.title.to_lowercase(),
+                    book.metadata.authors.join(" ").to_lowercase(),
+                ),
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -504,6 +521,8 @@ struct ReaderScreen {
     forward_history: Vec<SavedPosition>,
     /// Source-character weights for content-based progress.
     chapter_weights: Vec<usize>,
+    /// Cached inline source-to-display ranges for the current layout.
+    inline_ranges: Vec<Vec<(usize, usize, usize)>>,
     /// Whether the current position has changed since the last checkpoint.
     position_dirty: bool,
     last_position_checkpoint: Instant,
@@ -3329,8 +3348,12 @@ impl App {
         if let (Some(block), Some(spans)) =
             (reader.blocks.get(line.block), reader.inline.get(line.block))
         {
-            if let Some(text) = sync::block_text(block) {
-                for (start, end, span) in line_inline_ranges(line, text, spans) {
+            if sync::block_text(block).is_some() {
+                for &(start, end, span) in reader
+                    .inline_ranges
+                    .get(line_index)
+                    .map_or(&[][..], Vec::as_slice)
+                {
                     let style = match spans.get(span).map(|span| &span.kind) {
                         Some(InlineKind::Emphasis) => Style::new().add_modifier(Modifier::ITALIC),
                         Some(InlineKind::Strong) => Style::new().add_modifier(Modifier::BOLD),
@@ -3399,10 +3422,14 @@ impl App {
             else {
                 continue;
             };
-            let Some(text) = sync::block_text(block) else {
+            if sync::block_text(block).is_none() {
                 continue;
-            };
-            for (start, end, span) in line_inline_ranges(line, text, spans) {
+            }
+            for &(start, end, span) in reader
+                .inline_ranges
+                .get(reader.top_line + row)
+                .map_or(&[][..], Vec::as_slice)
+            {
                 let action = match spans.get(span).map(|span| &span.kind) {
                     Some(InlineKind::Noteref(_)) => Action::Footnote(line.block, span),
                     Some(InlineKind::Link(_)) => Action::OpenLink(line.block, span),
@@ -4097,14 +4124,11 @@ impl App {
             .books
             .iter()
             .filter(|book| {
+                let fields = library.search_fields.get(&book.path);
                 needle.is_empty()
-                    || book.metadata.title.to_lowercase().contains(&needle)
-                    || book
-                        .metadata
-                        .authors
-                        .join(" ")
-                        .to_lowercase()
-                        .contains(&needle)
+                    || fields.is_some_and(|(title, authors)| {
+                        title.contains(&needle) || authors.contains(&needle)
+                    })
             })
             .collect()
     }
@@ -4353,6 +4377,7 @@ impl App {
         // Only jump to the library if the user is still where they asked for it.
         if matches!(self.screen, Screen::Home(_)) {
             self.status = None;
+            let search_fields = library_search_fields(&outcome.books);
             self.next_screen = Some(Screen::Library(LibraryScreen {
                 title: outcome.title,
                 books: outcome.books,
@@ -4360,6 +4385,7 @@ impl App {
                 selection: 0,
                 top: 0,
                 sort: LibrarySort::default(),
+                search_fields,
             }));
             self.apply_screen_transition();
         } else {
@@ -5295,6 +5321,7 @@ impl ReaderScreen {
             back_history: Vec::new(),
             forward_history: Vec::new(),
             chapter_weights,
+            inline_ranges: Vec::new(),
             position_dirty: false,
             last_position_checkpoint: Instant::now(),
         }
@@ -5341,6 +5368,7 @@ impl ReaderScreen {
         } else {
             self.lines = layout_with(&self.blocks, width, options);
         }
+        self.rebuild_inline_ranges();
         if self.open_at_end {
             self.open_at_end = false;
             let step = self.content_height();
@@ -5355,7 +5383,24 @@ impl ReaderScreen {
     fn invalidate_layout(&mut self) {
         self.width = 0;
         self.lines.clear();
+        self.inline_ranges.clear();
         self.selection = None;
+    }
+
+    fn rebuild_inline_ranges(&mut self) {
+        self.inline_ranges = self
+            .lines
+            .iter()
+            .map(|line| {
+                let Some(text) = self.blocks.get(line.block).and_then(sync::block_text) else {
+                    return Vec::new();
+                };
+                let Some(spans) = self.inline.get(line.block) else {
+                    return Vec::new();
+                };
+                line_inline_ranges(line, text, spans)
+            })
+            .collect();
     }
     /// Invalidate layout *and* the loaded chapter blocks.
     fn invalidate_chapter(&mut self) {
