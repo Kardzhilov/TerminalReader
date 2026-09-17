@@ -25,6 +25,8 @@ const PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const QUEUE_MAX_ITEMS: usize = 200;
 const QUEUE_MAX_AGE_SECONDS: u64 = 28 * 24 * 60 * 60;
+const RETRY_BASE_SECONDS: u64 = 30;
+const RETRY_MAX_SECONDS: u64 = 30 * 60;
 
 #[derive(Debug, Error)]
 pub enum SyncError {
@@ -287,6 +289,15 @@ pub struct QueuedProgress {
     /// Normalized local book identity, absent in legacy queue entries.
     #[serde(default)]
     pub book_path: Option<PathBuf>,
+    /// Monotonic local generation for stale completion protection.
+    #[serde(default)]
+    pub generation: u64,
+    /// Number of failed delivery attempts.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Earliest Unix time at which another automatic attempt is allowed.
+    #[serde(default)]
+    pub next_attempt_at: u64,
 }
 
 impl ProgressQueue {
@@ -324,17 +335,40 @@ impl ProgressQueue {
 
     /// Queue progress with the local book identity used for exclusion checks.
     pub fn push_with_book(&mut self, update: ProgressUpdate, book_path: Option<PathBuf>) {
+        self.push_with_generation(update, book_path, 0);
+    }
+
+    pub fn push_with_generation(
+        &mut self,
+        update: ProgressUpdate,
+        book_path: Option<PathBuf>,
+        generation: u64,
+    ) -> u64 {
         self.expire();
         self.items
             .retain(|item| item.update.document != update.document);
+        let generation = if generation == 0 {
+            self.items
+                .iter()
+                .map(|item| item.generation)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+        } else {
+            generation
+        };
         self.items.push_back(QueuedProgress {
             update,
             queued_at: unix_timestamp(),
             book_path,
+            generation,
+            attempts: 0,
+            next_attempt_at: 0,
         });
         while self.items.len() > QUEUE_MAX_ITEMS {
             let _ = self.items.pop_front();
         }
+        generation
     }
 
     #[must_use]
@@ -352,6 +386,42 @@ impl ProgressQueue {
         let before = self.items.len();
         self.items.retain(|item| item.update.document != document);
         self.items.len() != before
+    }
+
+    pub fn remove_generation(&mut self, document: &str, generation: u64) -> bool {
+        let before = self.items.len();
+        self.items
+            .retain(|item| !(item.update.document == document && item.generation == generation));
+        self.items.len() != before
+    }
+
+    #[must_use]
+    pub fn has_document(&self, document: &str) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.update.document == document)
+    }
+
+    pub fn mark_failed(&mut self, document: &str, generation: u64) -> bool {
+        let Some(item) = self
+            .items
+            .iter_mut()
+            .find(|item| item.update.document == document && item.generation == generation)
+        else {
+            return false;
+        };
+        item.attempts = item.attempts.saturating_add(1);
+        let exponent = item.attempts.saturating_sub(1).min(6);
+        let delay = RETRY_BASE_SECONDS
+            .saturating_mul(1_u64 << exponent)
+            .min(RETRY_MAX_SECONDS);
+        item.next_attempt_at = unix_timestamp().saturating_add(delay);
+        true
+    }
+
+    #[must_use]
+    pub fn retry_due(item: &QueuedProgress) -> bool {
+        item.next_attempt_at <= unix_timestamp()
     }
 
     pub fn expire(&mut self) {
@@ -444,6 +514,29 @@ mod tests {
                 .is_none()
         );
         Ok(())
+    }
+
+    #[test]
+    fn queue_completion_only_removes_matching_generation() {
+        let mut queue = ProgressQueue::default();
+        let old = queue.push_with_generation(update("a"), None, 7);
+        assert!(queue.remove_generation("a", old));
+        let newer = queue.push_with_generation(update("a"), None, 8);
+        assert!(!queue.remove_generation("a", old));
+        assert_eq!(
+            queue.items().front().map(|item| item.generation),
+            Some(newer)
+        );
+    }
+
+    #[test]
+    fn queue_failure_schedules_bounded_retry() {
+        let mut queue = ProgressQueue::default();
+        let generation = queue.push_with_generation(update("a"), None, 3);
+        assert!(queue.mark_failed("a", generation));
+        let item = queue.items().front().expect("queued item");
+        assert_eq!(item.attempts, 1);
+        assert!(item.next_attempt_at > unix_timestamp());
     }
 
     #[test]
