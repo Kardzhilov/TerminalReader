@@ -4019,6 +4019,7 @@ name = "tr-render"
 version = "0.1.0"
 dependencies = [
  "tr-epub",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

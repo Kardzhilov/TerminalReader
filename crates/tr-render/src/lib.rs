@@ -1,6 +1,7 @@
 //! Terminal-width-aware rendering and layout for EPUB blocks.
 
 use tr_epub::{Block, InlineSpan};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Sentinel offset for the blank separator line between blocks.
@@ -253,10 +254,14 @@ pub fn render_block(block: &Block, width: usize, ascii_only: bool) -> Vec<(Strin
             .map(|(line, offset)| (format!("> {line}"), offset))
             .collect(),
         Block::Code(text) => {
-            let mut offset = 0;
             let mut lines = Vec::new();
-            for line in text.lines() {
-                lines.push((truncate(line, width), offset));
+            let mut offset = 0;
+            for line in text.split('\n') {
+                if line.is_empty() {
+                    lines.push((String::new(), offset));
+                } else {
+                    lines.extend(wrap_token(line, width, offset));
+                }
                 offset += line.len() + 1;
             }
             lines
@@ -388,6 +393,15 @@ fn wrap_indent(text: &str, first_width: usize, width: usize) -> Vec<(String, usi
             .map_or(search, |found| search + found);
         search = word_offset + word.len();
         let target = if lines.is_empty() { first_width } else { width };
+        if UnicodeWidthStr::width(word) > target {
+            if !current.is_empty() {
+                lines.push((current, current_offset));
+                current = String::new();
+            }
+            lines.extend(wrap_token(word, target, word_offset));
+            search = word_offset + word.len();
+            continue;
+        }
         let separator = usize::from(!current.is_empty());
         if UnicodeWidthStr::width(current.as_str()) + separator + UnicodeWidthStr::width(word)
             > target
@@ -405,6 +419,32 @@ fn wrap_indent(text: &str, first_width: usize, width: usize) -> Vec<(String, usi
     }
     if !current.is_empty() {
         lines.push((current, current_offset));
+    }
+    lines
+}
+
+/// Split an oversized token without breaking grapheme clusters.
+fn wrap_token(text: &str, width: usize, source_offset: usize) -> Vec<(String, usize)> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_offset = source_offset;
+    let mut consumed = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if !line.is_empty() && UnicodeWidthStr::width(line.as_str()) + grapheme_width > width {
+            lines.push((line, line_offset));
+            line = String::new();
+            line_offset = source_offset + consumed;
+        }
+        if line.is_empty() {
+            line_offset = source_offset + consumed;
+        }
+        line.push_str(grapheme);
+        consumed += grapheme.len();
+    }
+    if !line.is_empty() {
+        lines.push((line, line_offset));
     }
     lines
 }
@@ -489,6 +529,56 @@ mod tests {
             Some(&"+--------------------------------------+".to_owned())
         );
         assert!(lines.iter().any(|line| line.contains("[ IMAGE ]")));
+    }
+
+    #[test]
+    fn long_tokens_wrap_without_losing_text() {
+        let text = "https://example.test/abcdefghijklmnopqrstuvwxyz";
+        let lines = render_block(&Block::Paragraph(text.to_owned()), 12, true);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|(line, _)| line)
+                .cloned()
+                .collect::<String>(),
+            text
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|(line, _)| UnicodeWidthStr::width(line.as_str()) <= 12)
+        );
+    }
+
+    #[test]
+    fn code_lines_wrap_without_truncation() {
+        let text = "let value = 1234567890;\nnext";
+        let lines = render_block(&Block::Code(text.to_owned()), 8, true);
+        let rendered = lines
+            .iter()
+            .map(|(line, _)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered, "let valu\ne = 1234\n567890;\nnext");
+        assert!(
+            lines
+                .iter()
+                .all(|(line, _)| UnicodeWidthStr::width(line.as_str()) <= 8)
+        );
+    }
+
+    #[test]
+    fn grapheme_clusters_are_not_split() {
+        let text = "e\u{301}e\u{301}";
+        let lines = render_block(&Block::Paragraph(text.to_owned()), 1, true);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|(line, _)| line)
+                .cloned()
+                .collect::<String>(),
+            text
+        );
     }
 
     #[test]

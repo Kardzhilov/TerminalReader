@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 tr-epub = { path = "../tr-epub" }
 unicode-width.workspace = true
+unicode-segmentation.workspace = true
 
 [lints]
 workspace = true
