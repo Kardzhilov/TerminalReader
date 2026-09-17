@@ -1874,6 +1874,10 @@ impl App {
 
     /// Search all chapters and show the results popup.
     fn run_reader_search(&mut self, reader: &mut ReaderScreen, query: &str) {
+        if self.search_busy {
+            self.status = Some("Search already in progress; press Esc to cancel it.".to_owned());
+            return;
+        }
         self.search_generation = self.search_generation.wrapping_add(1);
         let generation = self.search_generation;
         self.search_busy = true;
@@ -5158,7 +5162,7 @@ fn book_progress_cell(position: &SavedPosition, spine_count: usize, ascii_only: 
         0.0
     };
     let percent = position.percent.max(chapter_fraction);
-    if percent >= FINISHED_PERCENT {
+    if position.completed || percent >= FINISHED_PERCENT {
         (if ascii_only { "done" } else { "✓ done" }).to_owned()
     } else if percent > 0.0 {
         format!("{:.0}%", percent * 100.0)

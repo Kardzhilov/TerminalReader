@@ -481,6 +481,10 @@ impl ProgressQueue {
     }
 
     pub fn mark_failed(&mut self, document: &str, generation: u64) -> bool {
+        self.mark_failed_at(document, generation, unix_timestamp())
+    }
+
+    pub fn mark_failed_at(&mut self, document: &str, generation: u64, now: u64) -> bool {
         let Some(item) = self
             .items
             .iter_mut()
@@ -493,13 +497,18 @@ impl ProgressQueue {
         let delay = RETRY_BASE_SECONDS
             .saturating_mul(1_u64 << exponent)
             .min(RETRY_MAX_SECONDS);
-        item.next_attempt_at = unix_timestamp().saturating_add(delay);
+        item.next_attempt_at = now.saturating_add(delay);
         true
     }
 
     #[must_use]
     pub fn retry_due(item: &QueuedProgress) -> bool {
-        item.next_attempt_at <= unix_timestamp()
+        Self::retry_due_at(item, unix_timestamp())
+    }
+
+    #[must_use]
+    pub fn retry_due_at(item: &QueuedProgress, now: u64) -> bool {
+        item.next_attempt_at <= now
     }
 
     pub fn expire(&mut self) {
@@ -646,6 +655,17 @@ mod tests {
         let item = queue.items().front().expect("queued item");
         assert_eq!(item.attempts, 1);
         assert!(item.next_attempt_at > unix_timestamp());
+    }
+
+    #[test]
+    fn retry_backoff_uses_injected_time() {
+        let mut queue = ProgressQueue::default();
+        let generation = queue.push_with_generation(update("clock"), None, 1);
+        assert!(queue.mark_failed_at("clock", generation, 1_000));
+        let item = queue.items().front().expect("queued item");
+        assert_eq!(item.next_attempt_at, 1_030);
+        assert!(!ProgressQueue::retry_due_at(item, 1_029));
+        assert!(ProgressQueue::retry_due_at(item, 1_030));
     }
 
     #[test]
