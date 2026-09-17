@@ -21,7 +21,8 @@ use ratatui::{
 use sha2::{Digest, Sha256};
 use tr_core::{
     Bookmark, BookmarkStore, Config, LibraryBook, PositionStore, RecentBook, RecentsStore,
-    SavedPosition, ScanCache, StatsStore, SyncStrategy, credentials, logging, scan_library_cached,
+    SavedPosition, ScanCache, StatsStore, SyncStrategy, credentials, logging, normalize_book_path,
+    scan_library_cached,
 };
 use tr_epub::{EpubBook, InlineKind, InlineSpan};
 use tr_kosync::{Credentials, ProgressRecord, ProgressUpdate, xpointer::XPointer};
@@ -664,7 +665,7 @@ impl App {
             app.status = Some("Offline mode — sync is disabled.".to_owned());
         }
         if let Some(path) = initial_book {
-            app.open_book(path)?;
+            app.open_book(&path)?;
             app.apply_screen_transition();
         }
         Ok(app)
@@ -858,7 +859,7 @@ impl App {
             KeyCode::Enter => {
                 if let Some(book) = Self::filtered_books(library).get(library.selection) {
                     let path = book.path.clone();
-                    self.open_book_or_status(path);
+                    self.open_book_or_status(&path);
                 }
             }
             _ => {
@@ -2174,7 +2175,7 @@ impl App {
                     None
                 };
                 if let Some(path) = path {
-                    self.open_book_or_status(path);
+                    self.open_book_or_status(&path);
                 }
             }
             Action::LibraryHome | Action::SettingsHome => {
@@ -3931,7 +3932,7 @@ impl App {
             Some(HomeItem::Continue) => {
                 let path = self.recents.most_recent().map(|recent| recent.path.clone());
                 if let Some(path) = path {
-                    self.open_book_or_status(path);
+                    self.open_book_or_status(&path);
                 }
             }
             Some(HomeItem::Recent(list_index)) => {
@@ -3940,7 +3941,7 @@ impl App {
                 };
                 let path = recent.path.clone();
                 if path.exists() {
-                    self.open_book_or_status(path);
+                    self.open_book_or_status(&path);
                 } else {
                     self.status = Some(
                         "Book file is missing — press Del to remove it from Recent.".to_owned(),
@@ -4024,9 +4025,10 @@ impl App {
             .collect()
     }
 
-    fn open_book(&mut self, path: PathBuf) -> Result<()> {
+    fn open_book(&mut self, path: &Path) -> Result<()> {
         self.pending_status = None;
         self.session_summary_visible = false;
+        let path = normalize_book_path(path);
         let book =
             EpubBook::open(&path).with_context(|| format!("could not open {}", path.display()))?;
         let position = self.positions.get(&path);
@@ -4060,7 +4062,7 @@ impl App {
 
     /// Open a book, surfacing failures (corrupt EPUBs, I/O errors) in the
     /// status line instead of silently doing nothing.
-    fn open_book_or_status(&mut self, path: PathBuf) {
+    fn open_book_or_status(&mut self, path: &Path) {
         if let Err(error) = self.open_book(path) {
             self.status = Some(format!("{error:#}"));
         }
@@ -5060,10 +5062,13 @@ fn default_library_suggestion() -> String {
 
 impl ReaderScreen {
     fn new(path: PathBuf, book: EpubBook, position: &SavedPosition) -> Self {
+        let chapter_index = position
+            .chapter_index
+            .min(book.spine.len().saturating_sub(1));
         Self {
             path,
             book,
-            chapter_index: position.chapter_index,
+            chapter_index,
             top_line: 0,
             anchor: (position.block_index, position.char_offset),
             blocks: Vec::new(),
@@ -5122,6 +5127,14 @@ impl ReaderScreen {
                 self.source_paths.push(block.source_path);
                 self.inline.push(block.inline);
                 self.ids.push(block.ids);
+            }
+            if self.anchor.0 >= self.blocks.len() {
+                self.anchor = (0, 0);
+            } else if let Some(text) = self.blocks.get(self.anchor.0).and_then(sync::block_text) {
+                self.anchor.1 = self.anchor.1.min(text.len());
+                while !text.is_char_boundary(self.anchor.1) {
+                    self.anchor.1 = self.anchor.1.saturating_sub(1);
+                }
             }
         }
         if self.blocks.is_empty() {

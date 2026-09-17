@@ -65,7 +65,19 @@ impl PositionStore {
     }
 
     pub fn load_or_backup() -> Result<(Self, Option<PathBuf>), CoreError> {
-        load_json_or_backup("positions.json")
+        let (mut store, backup) = load_json_or_backup::<Self>("positions.json")?;
+        let positions = std::mem::take(&mut store.positions);
+        for (path, position) in positions {
+            let path = normalize_book_path(&path);
+            let replace = store
+                .positions
+                .get(&path)
+                .is_none_or(|existing| existing.updated < position.updated);
+            if replace {
+                store.positions.insert(path, position);
+            }
+        }
+        Ok((store, backup))
     }
 
     #[must_use]
@@ -411,7 +423,14 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        Ok(toml::from_str(&fs::read_to_string(path)?)?)
+        let mut config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        config.sync.excluded_books = config
+            .sync
+            .excluded_books
+            .iter()
+            .map(|path| normalize_book_path(path))
+            .collect();
+        Ok(config)
     }
 
     /// Load the config; a corrupt file is renamed to `config.toml.bad` and
@@ -491,7 +510,13 @@ impl RecentsStore {
 
     pub fn load_or_backup() -> Result<(Self, Option<PathBuf>), CoreError> {
         let (file, backup): (RecentsFile, Option<PathBuf>) = load_json_or_backup("recents.json")?;
-        Ok((Self { items: file.items }, backup))
+        let mut store = Self { items: file.items };
+        let mut seen = HashSet::new();
+        store.items.retain_mut(|item| {
+            item.path = normalize_book_path(&item.path);
+            seen.insert(item.path.clone())
+        });
+        Ok((store, backup))
     }
 
     #[must_use]
@@ -571,7 +596,15 @@ impl BookmarkStore {
     pub fn load_or_backup() -> Result<(Self, Option<PathBuf>), CoreError> {
         let (file, backup): (BookmarksFile, Option<PathBuf>) =
             load_json_or_backup("bookmarks.json")?;
-        Ok((Self { books: file.books }, backup))
+        let mut store = Self::default();
+        for (path, bookmarks) in file.books {
+            store
+                .books
+                .entry(normalize_book_path(&path))
+                .or_default()
+                .extend(bookmarks);
+        }
+        Ok((store, backup))
     }
 
     #[must_use]
@@ -656,7 +689,13 @@ impl StatsStore {
 
     pub fn load_or_backup() -> Result<(Self, Option<PathBuf>), CoreError> {
         let (file, backup): (StatsFile, Option<PathBuf>) = load_json_or_backup("stats.json")?;
-        Ok((Self { books: file.books }, backup))
+        let mut store = Self::default();
+        for (path, stats) in file.books {
+            let entry = store.books.entry(normalize_book_path(&path)).or_default();
+            entry.seconds = entry.seconds.saturating_add(stats.seconds);
+            entry.pages = entry.pages.saturating_add(stats.pages);
+        }
+        Ok((store, backup))
     }
 
     #[must_use]
@@ -953,13 +992,22 @@ fn normalize_book_dir(path: &Path) -> Result<PathBuf, CoreError> {
         )
         .into());
     }
-    let path = path.canonicalize()?;
+    Ok(normalize_book_path(path))
+}
+
+/// Return one stable local identity for an existing book path.
+///
+/// Existing paths are canonicalized; missing paths retain their lexical form so
+/// saved records can still be migrated and displayed before the file returns.
+#[must_use]
+pub fn normalize_book_path(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     #[cfg(windows)]
     let path = {
         let display = path.to_string_lossy().into_owned();
         display.strip_prefix(r"\\?\").map_or(path, PathBuf::from)
     };
-    Ok(path)
+    path
 }
 
 fn unix_timestamp() -> u64 {
