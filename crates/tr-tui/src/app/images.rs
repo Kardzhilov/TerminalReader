@@ -34,6 +34,8 @@ impl std::fmt::Debug for InlineImages {
 }
 
 impl InlineImages {
+    const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
+
     /// Query the terminal for its graphics protocol and font size.
     pub fn detect() -> Self {
         Self {
@@ -127,6 +129,10 @@ fn load_protocol(
         .resource_bytes(reader.chapter_index, &href)
         .ok()?;
     let decoded = image::load_from_memory(&bytes).ok()?;
+    let pixels = u64::from(decoded.width()).saturating_mul(u64::from(decoded.height()));
+    if pixels > InlineImages::MAX_IMAGE_PIXELS {
+        return None;
+    }
     picker
         .new_protocol(decoded, area.as_size(), Resize::Fit(None))
         .ok()

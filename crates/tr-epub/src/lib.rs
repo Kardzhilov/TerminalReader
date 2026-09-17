@@ -25,7 +25,14 @@ pub enum EpubError {
     Missing(&'static str),
     #[error("EPUB text is not valid UTF-8: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
+    #[error("EPUB resource exceeds the safety limit: {0}")]
+    ResourceLimit(&'static str),
 }
+
+const MAX_XML_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RESOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CHAPTER_DEPTH: usize = 128;
+const MAX_CHAPTER_BLOCKS: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookMetadata {
@@ -150,7 +157,7 @@ impl EpubBook {
             .path
             .clone();
         let chapter = read_entry(&mut self.archive, &path)?;
-        Ok(parse_chapter(&chapter))
+        parse_chapter_limited(&chapter)
     }
 
     /// Read a resource referenced from a chapter (e.g. an image `src`),
@@ -275,9 +282,20 @@ fn decode_windows_1252(bytes: &[u8]) -> String {
 }
 
 fn read_entry_bytes(archive: &mut ZipArchive<File>, path: &str) -> Result<Vec<u8>, EpubError> {
-    let mut entry = archive.by_name(path)?;
+    let entry = archive.by_name(path)?;
+    let limit = if is_xml_entry(path) {
+        MAX_XML_ENTRY_BYTES
+    } else {
+        MAX_RESOURCE_BYTES
+    };
+    if entry.size() > limit {
+        return Err(EpubError::ResourceLimit("archive member size"));
+    }
     let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes)?;
+    entry.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(EpubError::ResourceLimit("decompressed member size"));
+    }
     Ok(bytes)
 }
 
@@ -625,6 +643,14 @@ fn parse_nav(xhtml: &str, nav_path: &str, spine: &[SpineItem]) -> Result<Vec<Toc
 /// Public so the fuzz targets can exercise the parser directly.
 #[must_use]
 pub fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
+    parse_chapter_limited(xhtml).unwrap_or_default()
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_chapter_limited(xhtml: &str) -> Result<Vec<SourcedBlock>, EpubError> {
+    if xhtml.len() as u64 > MAX_XML_ENTRY_BYTES {
+        return Err(EpubError::ResourceLimit("chapter size"));
+    }
     let mut reader = Reader::from_reader(Cursor::new(xhtml));
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -636,6 +662,9 @@ pub fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
         let event = reader.read_event_into(&mut buf);
         match event {
             Ok(Event::Start(element)) => {
+                if stack.len() >= MAX_CHAPTER_DEPTH {
+                    return Err(EpubError::ResourceLimit("chapter nesting depth"));
+                }
                 let name = local_name(element.name().as_ref());
                 let ordinal = sibling_counts.last_mut().map_or(1, |counts| {
                     let count = counts.entry(name.clone()).or_insert(0);
@@ -710,14 +739,28 @@ pub fn parse_chapter(xhtml: &str) -> Vec<SourcedBlock> {
                 if let Some(element) = stack.pop() {
                     sibling_counts.pop();
                     finish_chapter_element(element, &mut stack, &mut blocks);
+                    if blocks.len() > MAX_CHAPTER_BLOCKS {
+                        return Err(EpubError::ResourceLimit("chapter block count"));
+                    }
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(error.into()),
             _ => {}
         }
         buf.clear();
     }
-    blocks
+    Ok(blocks)
+}
+
+fn is_xml_entry(path: &str) -> bool {
+    Path::new(path).extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("xhtml")
+            || extension.eq_ignore_ascii_case("html")
+            || extension.eq_ignore_ascii_case("opf")
+            || extension.eq_ignore_ascii_case("ncx")
+            || extension.eq_ignore_ascii_case("xml")
+    })
 }
 
 #[derive(Debug)]
@@ -1310,6 +1353,23 @@ mod tests {
         assert!(matches!(
             blocks.last().map(|block| &block.block),
             Some(Block::Image { .. })
+        ));
+    }
+
+    #[test]
+    fn chapter_limits_reject_excessive_nesting() {
+        let mut xhtml = String::from("<html><body>");
+        for _ in 0..=MAX_CHAPTER_DEPTH {
+            xhtml.push_str("<div>");
+        }
+        xhtml.push_str("text");
+        for _ in 0..=MAX_CHAPTER_DEPTH {
+            xhtml.push_str("</div>");
+        }
+        xhtml.push_str("</body></html>");
+        assert!(matches!(
+            parse_chapter_limited(&xhtml),
+            Err(EpubError::ResourceLimit("chapter nesting depth"))
         ));
     }
 
