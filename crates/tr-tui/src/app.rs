@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tr_core::{
     Bookmark, BookmarkStore, Config, LibraryBook, PositionStore, RecentBook, RecentsStore,
     SavedPosition, ScanCache, StatsStore, SyncStrategy, credentials, logging, normalize_book_path,
-    scan_library_cached,
+    scan_library_cached_report,
 };
 use tr_epub::{EpubBook, InlineKind, InlineSpan};
 use tr_kosync::{Credentials, ProgressRecord, ProgressUpdate, xpointer::XPointer};
@@ -4063,7 +4063,7 @@ impl App {
             Some(HomeItem::Library(dir_index)) => {
                 if let Some(directory) = self.config.library.book_dirs.get(*dir_index) {
                     let directory = directory.clone();
-                    self.start_library_scan(directory.display().to_string(), vec![directory]);
+                    self.start_library_scan(directory.display().to_string(), &[directory]);
                 }
             }
             Some(HomeItem::AddLibrary) | None => {
@@ -4079,12 +4079,12 @@ impl App {
     fn open_aggregated_library(&mut self) {
         let directories = self.config.library.book_dirs.clone();
         let title = format!("All books ({} libraries)", directories.len());
-        self.start_library_scan(title, directories);
+        self.start_library_scan(title, &directories);
     }
 
     /// Scan on a worker thread so a cold scan of a large library does not
     /// freeze the UI; the result arrives via `process_scan_events`.
-    fn start_library_scan(&mut self, title: String, directories: Vec<PathBuf>) {
+    fn start_library_scan(&mut self, title: String, directories: &[PathBuf]) {
         if self.scanner.busy {
             self.status = Some("A library scan is already running…".to_owned());
             return;
@@ -4376,7 +4376,14 @@ impl App {
         }
         // Only jump to the library if the user is still where they asked for it.
         if matches!(self.screen, Screen::Home(_)) {
-            self.status = None;
+            self.status = if outcome.complete && outcome.warnings.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "Library scan incomplete; skipped {} item(s).",
+                    outcome.warnings.len()
+                ))
+            };
             let search_fields = library_search_fields(&outcome.books);
             self.next_screen = Some(Screen::Library(LibraryScreen {
                 title: outcome.title,
@@ -4390,8 +4397,9 @@ impl App {
             self.apply_screen_transition();
         } else {
             self.status = Some(format!(
-                "Library scan finished ({} books).",
-                outcome.books.len()
+                "Library scan finished ({} books, {} warning(s)).",
+                outcome.books.len(),
+                outcome.warnings.len()
             ));
         }
     }
@@ -4685,6 +4693,8 @@ struct ScanOutcome {
     title: String,
     books: Vec<LibraryBook>,
     cache: ScanCache,
+    warnings: Vec<String>,
+    complete: bool,
 }
 
 /// Background library-scan worker, mirroring `UpdateController`.
@@ -4710,14 +4720,35 @@ impl LibraryScanner {
 
     /// Scan `directories` on a worker thread with a copy of the cache; the
     /// updated cache comes back with the result.
-    fn start(&mut self, title: String, directories: Vec<PathBuf>, mut cache: ScanCache) {
+    fn start(&mut self, title: String, directories: &[PathBuf], mut cache: ScanCache) {
         self.busy = true;
         self.started = Instant::now();
         let tx = self.tx.clone();
+        let mut directories: Vec<PathBuf> = directories
+            .iter()
+            .map(|directory| normalize_book_path(directory))
+            .collect();
+        directories.sort();
+        let roots = directories.clone();
+        directories.retain(|directory| {
+            !roots
+                .iter()
+                .any(|other| other != directory && directory.starts_with(other))
+        });
         std::thread::spawn(move || {
             let mut books = Vec::new();
+            let mut warnings = Vec::new();
+            let mut complete = true;
             for directory in &directories {
-                books.extend(scan_library_cached(directory, &mut cache));
+                let report = scan_library_cached_report(directory, &mut cache);
+                books.extend(report.books);
+                warnings.extend(
+                    report
+                        .warnings
+                        .into_iter()
+                        .map(|warning| format!("{}: {}", warning.path.display(), warning.message)),
+                );
+                complete &= report.complete;
             }
             if directories.len() > 1 {
                 books.sort_by(|left, right| left.path.cmp(&right.path));
@@ -4728,6 +4759,8 @@ impl LibraryScanner {
                 title,
                 books,
                 cache,
+                warnings,
+                complete,
             });
         });
     }

@@ -736,6 +736,19 @@ pub struct LibraryBook {
     pub mtime: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanWarning {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanReport {
+    pub books: Vec<LibraryBook>,
+    pub warnings: Vec<ScanWarning>,
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScanCacheEntry {
     size: u64,
@@ -832,12 +845,24 @@ pub fn scan_library(root: &Path) -> Vec<LibraryBook> {
 /// Scan `root`, reusing cached metadata for unchanged files.
 #[must_use]
 pub fn scan_library_cached(root: &Path, cache: &mut ScanCache) -> Vec<LibraryBook> {
+    scan_library_cached_report(root, cache).books
+}
+
+/// Scan `root`, returning metadata plus warnings when enumeration is incomplete.
+pub fn scan_library_cached_report(root: &Path, cache: &mut ScanCache) -> ScanReport {
     let mut books = Vec::new();
     let mut seen = Vec::new();
-    scan_directory(root, cache, &mut books, &mut seen);
-    cache.prune(root, &seen);
+    let mut warnings = Vec::new();
+    let complete = scan_directory(root, cache, &mut books, &mut seen, &mut warnings);
+    if complete {
+        cache.prune(root, &seen);
+    }
     books.sort_by(|left, right| left.metadata.title.cmp(&right.metadata.title));
-    books
+    ScanReport {
+        books,
+        warnings,
+        complete,
+    }
 }
 
 fn scan_directory(
@@ -845,25 +870,58 @@ fn scan_directory(
     cache: &mut ScanCache,
     books: &mut Vec<LibraryBook>,
     seen: &mut Vec<PathBuf>,
-) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
+    warnings: &mut Vec<ScanWarning>,
+) -> bool {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(ScanWarning {
+                path: directory.to_owned(),
+                message: error.to_string(),
+            });
+            return false;
+        }
     };
-    for entry in entries.flatten() {
+    let mut complete = true;
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                warnings.push(ScanWarning {
+                    path: directory.to_owned(),
+                    message: error.to_string(),
+                });
+                complete = false;
+                continue;
+            }
+        };
         let path = entry.path();
         // `file_type` does not follow symlinks, so a symlinked directory is
         // skipped instead of risking an infinite symlink cycle. Symlinked
         // EPUB files still work: their metadata is read through the link.
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                warnings.push(ScanWarning {
+                    path: path.clone(),
+                    message: error.to_string(),
+                });
+                complete = false;
+                continue;
+            }
         };
         if file_type.is_dir() {
-            scan_directory(&path, cache, books, seen);
+            complete &= scan_directory(&path, cache, books, seen, warnings);
         } else if path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
         {
             let Some((size, mtime)) = file_signature(&path) else {
+                warnings.push(ScanWarning {
+                    path: path.clone(),
+                    message: "could not read file metadata".to_owned(),
+                });
+                complete = false;
                 continue;
             };
             seen.push(path.clone());
@@ -874,18 +932,27 @@ fn scan_directory(
                     spine_count,
                     mtime,
                 });
-            } else if let Ok(book) = EpubBook::open(&path) {
-                let spine_count = book.spine.len();
-                cache.store(path.clone(), size, mtime, &book.metadata, spine_count);
-                books.push(LibraryBook {
-                    path,
-                    metadata: book.metadata,
-                    spine_count,
-                    mtime,
-                });
+            } else {
+                match EpubBook::open(&path) {
+                    Ok(book) => {
+                        let spine_count = book.spine.len();
+                        cache.store(path.clone(), size, mtime, &book.metadata, spine_count);
+                        books.push(LibraryBook {
+                            path,
+                            metadata: book.metadata,
+                            spine_count,
+                            mtime,
+                        });
+                    }
+                    Err(error) => warnings.push(ScanWarning {
+                        path,
+                        message: error.to_string(),
+                    }),
+                }
             }
         }
     }
+    complete
 }
 
 fn file_signature(path: &Path) -> Option<(u64, u64)> {
@@ -1175,6 +1242,19 @@ mod tests {
         cache.prune(&root, std::slice::from_ref(&kept));
         assert!(cache.lookup(&deleted, 1, 2).is_none());
         assert!(cache.lookup(&kept, 10, 20).is_some());
+    }
+
+    #[test]
+    fn scan_report_surfaces_unreadable_root_without_pruning_cache() {
+        let mut cache = ScanCache::default();
+        let root = std::env::temp_dir().join(format!(
+            "terminalreader-missing-scan-{}",
+            std::process::id()
+        ));
+        let report = scan_library_cached_report(&root, &mut cache);
+        assert!(!report.complete);
+        assert_eq!(report.warnings.len(), 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
