@@ -5736,6 +5736,11 @@ impl ReaderScreen {
         )
     }
     fn next_page(&mut self) {
+        // A chapter transition clears layout until the next draw. Do not treat
+        // that pending state as an empty chapter and advance again.
+        if self.lines.is_empty() {
+            return;
+        }
         let step = self.content_height();
         if self.top_line + step < self.lines.len() {
             self.top_line += step;
@@ -5761,6 +5766,9 @@ impl ReaderScreen {
         }
     }
     fn previous_page(&mut self) {
+        if self.lines.is_empty() {
+            return;
+        }
         if self.top_line > 0 {
             self.top_line = self.top_line.saturating_sub(self.content_height());
             self.update_anchor();
