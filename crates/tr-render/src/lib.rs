@@ -431,8 +431,9 @@ fn wrap_token(text: &str, width: usize, source_offset: usize) -> Vec<(String, us
     let mut line_offset = source_offset;
     let mut consumed = 0;
     for grapheme in text.graphemes(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme);
-        if !line.is_empty() && UnicodeWidthStr::width(line.as_str()) + grapheme_width > width {
+        let current_width = display_width(line.as_str());
+        let grapheme_width = display_width_at(grapheme, current_width);
+        if !line.is_empty() && current_width + grapheme_width > width {
             lines.push((line, line_offset));
             line = String::new();
             line_offset = source_offset + consumed;
@@ -447,6 +448,22 @@ fn wrap_token(text: &str, width: usize, source_offset: usize) -> Vec<(String, us
         lines.push((line, line_offset));
     }
     lines
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().fold(0, |column, character| {
+        column + display_width_at(&character.to_string(), column)
+    })
+}
+
+fn display_width_at(text: &str, column: usize) -> usize {
+    text.chars().fold(column, |current, character| {
+        if character == '\t' {
+            current + (4 - current % 4)
+        } else {
+            current + UnicodeWidthChar::width(character).unwrap_or(0)
+        }
+    }) - column
 }
 
 /// Cut to `width` terminal columns, not chars, so CJK text stays aligned.
@@ -564,6 +581,21 @@ mod tests {
             lines
                 .iter()
                 .all(|(line, _)| UnicodeWidthStr::width(line.as_str()) <= 8)
+        );
+    }
+
+    #[test]
+    fn code_tabs_wrap_at_display_width_without_loss() {
+        let text = "a\tb\tc";
+        let lines = render_block(&Block::Code(text.to_owned()), 4, true);
+        assert!(lines.iter().all(|(line, _)| display_width(line) <= 4));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|(line, _)| line)
+                .cloned()
+                .collect::<String>(),
+            text
         );
     }
 

@@ -35,6 +35,7 @@ pub enum SyncEvent {
         manual: bool,
         book_path: Option<PathBuf>,
         generation: u64,
+        auth_generation: u64,
     },
     Pull {
         document: String,
@@ -324,6 +325,7 @@ impl SyncController {
     ) {
         let server = server.to_owned();
         let tx = self.tx.clone();
+        let auth_generation = self.auth_generation;
         self.in_flight += 1;
         self.push_in_flight.insert(update.document.clone());
         self.last_call = Some(Instant::now());
@@ -338,6 +340,7 @@ impl SyncController {
                 manual,
                 book_path,
                 generation,
+                auth_generation,
             });
         });
     }
@@ -351,10 +354,7 @@ impl SyncController {
         if expired && config.auto_sync && !self.offline && !self.deferred.is_empty() {
             // One per window; the rest go out on later polls.
             let deferred = self.deferred.remove(0);
-            let eligible = deferred
-                .book_path
-                .as_deref()
-                .is_none_or(|path| !Self::is_excluded(config, Some(path)));
+            let eligible = Self::eligible_book(config, deferred.book_path.as_deref());
             if eligible && !self.push_in_flight.contains(&deferred.update.document) {
                 if let Some(credentials) = self.credentials.clone() {
                     self.spawn_push(
@@ -380,7 +380,16 @@ impl SyncController {
                     manual,
                     book_path,
                     generation,
-                } => self.finish_push(config, update, &result, manual, book_path, generation),
+                    auth_generation,
+                } => self.finish_push(
+                    config,
+                    update,
+                    &result,
+                    manual,
+                    book_path,
+                    generation,
+                    auth_generation,
+                ),
                 event => events.push(event),
             }
         }
@@ -388,6 +397,7 @@ impl SyncController {
         events
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_push(
         &mut self,
         config: &SyncConfig,
@@ -396,8 +406,13 @@ impl SyncController {
         _manual: bool,
         book_path: Option<PathBuf>,
         generation: u64,
+        auth_generation: u64,
     ) {
         self.push_in_flight.remove(&update.document);
+        if auth_generation != self.auth_generation {
+            self.status = Some("Ignored stale sync result after account change.".to_owned());
+            return;
+        }
         match result {
             Ok(()) => {
                 logging::info(&format!("sync push ok: {}", update.document));
@@ -512,7 +527,9 @@ impl SyncController {
         if self.allowed(config, false) {
             if let Some(credentials) = self.credentials.clone() {
                 for deferred in std::mem::take(&mut self.deferred) {
-                    if self.push_in_flight.contains(&deferred.update.document) {
+                    if !Self::eligible_book(config, deferred.book_path.as_deref())
+                        || self.push_in_flight.contains(&deferred.update.document)
+                    {
                         self.deferred.push(deferred);
                         continue;
                     }
@@ -542,11 +559,20 @@ impl SyncController {
                 manual,
                 book_path,
                 generation,
+                auth_generation,
             } = event
             {
                 // Full bookkeeping: successes clear their persisted mirror
                 // (and drain the backlog), failures stay queued.
-                self.finish_push(config, update, &result, manual, book_path, generation);
+                self.finish_push(
+                    config,
+                    update,
+                    &result,
+                    manual,
+                    book_path,
+                    generation,
+                    auth_generation,
+                );
             }
         }
     }
@@ -570,6 +596,10 @@ impl SyncController {
                 .map(|excluded| normalize_book_path(excluded))
                 .any(|excluded| excluded == path)
         })
+    }
+
+    fn eligible_book(config: &SyncConfig, book_path: Option<&std::path::Path>) -> bool {
+        book_path.is_some_and(|path| !Self::is_excluded(config, Some(path)))
     }
 }
 
@@ -899,7 +929,7 @@ mod tests {
     fn finish_push_exposes_success_and_failure_notices() {
         let mut controller = SyncController::for_tests();
         let config = SyncConfig::default();
-        controller.finish_push(&config, update("ok", 0.5), &Ok(()), false, None, 1);
+        controller.finish_push(&config, update("ok", 0.5), &Ok(()), false, None, 1, 0);
         assert_eq!(
             controller.take_push_notice(),
             Some(PushNotice {
@@ -915,6 +945,7 @@ mod tests {
             false,
             None,
             1,
+            0,
         );
         assert_eq!(
             controller.take_push_notice(),
@@ -1053,6 +1084,32 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_queue_entries_without_book_identity_stay_paused() {
+        let mut controller = signed_in_controller();
+        controller.queue.push(update("legacy", 0.2));
+        controller.drain_next(&unreachable_config());
+        assert_eq!(controller.in_flight, 0);
+    }
+
+    #[test]
+    fn flush_rechecks_exclusions_before_dispatch() {
+        let mut controller = signed_in_controller();
+        let excluded = PathBuf::from("C:/Books/private.epub");
+        controller.deferred.push(DeferredUpdate {
+            update: update("excluded", 0.2),
+            book_path: Some(excluded.clone()),
+            generation: 1,
+        });
+        let config = SyncConfig {
+            excluded_books: vec![excluded],
+            ..unreachable_config()
+        };
+        controller.flush(&config, Duration::from_millis(1));
+        assert_eq!(controller.in_flight, 0);
+        assert_eq!(controller.deferred.len(), 1);
     }
 
     #[test]

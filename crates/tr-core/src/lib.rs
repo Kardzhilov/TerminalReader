@@ -39,6 +39,9 @@ pub struct SavedPosition {
     /// Fraction of the book read when saved (0.0 when unknown).
     #[serde(default)]
     pub percent: f64,
+    /// Whether the saved anchor is the final valid source position.
+    #[serde(default)]
+    pub completed: bool,
 }
 
 /// Newest saved positions kept on disk; the stalest are evicted beyond this.
@@ -119,6 +122,7 @@ impl PositionStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LibraryConfig {
     #[serde(default)]
     pub book_dirs: Vec<PathBuf>,
@@ -126,6 +130,7 @@ pub struct LibraryConfig {
 
 /// Reading preferences applied to the reader layout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadingConfig {
     /// Maximum content width in columns; `None` uses the full terminal width.
     #[serde(default)]
@@ -171,6 +176,7 @@ impl Default for ReadingConfig {
 /// Input preferences for moving through a book.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NavigationConfig {
     #[serde(default = "default_true")]
     pub line_scroll: bool,
@@ -202,6 +208,7 @@ impl Default for NavigationConfig {
 
 /// Color and light/dark preferences for the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThemeConfig {
     /// Preset name (e.g. gruvbox, dracula, nord); "custom" uses `accent`/`light`.
     #[serde(default = "default_preset")]
@@ -238,6 +245,7 @@ impl Default for ThemeConfig {
 
 /// Optional overrides for the reader's single-character keys.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct KeyBindings {
     #[serde(default)]
     pub contents: Option<char>,
@@ -342,6 +350,7 @@ impl SyncStrategy {
 
 /// Persisted `KOReader` progress-sync settings (credentials live in the keyring).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyncConfig {
     #[serde(default = "default_sync_server")]
     pub server_url: String,
@@ -403,6 +412,7 @@ impl Default for SyncConfig {
 
 /// File logging configuration; logging is off unless enabled.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -414,6 +424,7 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "config_schema_version")]
     pub schema_version: u32,
@@ -1492,6 +1503,14 @@ mod tests {
     fn server_url_validation_rejects_embedded_credentials() {
         assert!(validate_server_url("https://reader:secret@example.test").is_err());
         assert!(validate_server_url("https://example.test").is_ok());
+    }
+
+    #[test]
+    fn config_rejects_unknown_keys() {
+        assert!(toml::from_str::<Config>("schema_version = 1\nunknown = true\n").is_err());
+        assert!(
+            toml::from_str::<Config>("schema_version = 1\n[reading]\nunknown = true\n").is_err()
+        );
     }
 
     #[test]

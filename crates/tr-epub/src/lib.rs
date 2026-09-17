@@ -35,6 +35,7 @@ const MAX_XML_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RESOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHAPTER_DEPTH: usize = 128;
 const MAX_CHAPTER_BLOCKS: usize = 100_000;
+const MAX_CHAPTER_SPANS: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookMetadata {
@@ -723,6 +724,14 @@ fn parse_chapter_limited(xhtml: &str) -> Result<Vec<SourcedBlock>, EpubError> {
                 if blocks.len() > MAX_CHAPTER_BLOCKS {
                     return Err(EpubError::ResourceLimit("chapter block count"));
                 }
+                if blocks
+                    .iter()
+                    .map(|block| block.inline.len())
+                    .fold(0_usize, usize::saturating_add)
+                    > MAX_CHAPTER_SPANS
+                {
+                    return Err(EpubError::ResourceLimit("chapter span count"));
+                }
             }
             Ok(Event::Text(text)) => {
                 if let Some(element) = stack.last_mut() {
@@ -749,6 +758,14 @@ fn parse_chapter_limited(xhtml: &str) -> Result<Vec<SourcedBlock>, EpubError> {
                     finish_chapter_element(element, &mut stack, &mut blocks);
                     if blocks.len() > MAX_CHAPTER_BLOCKS {
                         return Err(EpubError::ResourceLimit("chapter block count"));
+                    }
+                    if blocks
+                        .iter()
+                        .map(|block| block.inline.len())
+                        .fold(0_usize, usize::saturating_add)
+                        > MAX_CHAPTER_SPANS
+                    {
+                        return Err(EpubError::ResourceLimit("chapter span count"));
                     }
                 }
             }

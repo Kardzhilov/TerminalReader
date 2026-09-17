@@ -25,7 +25,7 @@ use tr_core::{
     SavedPosition, ScanCache, StatsStore, SyncStrategy, credentials, logging, normalize_book_path,
     scan_library_cached_report, validate_server_url,
 };
-use tr_epub::{EpubBook, InlineKind, InlineSpan};
+use tr_epub::{Block, EpubBook, InlineKind, InlineSpan, SourcePathStep, SourcedBlock};
 use tr_kosync::{Credentials, ProgressRecord, ProgressUpdate, xpointer::XPointer};
 use tr_render::{LayoutOptions, Line, layout_with, line_for_anchor, line_inline_ranges};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -349,8 +349,10 @@ impl LibraryStatus {
         match self {
             Self::All => true,
             Self::Unread => position.percent <= 0.0,
-            Self::InProgress => position.percent > 0.0 && position.percent < FINISHED_PERCENT,
-            Self::Finished => position.percent >= FINISHED_PERCENT,
+            Self::InProgress => {
+                !position.completed && position.percent > 0.0 && position.percent < FINISHED_PERCENT
+            }
+            Self::Finished => position.completed || position.percent >= FINISHED_PERCENT,
         }
     }
 }
@@ -537,6 +539,8 @@ struct ReaderScreen {
     search_query: Option<String>,
     /// Context snippets for the results popup, parallel to `search_matches`.
     search_snippets: Vec<String>,
+    /// Whether the worker stopped at its result cap.
+    search_truncated: bool,
     /// Search results popup, when open.
     results_open: Option<PopupList>,
     /// Go-to page/percent input popup, when open.
@@ -696,6 +700,7 @@ enum SearchEvent {
         matches: Vec<SavedPosition>,
         ends: Vec<usize>,
         snippets: Vec<String>,
+        truncated: bool,
     },
     Failed {
         generation: u64,
@@ -709,6 +714,7 @@ struct SearchResults {
     matches: Vec<SavedPosition>,
     ends: Vec<usize>,
     snippets: Vec<String>,
+    truncated: bool,
 }
 
 impl App {
@@ -1844,6 +1850,7 @@ impl App {
         reader.search_matches.clear();
         reader.search_match_ends.clear();
         reader.search_snippets.clear();
+        reader.search_truncated = false;
         reader.search_index = 0;
         reader.search_query = Some(query.to_owned());
         reader.results_open = None;
@@ -1857,6 +1864,7 @@ impl App {
                     matches,
                     ends,
                     snippets,
+                    truncated,
                 }) => SearchEvent::Finished {
                     generation,
                     path,
@@ -1864,6 +1872,7 @@ impl App {
                     matches,
                     ends,
                     snippets,
+                    truncated,
                 },
                 Err(error) => SearchEvent::Failed {
                     generation,
@@ -1882,6 +1891,7 @@ impl App {
         reader.search_matches.clear();
         reader.search_match_ends.clear();
         reader.search_snippets.clear();
+        reader.search_truncated = false;
         reader.search_index = 0;
         reader.results_open = None;
     }
@@ -3399,8 +3409,13 @@ impl App {
                     reader.search_matches.len()
                 )
             };
+            let search_cap = if reader.search_truncated {
+                "| 250+ results "
+            } else {
+                ""
+            };
             let footer = format!(
-                " [Contents] [Previous] [Next] [Home]  [/] chapter | ?: help | page {page}/{count} | {gauge} {percent:.0}% {matches}{badge}"
+                " [Contents] [Previous] [Next] [Home]  [/] chapter | ?: help | page {page}/{count} | {gauge} {percent:.0}% {matches}{search_cap}{badge}"
             );
             self.register_footer(
                 area,
@@ -4334,19 +4349,24 @@ impl App {
         };
         self.recents.touch(recent)?;
         let mut reader = ReaderScreen::new(path, book, &position);
+        let document = match sync::digest_for(&reader.path, self.config.sync.matching) {
+            Ok(document) => {
+                reader.document_digest = Some(document.clone());
+                Some(document)
+            }
+            Err(error) => {
+                logging::warn(&format!("could not hash document: {error}"));
+                None
+            }
+        };
         let excluded = self.config.sync.excluded_books.contains(&reader.path);
         if excluded {
             self.status = Some("Sync is disabled for this book — press x to enable.".to_owned());
-        } else if self.sync.logged_in() {
-            match sync::digest_for(&reader.path, self.config.sync.matching) {
-                Ok(document) => {
-                    reader.document_digest = Some(document.clone());
-                    if self.config.sync.auto_sync {
-                        self.sync.pull(&self.config.sync, document, false);
-                    }
-                }
-                Err(error) => logging::warn(&format!("could not hash document: {error}")),
-            }
+        } else if let Some(document) = document
+            && self.sync.logged_in()
+            && self.config.sync.auto_sync
+        {
+            self.sync.pull(&self.config.sync, document, false);
         }
         self.next_screen = Some(Screen::Reader(Box::new(reader)));
         Ok(())
@@ -4364,13 +4384,15 @@ impl App {
         if self.config.sync.auto_sync {
             Self::push_progress(&self.config, &mut self.sync, reader, false);
         }
+        if !self.persist_reader_state(reader) {
+            return;
+        }
         self.session_summary_visible =
             Self::record_session(&mut self.stats, &mut self.status, reader);
-        self.persist_reader_state(reader);
         self.next_screen = Some(Screen::Home(HomeScreen::default()));
     }
 
-    fn persist_reader_state(&mut self, reader: &mut ReaderScreen) {
+    fn persist_reader_state(&mut self, reader: &mut ReaderScreen) -> bool {
         let position = reader.position();
         let recent = RecentBook {
             path: reader.path.clone(),
@@ -4390,11 +4412,13 @@ impl App {
         }
         if errors.is_empty() {
             reader.last_position_checkpoint = Instant::now();
+            true
         } else {
             self.status = Some(format!(
                 "Could not save reading state: {}",
                 errors.join("; ")
             ));
+            false
         }
     }
 
@@ -4630,6 +4654,7 @@ impl App {
                     matches,
                     ends,
                     snippets,
+                    truncated,
                 } if generation == self.search_generation => {
                     self.search_busy = false;
                     if let Screen::Reader(reader) = &mut self.screen
@@ -4638,6 +4663,7 @@ impl App {
                         reader.search_matches = matches;
                         reader.search_match_ends = ends;
                         reader.search_snippets = snippets;
+                        reader.search_truncated = truncated;
                         if reader.search_matches.is_empty() {
                             reader.search_query = None;
                             self.status = Some(format!("No matches for \"{query}\"."));
@@ -4655,6 +4681,10 @@ impl App {
                                 selection: start,
                                 top: 0,
                             });
+                            if truncated {
+                                self.status =
+                                    Some("Search results truncated at 250 matches.".to_owned());
+                            }
                         }
                     }
                 }
@@ -5104,6 +5134,7 @@ fn search_book(path: &Path, query: &str) -> Result<SearchResults, String> {
     let mut matches = Vec::new();
     let mut ends = Vec::new();
     let mut snippets = Vec::new();
+    let mut truncated = false;
     'chapters: for chapter_index in 0..book.spine.len() {
         let blocks = book
             .chapter_blocks(chapter_index)
@@ -5122,6 +5153,7 @@ fn search_book(path: &Path, query: &str) -> Result<SearchResults, String> {
                 ends.push(match_end);
                 snippets.push(snippet_around(text, char_offset, match_end));
                 if matches.len() >= MATCH_CAP {
+                    truncated = true;
                     break 'chapters;
                 }
             }
@@ -5131,6 +5163,7 @@ fn search_book(path: &Path, query: &str) -> Result<SearchResults, String> {
         matches,
         ends,
         snippets,
+        truncated,
     })
 }
 
@@ -5272,6 +5305,60 @@ fn byte_at_display_column(text: &str, column: usize) -> usize {
 
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn note_parent_path(
+    source_paths: &[Vec<SourcePathStep>],
+    index: usize,
+) -> Option<&[SourcePathStep]> {
+    let source = source_paths.get(index)?;
+    let parent = source.get(..source.len().saturating_sub(1))?;
+    let name = parent.last()?.name.as_str();
+    matches!(name, "aside" | "section" | "div" | "li").then_some(parent)
+}
+
+fn note_text_from_reader_blocks(
+    blocks: &[Block],
+    source_paths: &[Vec<SourcePathStep>],
+    index: usize,
+) -> Option<String> {
+    let parent = note_parent_path(source_paths, index);
+    let text = blocks
+        .iter()
+        .enumerate()
+        .skip(index)
+        .take_while(|(block_index, _)| {
+            parent.is_none_or(|parent| {
+                source_paths
+                    .get(*block_index)
+                    .is_some_and(|path| path.get(..parent.len()) == Some(parent))
+            })
+        })
+        .filter_map(|(_, block)| sync::block_text(block))
+        .collect::<Vec<_>>();
+    (!text.is_empty()).then(|| text.join("\n\n"))
+}
+
+fn note_text_from_sourced_blocks(
+    blocks: &[SourcedBlock],
+    source_paths: &[Vec<SourcePathStep>],
+    index: usize,
+) -> Option<String> {
+    let parent = note_parent_path(source_paths, index);
+    let text = blocks
+        .iter()
+        .enumerate()
+        .skip(index)
+        .take_while(|(block_index, _)| {
+            parent.is_none_or(|parent| {
+                source_paths
+                    .get(*block_index)
+                    .is_some_and(|path| path.get(..parent.len()) == Some(parent))
+            })
+        })
+        .filter_map(|(_, block)| sync::block_text(&block.block))
+        .collect::<Vec<_>>();
+    (!text.is_empty()).then(|| text.join("\n\n"))
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -5537,6 +5624,7 @@ impl ReaderScreen {
             search_index: 0,
             search_query: None,
             search_snippets: Vec::new(),
+            search_truncated: false,
             results_open: None,
             goto_input: None,
             footnote: None,
@@ -5897,7 +5985,25 @@ impl ReaderScreen {
             block_index: self.anchor.0,
             char_offset: self.anchor.1,
             percent: self.percentage(),
+            completed: self.at_final_source_anchor(),
         }
+    }
+
+    fn at_final_source_anchor(&self) -> bool {
+        if self.chapter_index + 1 != self.book.spine.len() {
+            return false;
+        }
+        let Some(last_text_block) = self
+            .blocks
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, block)| sync::block_text(block).is_some())
+        else {
+            return true;
+        };
+        self.anchor.0 == last_text_block.0
+            && sync::block_text(last_text_block.1).is_some_and(|text| self.anchor.1 >= text.len())
     }
 
     /// Fraction of the book read, rounded like `KOReader`.
@@ -5906,12 +6012,6 @@ impl ReaderScreen {
         let total: usize = self.chapter_weights.iter().sum();
         if total == 0 {
             return 0.0;
-        }
-        if self.chapter_index + 1 == self.book.spine.len()
-            && !self.lines.is_empty()
-            && self.top_line + self.content_height() >= self.lines.len()
-        {
-            return 1.0;
         }
         let completed: usize = self.chapter_weights.iter().take(self.chapter_index).sum();
         let current = self
@@ -6001,6 +6101,7 @@ impl ReaderScreen {
                     .and_then(|block| sync::block_text(&block.block))
                     .map_or(0, str::len),
                 percent: 1.0,
+                completed: true,
             };
         }
         let target = (percentage.clamp(0.0, 1.0) * total as f64) as usize;
@@ -6249,17 +6350,17 @@ impl ReaderScreen {
                 .ids
                 .iter()
                 .position(|ids| ids.iter().any(|id| id == fragment))?;
-            return self
-                .blocks
-                .get(index)
-                .and_then(sync::block_text)
-                .map(str::to_owned);
+            return note_text_from_reader_blocks(&self.blocks, &self.source_paths, index);
         }
         let blocks = self.book.chapter_blocks(chapter).ok()?;
-        let block = blocks
+        let index = blocks
             .iter()
-            .find(|block| block.ids.iter().any(|id| id == fragment))?;
-        sync::block_text(&block.block).map(str::to_owned)
+            .position(|block| block.ids.iter().any(|id| id == fragment))?;
+        let source_paths = blocks
+            .iter()
+            .map(|block| block.source_path.clone())
+            .collect::<Vec<_>>();
+        note_text_from_sourced_blocks(&blocks, &source_paths, index)
     }
     fn ensure_toc_visible(&mut self) {
         let count = self.filtered_toc().len();
@@ -6362,6 +6463,59 @@ mod tests {
         assert_eq!(session.finish(), (42, 3));
         assert_eq!(session.active_seconds, 0);
         assert_eq!(session.pages, 0);
+    }
+
+    #[test]
+    fn footnote_text_collects_paragraphs_within_its_container() {
+        let blocks = vec![
+            Block::Paragraph("first".to_owned()),
+            Block::Paragraph("second".to_owned()),
+            Block::Paragraph("outside".to_owned()),
+        ];
+        let paths = vec![
+            vec![
+                SourcePathStep {
+                    name: "body".to_owned(),
+                    ordinal: 1,
+                },
+                SourcePathStep {
+                    name: "aside".to_owned(),
+                    ordinal: 1,
+                },
+                SourcePathStep {
+                    name: "p".to_owned(),
+                    ordinal: 1,
+                },
+            ],
+            vec![
+                SourcePathStep {
+                    name: "body".to_owned(),
+                    ordinal: 1,
+                },
+                SourcePathStep {
+                    name: "aside".to_owned(),
+                    ordinal: 1,
+                },
+                SourcePathStep {
+                    name: "p".to_owned(),
+                    ordinal: 2,
+                },
+            ],
+            vec![
+                SourcePathStep {
+                    name: "body".to_owned(),
+                    ordinal: 1,
+                },
+                SourcePathStep {
+                    name: "p".to_owned(),
+                    ordinal: 4,
+                },
+            ],
+        ];
+        assert_eq!(
+            note_text_from_reader_blocks(&blocks, &paths, 0).as_deref(),
+            Some("first\n\nsecond")
+        );
     }
 
     #[test]
