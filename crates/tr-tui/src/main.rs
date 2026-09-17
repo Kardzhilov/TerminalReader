@@ -10,8 +10,8 @@ use crossterm::{
     execute,
 };
 use tr_core::{
-    BookmarkStore, Config, PositionStore, RecentsStore, ScanCache, logging, normalize_book_path,
-    scan_library_cached,
+    BookmarkStore, Config, ScanCache, StateFileStatus, inspect_state_file, logging,
+    normalize_book_path, scan_library_cached,
 };
 use tr_epub::EpubBook;
 use tr_kosync::{Credentials, KOSyncClient, ProgressQueue, filename_md5, partial_md5};
@@ -83,6 +83,10 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(Command::Doctor { book }) = &cli.command {
+        init_logging(&Config::default(), cli.log_file, cli.log_level.as_deref());
+        return doctor(book.as_deref(), cli.offline);
+    }
     // Load the config once; logging setup and the app share it.
     let (config, config_backup) = Config::load_or_backup().unwrap_or_else(|error| {
         eprintln!("warning: could not load config: {error}");
@@ -258,10 +262,26 @@ fn export_bookmarks(book_path: &Path, output: Option<&Path>, json: bool) -> Resu
 }
 
 fn doctor(book: Option<&Path>, offline: bool) -> Result<()> {
-    let config = Config::load()?;
-    let _ = PositionStore::load()?;
-    let _ = RecentsStore::load()?;
-    println!("Config: OK");
+    let config = match Config::load_read_only() {
+        Ok(config) => {
+            println!("Config: OK");
+            config
+        }
+        Err(error) => {
+            println!("Config: INVALID ({error})");
+            Config::default()
+        }
+    };
+    for name in [
+        "positions.json",
+        "recents.json",
+        "bookmarks.json",
+        "stats.json",
+        "scan_cache.json",
+        "sync_queue.json",
+    ] {
+        println!("State {name}: {}", state_status(name));
+    }
     if config.library.book_dirs.is_empty() {
         println!("Libraries: none configured");
     } else {
@@ -292,8 +312,10 @@ fn doctor_sync(config: &Config, offline: bool) {
             return;
         }
     }
-    let queue_len =
-        tr_core::state_file("sync_queue.json").map_or(0, |path| ProgressQueue::load(&path).len());
+    let queue_len = tr_core::state_path_read_only("sync_queue.json")
+        .ok()
+        .filter(|path| path.exists())
+        .map_or(0, |path| ProgressQueue::load(&path).len());
     println!("Sync queue: {queue_len} pending");
     if offline {
         println!("Sync network: skipped (--offline)");
@@ -328,5 +350,14 @@ fn doctor_sync(config: &Config, offline: bool) {
     match client.and_then(|client| client.authorize()) {
         Ok(()) => println!("Sync server: reachable, authentication OK"),
         Err(error) => println!("Sync server: FAILED ({error})"),
+    }
+}
+
+fn state_status(name: &str) -> &'static str {
+    match inspect_state_file(name) {
+        Ok(StateFileStatus::Missing) => "missing",
+        Ok(StateFileStatus::Valid) => "OK",
+        Ok(StateFileStatus::Corrupt(_)) => "CORRUPT",
+        Err(_) => "UNREADABLE",
     }
 }

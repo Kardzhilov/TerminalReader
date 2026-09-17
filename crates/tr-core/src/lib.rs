@@ -503,6 +503,22 @@ impl Config {
         Ok(config)
     }
 
+    /// Load configuration without creating its parent directory or repairing it.
+    pub fn load_read_only() -> Result<Self, CoreError> {
+        let path = config_path_read_only()?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let mut config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        config.sync.excluded_books = config
+            .sync
+            .excluded_books
+            .iter()
+            .map(|path| normalize_book_path(path))
+            .collect();
+        Ok(config)
+    }
+
     /// Load the config; a corrupt file is renamed to `config.toml.bad` and
     /// replaced with defaults so the app can still start.
     pub fn load_or_backup() -> Result<(Self, Option<PathBuf>), CoreError> {
@@ -1094,6 +1110,49 @@ fn config_file(name: &str) -> Result<PathBuf, CoreError> {
 /// Path of the main configuration file.
 pub fn config_path() -> Result<PathBuf, CoreError> {
     config_file("config.toml")
+}
+
+/// Return the configuration path without creating its parent directory.
+pub fn config_path_read_only() -> Result<PathBuf, CoreError> {
+    let dirs = ProjectDirs::from("", "", "TerminalReader")
+        .ok_or_else(|| std::io::Error::other("could not determine config directory"))?;
+    Ok(dirs.config_dir().join("config.toml"))
+}
+
+/// Return a state-file path without creating its parent directory.
+pub fn state_path_read_only(name: &str) -> Result<PathBuf, CoreError> {
+    let dirs = ProjectDirs::from("", "", "TerminalReader")
+        .ok_or_else(|| std::io::Error::other("could not determine state directory"))?;
+    let directory = dirs.state_dir().unwrap_or_else(|| dirs.data_local_dir());
+    Ok(directory.join(name))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateFileStatus {
+    Missing,
+    Valid,
+    Corrupt(String),
+}
+
+/// Inspect a persisted JSON store without creating, repairing, or renaming it.
+pub fn inspect_state_file(name: &str) -> Result<StateFileStatus, CoreError> {
+    let path = state_path_read_only(name)?;
+    if !path.exists() {
+        return Ok(StateFileStatus::Missing);
+    }
+    let bytes = fs::read(path)?;
+    let result = match name {
+        "positions.json" => serde_json::from_slice::<PositionStore>(&bytes).map(|_| ()),
+        "recents.json" => serde_json::from_slice::<RecentsFile>(&bytes).map(|_| ()),
+        "bookmarks.json" => serde_json::from_slice::<BookmarksFile>(&bytes).map(|_| ()),
+        "stats.json" => serde_json::from_slice::<StatsFile>(&bytes).map(|_| ()),
+        "scan_cache.json" => serde_json::from_slice::<ScanCache>(&bytes).map(|_| ()),
+        _ => serde_json::from_slice::<serde_json::Value>(&bytes).map(|_| ()),
+    };
+    Ok(match result {
+        Ok(()) => StateFileStatus::Valid,
+        Err(error) => StateFileStatus::Corrupt(error.to_string()),
+    })
 }
 
 fn write_json_atomic<T: Serialize>(destination: &Path, value: &T) -> Result<(), CoreError> {

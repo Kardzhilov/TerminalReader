@@ -313,7 +313,46 @@ struct LibraryScreen {
     selection: usize,
     top: usize,
     sort: LibrarySort,
+    status: LibraryStatus,
     search_fields: HashMap<PathBuf, (String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum LibraryStatus {
+    #[default]
+    All,
+    Unread,
+    InProgress,
+    Finished,
+}
+
+impl LibraryStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Unread => "unread",
+            Self::InProgress => "in-progress",
+            Self::Finished => "finished",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Unread,
+            Self::Unread => Self::InProgress,
+            Self::InProgress => Self::Finished,
+            Self::Finished => Self::All,
+        }
+    }
+
+    fn matches(self, position: &SavedPosition) -> bool {
+        match self {
+            Self::All => true,
+            Self::Unread => position.percent <= 0.0,
+            Self::InProgress => position.percent > 0.0 && position.percent < FINISHED_PERCENT,
+            Self::Finished => position.percent >= FINISHED_PERCENT,
+        }
+    }
 }
 
 /// Sort order of the library list.
@@ -948,7 +987,7 @@ impl App {
     }
 
     fn handle_library_key(&mut self, library: &mut LibraryScreen, key: KeyCode) {
-        let count = Self::filtered_books(library).len();
+        let count = Self::filtered_books(library, &self.positions).len();
         match key {
             KeyCode::Esc => self.next_screen = Some(Screen::Home(HomeScreen::default())),
             KeyCode::Up => library.selection = library.selection.saturating_sub(1),
@@ -972,8 +1011,15 @@ impl App {
                 library.selection = 0;
                 library.top = 0;
             }
+            KeyCode::Char('f') => {
+                library.status = library.status.next();
+                library.selection = 0;
+                library.top = 0;
+            }
             KeyCode::Enter => {
-                if let Some(book) = Self::filtered_books(library).get(library.selection) {
+                if let Some(book) =
+                    Self::filtered_books(library, &self.positions).get(library.selection)
+                {
                     let path = book.path.clone();
                     self.open_book_or_status(&path);
                 }
@@ -2291,8 +2337,11 @@ impl App {
                     true
                 }
                 MouseEventKind::ScrollDown => {
-                    library.selection = (library.selection + 1)
-                        .min(Self::filtered_books(library).len().saturating_sub(1));
+                    library.selection = (library.selection + 1).min(
+                        Self::filtered_books(library, &self.positions)
+                            .len()
+                            .saturating_sub(1),
+                    );
                     true
                 }
                 _ => false,
@@ -2337,7 +2386,7 @@ impl App {
             Action::HomeQuit => self.should_exit = true,
             Action::LibraryOpen(index) => {
                 let path = if let Screen::Library(library) = &self.screen {
-                    Self::filtered_books(library)
+                    Self::filtered_books(library, &self.positions)
                         .get(index)
                         .map(|book| book.path.clone())
                 } else {
@@ -2828,7 +2877,7 @@ impl App {
 
     fn draw_library(&mut self, frame: &mut Frame, library: &mut LibraryScreen) {
         let area = frame.area();
-        let books = Self::filtered_books(library)
+        let books = Self::filtered_books(library, &self.positions)
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
@@ -2876,9 +2925,12 @@ impl App {
         if books.is_empty() {
             rows.push("No matching EPUBs.".to_owned());
         }
-        let footer = " [Home]  type: filter | Enter: open | Tab: sort | Esc: home ";
-        self.register_footer(area, footer, &[("[Home]", Action::LibraryHome)]);
-        let counts = if library.filter.value().is_empty() {
+        let footer = format!(
+            " [Home]  type: search | f: status ({}) | Enter: open | Tab: sort | Esc: home ",
+            library.status.label()
+        );
+        self.register_footer(area, &footer, &[("[Home]", Action::LibraryHome)]);
+        let counts = if library.filter.value().is_empty() && library.status == LibraryStatus::All {
             format!("({})", books.len())
         } else {
             format!("({}/{})", books.len(), library.books.len())
@@ -2891,7 +2943,7 @@ impl App {
                 library.sort.label()
             ))
             .title_style(self.palette.title())
-            .title_bottom(self.styled_footer(area, footer));
+            .title_bottom(self.styled_footer(area, &footer));
         let mut text = self.styled_rows(area, rows);
         if let Some(row) = selected_row {
             if let Some(line) = text.lines.get_mut(row) {
@@ -4219,17 +4271,21 @@ impl App {
         }
     }
 
-    fn filtered_books(library: &LibraryScreen) -> Vec<&LibraryBook> {
+    fn filtered_books<'a>(
+        library: &'a LibraryScreen,
+        positions: &PositionStore,
+    ) -> Vec<&'a LibraryBook> {
         let needle = library.filter.value().to_lowercase();
         library
             .books
             .iter()
             .filter(|book| {
                 let fields = library.search_fields.get(&book.path);
-                needle.is_empty()
-                    || fields.is_some_and(|(title, authors)| {
-                        title.contains(&needle) || authors.contains(&needle)
-                    })
+                library.status.matches(&positions.get(&book.path))
+                    && (needle.is_empty()
+                        || fields.is_some_and(|(title, authors)| {
+                            title.contains(&needle) || authors.contains(&needle)
+                        }))
             })
             .collect()
     }
@@ -4499,6 +4555,7 @@ impl App {
                 selection: 0,
                 top: 0,
                 sort: LibrarySort::default(),
+                status: LibraryStatus::default(),
                 search_fields,
             }));
             self.apply_screen_transition();
@@ -6206,6 +6263,24 @@ impl ReaderScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_status_filters_use_explicit_progress_ranges() {
+        let unread = SavedPosition::default();
+        let in_progress = SavedPosition {
+            percent: 0.5,
+            ..SavedPosition::default()
+        };
+        let finished = SavedPosition {
+            percent: FINISHED_PERCENT,
+            ..SavedPosition::default()
+        };
+        assert!(LibraryStatus::Unread.matches(&unread));
+        assert!(LibraryStatus::InProgress.matches(&in_progress));
+        assert!(LibraryStatus::Finished.matches(&finished));
+        assert!(!LibraryStatus::Unread.matches(&in_progress));
+        assert!(!LibraryStatus::InProgress.matches(&finished));
+    }
 
     #[test]
     fn reader_session_finish_isolated_from_app_state() {
