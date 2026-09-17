@@ -315,6 +315,8 @@ struct LibraryScreen {
     sort: LibrarySort,
     status: LibraryStatus,
     search_fields: HashMap<PathBuf, (String, String)>,
+    filtered_indices: Vec<usize>,
+    filtered_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1035,24 +1037,26 @@ impl App {
             KeyCode::Tab => {
                 library.sort = library.sort.next();
                 sort_books(&mut library.books, library.sort);
+                library.filtered_key = None;
                 library.selection = 0;
                 library.top = 0;
             }
             KeyCode::Char('F') => {
                 library.status = library.status.next();
+                library.filtered_key = None;
                 library.selection = 0;
                 library.top = 0;
             }
             KeyCode::Enter => {
-                if let Some(book) =
-                    Self::filtered_books(library, &self.positions).get(library.selection)
-                {
+                let selection = library.selection;
+                if let Some(book) = Self::filtered_books(library, &self.positions).get(selection) {
                     let path = book.path.clone();
                     self.open_book_or_status(&path);
                 }
             }
             _ => {
                 if library.filter.handle_key(key) {
+                    library.filtered_key = None;
                     library.selection = 0;
                 }
             }
@@ -2545,7 +2549,7 @@ impl App {
             }
             Action::HomeQuit => self.should_exit = true,
             Action::LibraryOpen(index) => {
-                let path = if let Screen::Library(library) = &self.screen {
+                let path = if let Screen::Library(library) = &mut self.screen {
                     Self::filtered_books(library, &self.positions)
                         .get(index)
                         .map(|book| book.path.clone())
@@ -4442,21 +4446,32 @@ impl App {
     }
 
     fn filtered_books<'a>(
-        library: &'a LibraryScreen,
+        library: &'a mut LibraryScreen,
         positions: &PositionStore,
     ) -> Vec<&'a LibraryBook> {
         let needle = library.filter.value().to_lowercase();
+        let key = format!("{}\n{:?}", needle, library.status);
+        if library.filtered_key.as_deref() != Some(key.as_str()) {
+            library.filtered_indices = library
+                .books
+                .iter()
+                .enumerate()
+                .filter(|(_, book)| {
+                    let fields = library.search_fields.get(&book.path);
+                    library.status.matches(&positions.get(&book.path))
+                        && (needle.is_empty()
+                            || fields.is_some_and(|(title, authors)| {
+                                title.contains(&needle) || authors.contains(&needle)
+                            }))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            library.filtered_key = Some(key);
+        }
         library
-            .books
+            .filtered_indices
             .iter()
-            .filter(|book| {
-                let fields = library.search_fields.get(&book.path);
-                library.status.matches(&positions.get(&book.path))
-                    && (needle.is_empty()
-                        || fields.is_some_and(|(title, authors)| {
-                            title.contains(&needle) || authors.contains(&needle)
-                        }))
-            })
+            .filter_map(|index| library.books.get(*index))
             .collect()
     }
 
@@ -4738,6 +4753,8 @@ impl App {
                 sort: LibrarySort::default(),
                 status: LibraryStatus::default(),
                 search_fields,
+                filtered_indices: Vec::new(),
+                filtered_key: None,
             }));
             self.apply_screen_transition();
         } else {
