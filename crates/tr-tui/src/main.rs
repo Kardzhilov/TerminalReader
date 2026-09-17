@@ -282,7 +282,7 @@ fn doctor_sync(config: &Config, offline: bool) {
     };
     let client = KOSyncClient::new(
         &config.sync.server_url,
-        Credentials {
+        &Credentials {
             username: username.clone(),
             userkey,
         },

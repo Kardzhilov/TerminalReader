@@ -15,6 +15,7 @@ use reqwest::{
     StatusCode,
     blocking::{Client, Response},
     header::{ACCEPT, HeaderMap, HeaderValue},
+    redirect::Policy,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -40,6 +41,8 @@ pub enum SyncError {
     Header(#[from] reqwest::header::InvalidHeaderValue),
     #[error("sync server returned HTTP {0}")]
     Http(StatusCode),
+    #[error("sync server returned malformed progress data: {0}")]
+    Protocol(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -97,11 +100,11 @@ impl std::fmt::Debug for Credentials {
 #[derive(Debug)]
 pub struct KOSyncClient {
     base_url: Url,
-    credentials: Credentials,
+    client: Client,
 }
 
 impl KOSyncClient {
-    pub fn new(base_url: &str, credentials: Credentials) -> Result<Self, SyncError> {
+    pub fn new(base_url: &str, credentials: &Credentials) -> Result<Self, SyncError> {
         let mut base_url = Url::parse(base_url)?;
         if !base_url.path().ends_with('/') {
             let path = format!("{}/", base_url.path());
@@ -109,7 +112,7 @@ impl KOSyncClient {
         }
         Ok(Self {
             base_url,
-            credentials,
+            client: auth_client(AUTH_TIMEOUT, Some(credentials))?,
         })
     }
 
@@ -127,8 +130,9 @@ impl KOSyncClient {
 
     pub fn authorize(&self) -> Result<(), SyncError> {
         let response = self
-            .authenticated_client(AUTH_TIMEOUT)?
+            .client
             .get(self.endpoint("users/auth")?)
+            .timeout(AUTH_TIMEOUT)
             .send()?;
         match response.status() {
             StatusCode::OK => Ok(()),
@@ -138,8 +142,9 @@ impl KOSyncClient {
 
     pub fn push(&self, update: &ProgressUpdate) -> Result<ProgressRecord, SyncError> {
         let response = self
-            .authenticated_client(PROGRESS_TIMEOUT)?
+            .client
             .put(self.endpoint("syncs/progress")?)
+            .timeout(PROGRESS_TIMEOUT)
             .json(update)
             .send()?;
         parse_progress_response(response, &[StatusCode::OK, StatusCode::ACCEPTED])
@@ -149,8 +154,9 @@ impl KOSyncClient {
     /// never been synced (servers answer 404, or 200 with an empty record).
     pub fn pull(&self, document: &str) -> Result<Option<ProgressRecord>, SyncError> {
         let response = self
-            .authenticated_client(PROGRESS_TIMEOUT)?
+            .client
             .get(self.endpoint(&format!("syncs/progress/{document}"))?)
+            .timeout(PROGRESS_TIMEOUT)
             .send()?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
@@ -165,10 +171,6 @@ impl KOSyncClient {
 
     fn endpoint(&self, path: &str) -> Result<Url, SyncError> {
         endpoint(self.base_url.clone(), path)
-    }
-
-    fn authenticated_client(&self, timeout: Duration) -> Result<Client, SyncError> {
-        auth_client(timeout, Some(&self.credentials))
     }
 }
 
@@ -192,6 +194,7 @@ fn auth_client(timeout: Duration, credentials: Option<&Credentials>) -> Result<C
     Ok(Client::builder()
         .connect_timeout(timeout.min(Duration::from_secs(2)))
         .timeout(timeout)
+        .redirect(Policy::none())
         .default_headers(headers)
         .build()?)
 }
@@ -204,13 +207,27 @@ fn parse_progress_response(
     if !expected.contains(&status) {
         return Err(SyncError::Http(status));
     }
-    Ok(record_from_body(&response.text()?))
+    record_from_body(&response.text()?)
 }
 
 /// Decode a progress body leniently: some servers answer with an empty body,
 /// `{}`, or `null` where others answer 404.
-fn record_from_body(body: &str) -> ProgressRecord {
-    serde_json::from_str(body).unwrap_or_default()
+fn record_from_body(body: &str) -> Result<ProgressRecord, SyncError> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() || trimmed == "null" || trimmed == "{}" {
+        return Ok(ProgressRecord::default());
+    }
+    let record: ProgressRecord =
+        serde_json::from_str(trimmed).map_err(|error| SyncError::Protocol(error.to_string()))?;
+    if record
+        .percentage
+        .is_some_and(|percentage| !percentage.is_finite() || !(0.0..=1.0).contains(&percentage))
+    {
+        return Err(SyncError::Protocol(
+            "percentage must be finite and between 0 and 1".to_owned(),
+        ));
+    }
+    Ok(record)
 }
 
 #[must_use]
@@ -462,17 +479,25 @@ mod tests {
     }
 
     #[test]
-    fn record_from_body_tolerates_empty_and_null_responses() {
-        assert_eq!(record_from_body(""), ProgressRecord::default());
-        assert_eq!(record_from_body("{}"), ProgressRecord::default());
-        assert_eq!(record_from_body("null"), ProgressRecord::default());
-        assert_eq!(
+    fn record_from_body_tolerates_known_empty_responses() -> Result<(), SyncError> {
+        assert_eq!(record_from_body("")?, ProgressRecord::default());
+        assert_eq!(record_from_body("{}")?, ProgressRecord::default());
+        assert_eq!(record_from_body("null")?, ProgressRecord::default());
+        assert!(matches!(
             record_from_body("<html>err</html>"),
-            ProgressRecord::default()
-        );
+            Err(SyncError::Protocol(_))
+        ));
         let record = record_from_body(r#"{"progress":"/body/p[1].0","percentage":0.5}"#);
-        assert_eq!(record.progress.as_deref(), Some("/body/p[1].0"));
-        assert_eq!(record.percentage, Some(0.5));
+        assert_eq!(record?.progress.as_deref(), Some("/body/p[1].0"));
+        Ok(())
+    }
+
+    #[test]
+    fn record_from_body_rejects_invalid_percentages() {
+        assert!(matches!(
+            record_from_body(r#"{"percentage":2.0}"#),
+            Err(SyncError::Protocol(_))
+        ));
     }
 
     #[test]

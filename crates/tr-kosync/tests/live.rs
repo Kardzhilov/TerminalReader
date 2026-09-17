@@ -40,7 +40,7 @@ fn live_round_trip_push_then_pull() {
     }
     let client = KOSyncClient::new(
         &config.server,
-        Credentials {
+        &Credentials {
             username: config.username,
             userkey: password_hash(&config.password),
         },

@@ -170,13 +170,11 @@ impl SyncController {
                 if register {
                     KOSyncClient::register(&server, &username, &password)?;
                 }
-                let client = KOSyncClient::new(
-                    &server,
-                    Credentials {
-                        username: username.clone(),
-                        userkey: userkey.clone(),
-                    },
-                )?;
+                let credentials = Credentials {
+                    username: username.clone(),
+                    userkey: userkey.clone(),
+                };
+                let client = KOSyncClient::new(&server, &credentials)?;
                 client.authorize()
             })()
             .map_err(|error| error.to_string());
@@ -285,7 +283,7 @@ impl SyncController {
         self.in_flight += 1;
         self.last_call = Some(Instant::now());
         std::thread::spawn(move || {
-            let result = KOSyncClient::new(&server, credentials)
+            let result = KOSyncClient::new(&server, &credentials)
                 .and_then(|client| client.pull(&document))
                 .map_err(|error| error.to_string());
             let _ = tx.send(SyncEvent::Pull {
@@ -312,7 +310,7 @@ impl SyncController {
         self.last_call = Some(Instant::now());
         self.status = Some("Syncing…".to_owned());
         std::thread::spawn(move || {
-            let result = KOSyncClient::new(&server, credentials.clone())
+            let result = KOSyncClient::new(&server, &credentials)
                 .and_then(|client| client.push(&update).map(|_| ()))
                 .map_err(|error| error.to_string());
             let _ = tx.send(SyncEvent::Push {
