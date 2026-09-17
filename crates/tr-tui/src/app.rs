@@ -1851,10 +1851,12 @@ impl App {
             format!("{chapter_label} — {snippet}")
         };
         let bookmark = Bookmark {
+            id: String::new(),
             chapter_index: reader.chapter_index,
             block_index: reader.anchor.0,
             char_offset: reader.anchor.1,
             label,
+            note: None,
             created: 0,
         };
         self.status = Some(match self.bookmarks.add(&reader.path, bookmark) {

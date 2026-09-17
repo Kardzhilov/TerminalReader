@@ -5,6 +5,7 @@ pub mod logging;
 
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -635,10 +636,14 @@ impl RecentsStore {
 /// A saved location inside a book, with a human-readable label.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Bookmark {
+    #[serde(default)]
+    pub id: String,
     pub chapter_index: usize,
     pub block_index: usize,
     pub char_offset: usize,
     pub label: String,
+    #[serde(default)]
+    pub note: Option<String>,
     #[serde(default)]
     pub created: u64,
 }
@@ -667,6 +672,15 @@ impl BookmarkStore {
             load_json_or_backup("bookmarks.json")?;
         let mut store = Self::default();
         for (path, bookmarks) in file.books {
+            let bookmarks: Vec<Bookmark> = bookmarks
+                .into_iter()
+                .map(|mut bookmark| {
+                    if bookmark.id.is_empty() {
+                        bookmark.id = bookmark_id(&bookmark);
+                    }
+                    bookmark
+                })
+                .collect();
             store
                 .books
                 .entry(normalize_book_path(&path))
@@ -683,6 +697,9 @@ impl BookmarkStore {
 
     pub fn add(&mut self, path: &Path, mut bookmark: Bookmark) -> Result<(), CoreError> {
         bookmark.created = unix_timestamp();
+        if bookmark.id.is_empty() {
+            bookmark.id = bookmark_id(&bookmark);
+        }
         let entries = self.books.entry(path.to_path_buf()).or_default();
         entries.push(bookmark);
         entries.sort_by_key(|entry| (entry.chapter_index, entry.block_index, entry.char_offset));
@@ -702,6 +719,30 @@ impl BookmarkStore {
         }
         self.save()?;
         Ok(true)
+    }
+
+    #[must_use]
+    pub fn export_json(&self, path: &Path) -> String {
+        serde_json::to_string_pretty(self.list(path)).unwrap_or_else(|_| "[]".to_owned())
+    }
+
+    #[must_use]
+    pub fn export_markdown(&self, path: &Path, title: &str) -> String {
+        let mut output = format!("# Bookmarks: {title}\n\n");
+        for bookmark in self.list(path) {
+            let _ = writeln!(
+                output,
+                "- **{}** (chapter {}, block {}, offset {})",
+                bookmark.label,
+                bookmark.chapter_index + 1,
+                bookmark.block_index + 1,
+                bookmark.char_offset
+            );
+            if let Some(note) = &bookmark.note {
+                let _ = writeln!(output, "  - Note: {note}");
+            }
+        }
+        output
     }
 
     /// Change the label of the bookmark at `index`.
@@ -1152,6 +1193,13 @@ fn unix_timestamp() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+fn bookmark_id(bookmark: &Bookmark) -> String {
+    format!(
+        "{}-{}-{}-{}",
+        bookmark.chapter_index, bookmark.block_index, bookmark.char_offset, bookmark.created
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
@@ -1307,6 +1355,28 @@ mod tests {
             warnings
                 .iter()
                 .any(|warning| warning.contains("server_url"))
+        );
+    }
+
+    #[test]
+    fn bookmark_exports_include_stable_id_and_note() {
+        let path = PathBuf::from("book.epub");
+        let bookmark = Bookmark {
+            id: "bookmark-1".to_owned(),
+            chapter_index: 1,
+            block_index: 2,
+            char_offset: 3,
+            label: "A place".to_owned(),
+            note: Some("Remember this passage".to_owned()),
+            created: 4,
+        };
+        let mut store = BookmarkStore::default();
+        store.books.insert(path.clone(), vec![bookmark]);
+        assert!(store.export_json(&path).contains("bookmark-1"));
+        assert!(
+            store
+                .export_markdown(&path, "Example")
+                .contains("Remember this passage")
         );
     }
 

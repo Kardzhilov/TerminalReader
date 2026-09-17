@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -6,7 +9,10 @@ use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
 };
-use tr_core::{Config, PositionStore, RecentsStore, ScanCache, logging, scan_library_cached};
+use tr_core::{
+    BookmarkStore, Config, PositionStore, RecentsStore, ScanCache, logging, normalize_book_path,
+    scan_library_cached,
+};
 use tr_epub::EpubBook;
 use tr_kosync::{Credentials, KOSyncClient, ProgressQueue, filename_md5, partial_md5};
 
@@ -50,6 +56,16 @@ enum Command {
     AddLibrary { directory: PathBuf },
     /// Print KOReader-compatible binary and filename document hashes.
     Hash { book: PathBuf },
+    /// Export local bookmarks for an EPUB as Markdown or JSON.
+    Export {
+        book: PathBuf,
+        /// Write to this file instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Export JSON instead of Markdown.
+        #[arg(long)]
+        json: bool,
+    },
     /// Verify local configuration, state, and optional book matching data.
     Doctor { book: Option<PathBuf> },
     /// Check for a newer release and install it.
@@ -81,6 +97,9 @@ fn main() -> Result<()> {
         }
         Some(Command::AddLibrary { directory }) => add_library(&directory),
         Some(Command::Hash { book }) => hash(&book),
+        Some(Command::Export { book, output, json }) => {
+            export_bookmarks(&book, output.as_deref(), json)
+        }
         Some(Command::Doctor { book }) => doctor(book.as_deref(), cli.offline),
         Some(Command::Update { check }) => self_update(check, cli.offline),
         Some(Command::Completions { shell }) => {
@@ -215,6 +234,25 @@ fn hash(path: &Path) -> Result<()> {
     println!("Binary: {}", partial_md5(path)?);
     if let Some(digest) = filename_md5(path) {
         println!("Filename: {digest}");
+    }
+    Ok(())
+}
+
+fn export_bookmarks(book_path: &Path, output: Option<&Path>, json: bool) -> Result<()> {
+    let book =
+        EpubBook::open(book_path).with_context(|| format!("opening {}", book_path.display()))?;
+    let bookmarks = BookmarkStore::load()?;
+    let identity = normalize_book_path(book_path);
+    let contents = if json {
+        bookmarks.export_json(&identity)
+    } else {
+        bookmarks.export_markdown(&identity, &book.metadata.title)
+    };
+    if let Some(output) = output {
+        fs::write(output, contents)?;
+        println!("Exported bookmarks to {}", output.display());
+    } else {
+        print!("{contents}");
     }
     Ok(())
 }
