@@ -6,6 +6,7 @@
 
 use ratatui::{Frame, layout::Rect};
 use ratatui_image::{Image, Resize, picker::Picker, protocol::Protocol};
+use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
 
 use super::ReaderScreen;
@@ -18,10 +19,12 @@ pub struct InlineImages {
 }
 
 struct Cached {
+    book_path: PathBuf,
     chapter: usize,
     block: usize,
+    href: String,
     area: Rect,
-    protocol: Protocol,
+    protocol: Option<Protocol>,
 }
 
 impl std::fmt::Debug for InlineImages {
@@ -54,19 +57,28 @@ impl InlineImages {
             self.current = None;
             return;
         };
+        let href = image_href(reader, block);
         let reusable = self.current.as_ref().is_some_and(|cached| {
-            cached.chapter == reader.chapter_index && cached.block == block && cached.area == area
+            cached.book_path == reader.path
+                && cached.chapter == reader.chapter_index
+                && cached.block == block
+                && cached.href == href
+                && cached.area == area
         });
         if !reusable {
-            self.current = load_protocol(picker, reader, block, area).map(|protocol| Cached {
+            self.current = Some(Cached {
+                book_path: reader.path.clone(),
                 chapter: reader.chapter_index,
                 block,
+                href,
                 area,
-                protocol,
+                protocol: load_protocol(picker, reader, block, area),
             });
         }
-        if let Some(cached) = &self.current {
-            frame.render_widget(Image::new(&cached.protocol), cached.area);
+        if let Some(cached) = &self.current
+            && let Some(protocol) = &cached.protocol
+        {
+            frame.render_widget(Image::new(protocol), cached.area);
         }
     }
 }
@@ -118,12 +130,10 @@ fn load_protocol(
     block: usize,
     area: Rect,
 ) -> Option<Protocol> {
-    let href = match reader.blocks.get(block) {
-        Some(tr_epub::Block::Image {
-            href: Some(href), ..
-        }) => href.clone(),
-        _ => return None,
-    };
+    let href = image_href(reader, block);
+    if href.is_empty() {
+        return None;
+    }
     let (_, bytes) = reader
         .book
         .resource_bytes(reader.chapter_index, &href)
@@ -136,4 +146,13 @@ fn load_protocol(
     picker
         .new_protocol(decoded, area.as_size(), Resize::Fit(None))
         .ok()
+}
+
+fn image_href(reader: &ReaderScreen, block: usize) -> String {
+    match reader.blocks.get(block) {
+        Some(tr_epub::Block::Image {
+            href: Some(href), ..
+        }) => href.clone(),
+        _ => String::new(),
+    }
 }
