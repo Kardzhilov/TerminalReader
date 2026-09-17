@@ -513,12 +513,7 @@ struct ReaderScreen {
     ids: Vec<Vec<String>>,
     /// Bookmarks popup, when open.
     bookmarks_open: Option<BookmarkState>,
-    /// Start of the current reading session, for statistics.
-    session_start: Instant,
-    /// Pages turned this session, for statistics.
-    session_pages: u64,
-    active_seconds: u64,
-    last_activity: Instant,
+    session: ReaderSession,
     /// In-book navigation history, bounded to avoid unbounded memory growth.
     back_history: Vec<SavedPosition>,
     forward_history: Vec<SavedPosition>,
@@ -529,6 +524,55 @@ struct ReaderScreen {
     /// Whether the current position has changed since the last checkpoint.
     position_dirty: bool,
     last_position_checkpoint: Instant,
+}
+
+#[derive(Debug)]
+struct ReaderSession {
+    started: Instant,
+    pages: u64,
+    active_seconds: u64,
+    last_activity: Instant,
+}
+
+impl ReaderSession {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            pages: 0,
+            active_seconds: 0,
+            last_activity: now,
+        }
+    }
+
+    fn record_activity(&mut self) {
+        let elapsed = self.last_activity.elapsed();
+        if elapsed <= READING_IDLE_LIMIT {
+            self.active_seconds = self.active_seconds.saturating_add(elapsed.as_secs());
+        }
+        self.last_activity = Instant::now();
+    }
+
+    fn active_seconds_now(&self) -> u64 {
+        let elapsed = self.last_activity.elapsed();
+        self.active_seconds
+            .saturating_add(if elapsed <= READING_IDLE_LIMIT {
+                elapsed.as_secs()
+            } else {
+                0
+            })
+    }
+
+    fn finish(&mut self) -> (u64, u64) {
+        self.record_activity();
+        let result = (
+            std::mem::take(&mut self.active_seconds),
+            std::mem::take(&mut self.pages),
+        );
+        self.started = Instant::now();
+        self.last_activity = self.started;
+        result
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -782,7 +826,7 @@ impl App {
     fn handle_event(&mut self, event: &Event) {
         self.needs_redraw = true;
         if let Screen::Reader(reader) = &mut self.screen {
-            reader.record_activity();
+            reader.session.record_activity();
         }
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key.code),
@@ -3584,9 +3628,9 @@ impl App {
     #[allow(clippy::cast_precision_loss)]
     fn draw_reader_stats(&self, frame: &mut Frame, reader: &ReaderScreen) {
         let totals = self.stats.get(&reader.path);
-        let session_seconds = reader.active_seconds_now();
+        let session_seconds = reader.session.active_seconds_now();
         let seconds = totals.seconds + session_seconds;
-        let pages = totals.pages + reader.session_pages;
+        let pages = totals.pages + reader.session.pages;
         let percent = reader.percentage();
         let (page, count) = reader.page_numbers();
         let speed = if seconds >= 60 && pages > 0 {
@@ -3602,7 +3646,7 @@ impl App {
             format!(
                 "This session  {} · {} pages",
                 format_duration(session_seconds),
-                reader.session_pages
+                reader.session.pages
             ),
             format!("This book     {} · {pages} pages", format_duration(seconds)),
             format!(
@@ -4318,7 +4362,7 @@ impl App {
             return;
         }
         reader.page_turns += 1;
-        reader.session_pages += 1;
+        reader.session.pages += 1;
         if let Some(pages) = config.sync.pages_before_update {
             if pages > 0 && reader.page_turns >= pages {
                 reader.page_turns = 0;
@@ -4333,11 +4377,7 @@ impl App {
         footer_status: &mut Option<String>,
         reader: &mut ReaderScreen,
     ) -> bool {
-        reader.record_activity();
-        let seconds = std::mem::take(&mut reader.active_seconds);
-        let pages = std::mem::take(&mut reader.session_pages);
-        reader.session_start = Instant::now();
-        reader.last_activity = Instant::now();
+        let (seconds, pages) = reader.session.finish();
         if pages == 0 && seconds < 30 {
             return false;
         }
@@ -5373,10 +5413,7 @@ impl ReaderScreen {
             inline: Vec::new(),
             ids: Vec::new(),
             bookmarks_open: None,
-            session_start: Instant::now(),
-            session_pages: 0,
-            active_seconds: 0,
-            last_activity: Instant::now(),
+            session: ReaderSession::new(),
             back_history: Vec::new(),
             forward_history: Vec::new(),
             chapter_weights,
@@ -5388,24 +5425,6 @@ impl ReaderScreen {
 
     fn navigation_position(&self) -> (usize, usize) {
         (self.chapter_index, self.top_line)
-    }
-
-    fn record_activity(&mut self) {
-        let elapsed = self.last_activity.elapsed();
-        if elapsed <= READING_IDLE_LIMIT {
-            self.active_seconds = self.active_seconds.saturating_add(elapsed.as_secs());
-        }
-        self.last_activity = Instant::now();
-    }
-
-    fn active_seconds_now(&self) -> u64 {
-        let elapsed = self.last_activity.elapsed();
-        self.active_seconds
-            .saturating_add(if elapsed <= READING_IDLE_LIMIT {
-                elapsed.as_secs()
-            } else {
-                0
-            })
     }
 
     fn ensure_layout(&mut self, width: u16, height: u16, options: LayoutOptions) {
@@ -6136,6 +6155,16 @@ impl ReaderScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_session_finish_isolated_from_app_state() {
+        let mut session = ReaderSession::new();
+        session.active_seconds = 42;
+        session.pages = 3;
+        assert_eq!(session.finish(), (42, 3));
+        assert_eq!(session.active_seconds, 0);
+        assert_eq!(session.pages, 0);
+    }
 
     #[test]
     fn home_items_orders_continue_recents_aggregate_libraries_add() {
