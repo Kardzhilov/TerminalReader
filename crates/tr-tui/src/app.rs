@@ -473,6 +473,7 @@ struct ReaderScreen {
     search: Option<TextInput>,
     /// Positions of all matches from the last search.
     search_matches: Vec<SavedPosition>,
+    search_match_ends: Vec<usize>,
     search_index: usize,
     /// The active query, kept for highlighting matches on the page.
     search_query: Option<String>,
@@ -548,6 +549,10 @@ pub struct App {
     stats: StatsStore,
     sync: SyncController,
     update: UpdateController,
+    search_tx: Sender<SearchEvent>,
+    search_rx: Receiver<SearchEvent>,
+    search_generation: u64,
+    search_busy: bool,
     palette: Palette,
     /// Never touch the network; sync is fully disabled.
     offline: bool,
@@ -568,6 +573,30 @@ pub struct App {
     next_screen: Option<Screen>,
     #[cfg(feature = "inline-images")]
     inline_images: images::InlineImages,
+}
+
+#[derive(Debug)]
+enum SearchEvent {
+    Finished {
+        generation: u64,
+        path: PathBuf,
+        query: String,
+        matches: Vec<SavedPosition>,
+        ends: Vec<usize>,
+        snippets: Vec<String>,
+    },
+    Failed {
+        generation: u64,
+        path: PathBuf,
+        error: String,
+    },
+}
+
+#[derive(Debug)]
+struct SearchResults {
+    matches: Vec<SavedPosition>,
+    ends: Vec<usize>,
+    snippets: Vec<String>,
 }
 
 impl App {
@@ -607,6 +636,7 @@ impl App {
         let show_wizard =
             first_run && config.library.book_dirs.is_empty() && initial_book.is_none();
         let palette = Palette::detect(&config.theme);
+        let (search_tx, search_rx) = channel();
         let (positions, positions_backup) = PositionStore::load_or_backup()?;
         let (recents, recents_backup) = RecentsStore::load_or_backup()?;
         let (bookmarks, bookmarks_backup) = BookmarkStore::load_or_backup()?;
@@ -631,6 +661,10 @@ impl App {
             stats,
             sync,
             update: UpdateController::new(),
+            search_tx,
+            search_rx,
+            search_generation: 0,
+            search_busy: false,
             palette,
             offline,
             screen: if show_wizard {
@@ -682,6 +716,7 @@ impl App {
             let previous_status = self.status_line();
             self.process_sync_events();
             self.process_update_events();
+            self.process_search_events();
             self.process_scan_events();
             self.maybe_timed_push();
             self.maybe_checkpoint();
@@ -759,7 +794,7 @@ impl App {
 
     fn next_poll_timeout(&self) -> Duration {
         let mut timeout = Duration::from_secs(1);
-        if self.scanner.busy || self.sync.busy() || self.update.busy {
+        if self.scanner.busy || self.sync.busy() || self.update.busy || self.search_busy {
             timeout = Duration::from_millis(100);
         }
         if self.caret_visible() {
@@ -1352,6 +1387,7 @@ impl App {
                 if reader.search_query.is_some() || !reader.search_matches.is_empty() {
                     reader.search_query = None;
                     reader.search_matches.clear();
+                    reader.search_match_ends.clear();
                     reader.search_snippets.clear();
                     reader.search_index = 0;
                     self.status = Some("Search cleared.".to_owned());
@@ -1641,23 +1677,40 @@ impl App {
 
     /// Search all chapters and show the results popup.
     fn run_reader_search(&mut self, reader: &mut ReaderScreen, query: &str) {
-        reader.run_search(query);
-        if reader.search_matches.is_empty() {
-            reader.search_query = None;
-            self.status = Some(format!("No matches for \"{query}\"."));
-            return;
-        }
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        self.search_busy = true;
+        reader.search_matches.clear();
+        reader.search_match_ends.clear();
+        reader.search_snippets.clear();
+        reader.search_index = 0;
         reader.search_query = Some(query.to_owned());
-        let current = (reader.chapter_index, reader.anchor.0, reader.anchor.1);
-        let start = reader
-            .search_matches
-            .iter()
-            .position(|hit| (hit.chapter_index, hit.block_index, hit.char_offset) > current)
-            .unwrap_or(0);
-        reader.search_index = start;
-        reader.results_open = Some(PopupList {
-            selection: start,
-            top: 0,
+        reader.results_open = None;
+        let path = reader.path.clone();
+        let query = query.to_owned();
+        let tx = self.search_tx.clone();
+        std::thread::spawn(move || {
+            let result = search_book(&path, &query);
+            let event = match result {
+                Ok(SearchResults {
+                    matches,
+                    ends,
+                    snippets,
+                }) => SearchEvent::Finished {
+                    generation,
+                    path,
+                    query,
+                    matches,
+                    ends,
+                    snippets,
+                },
+                Err(error) => SearchEvent::Failed {
+                    generation,
+                    path,
+                    error,
+                },
+            };
+            let _ = tx.send(event);
         });
     }
 
@@ -3291,9 +3344,26 @@ impl App {
                 }
             }
         }
-        if let Some(query) = &reader.search_query {
-            for (start, end) in find_matches(&line.text, query) {
-                layers.push((start, end, self.palette.search_mark()));
+        if reader.search_query.is_some() {
+            if let Some(text) = reader.blocks.get(line.block).and_then(sync::block_text) {
+                for (index, match_position) in reader.search_matches.iter().enumerate() {
+                    if match_position.chapter_index != reader.chapter_index
+                        || match_position.block_index != line.block
+                    {
+                        continue;
+                    }
+                    let Some(&end) = reader.search_match_ends.get(index) else {
+                        continue;
+                    };
+                    let span = InlineSpan {
+                        start: match_position.char_offset,
+                        end,
+                        kind: InlineKind::Emphasis,
+                    };
+                    for (start, end, _) in line_inline_ranges(line, text, &[span]) {
+                        layers.push((start, end, self.palette.search_mark()));
+                    }
+                }
             }
         }
         if let Some((start, end)) = reader.selection_range(line_index) {
@@ -4325,6 +4395,59 @@ impl App {
         }
     }
 
+    fn process_search_events(&mut self) {
+        while let Ok(event) = self.search_rx.try_recv() {
+            match event {
+                SearchEvent::Finished {
+                    generation,
+                    path,
+                    query,
+                    matches,
+                    ends,
+                    snippets,
+                } if generation == self.search_generation => {
+                    self.search_busy = false;
+                    if let Screen::Reader(reader) = &mut self.screen
+                        && reader.path == path
+                    {
+                        reader.search_matches = matches;
+                        reader.search_match_ends = ends;
+                        reader.search_snippets = snippets;
+                        if reader.search_matches.is_empty() {
+                            reader.search_query = None;
+                            self.status = Some(format!("No matches for \"{query}\"."));
+                        } else {
+                            let current = (reader.chapter_index, reader.anchor.0, reader.anchor.1);
+                            let start = reader
+                                .search_matches
+                                .iter()
+                                .position(|hit| {
+                                    (hit.chapter_index, hit.block_index, hit.char_offset) > current
+                                })
+                                .unwrap_or(0);
+                            reader.search_index = start;
+                            reader.results_open = Some(PopupList {
+                                selection: start,
+                                top: 0,
+                            });
+                        }
+                    }
+                }
+                SearchEvent::Failed {
+                    generation,
+                    path,
+                    error,
+                } if generation == self.search_generation => {
+                    self.search_busy = false;
+                    if matches!(&self.screen, Screen::Reader(reader) if reader.path == path) {
+                        self.status = Some(format!("Search failed: {error}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Handle finished background sync work (auth outcomes, pull results).
     fn process_sync_events(&mut self) {
         let events = self.sync.poll(&self.config.sync);
@@ -4719,6 +4842,42 @@ fn book_progress_cell(position: &SavedPosition, spine_count: usize, ascii_only: 
     } else {
         String::new()
     }
+}
+
+fn search_book(path: &Path, query: &str) -> Result<SearchResults, String> {
+    const MATCH_CAP: usize = 250;
+    let mut book = EpubBook::open(path).map_err(|error| error.to_string())?;
+    let mut matches = Vec::new();
+    let mut ends = Vec::new();
+    let mut snippets = Vec::new();
+    'chapters: for chapter_index in 0..book.spine.len() {
+        let blocks = book
+            .chapter_blocks(chapter_index)
+            .map_err(|error| error.to_string())?;
+        for (block_index, sourced) in blocks.iter().enumerate() {
+            let Some(text) = sync::block_text(&sourced.block) else {
+                continue;
+            };
+            for (char_offset, match_end) in find_matches(text, query) {
+                matches.push(SavedPosition {
+                    chapter_index,
+                    block_index,
+                    char_offset,
+                    ..SavedPosition::default()
+                });
+                ends.push(match_end);
+                snippets.push(snippet_around(text, char_offset, match_end));
+                if matches.len() >= MATCH_CAP {
+                    break 'chapters;
+                }
+            }
+        }
+    }
+    Ok(SearchResults {
+        matches,
+        ends,
+        snippets,
+    })
 }
 
 /// Split `text` into styled spans, patching `base` with every layer that
@@ -5119,6 +5278,7 @@ impl ReaderScreen {
             open_at_end: false,
             search: None,
             search_matches: Vec::new(),
+            search_match_ends: Vec::new(),
             search_index: 0,
             search_query: None,
             search_snippets: Vec::new(),
@@ -5731,36 +5891,6 @@ impl ReaderScreen {
             width,
             height,
         )
-    }
-    /// Collect case-insensitive matches for `query` across all chapters.
-    fn run_search(&mut self, query: &str) {
-        const MATCH_CAP: usize = 250;
-        self.search_matches.clear();
-        self.search_snippets.clear();
-        self.search_index = 0;
-        'chapters: for chapter_index in 0..self.book.spine.len() {
-            let Ok(blocks) = self.book.chapter_blocks(chapter_index) else {
-                continue;
-            };
-            for (block_index, sourced) in blocks.iter().enumerate() {
-                let Some(text) = sync::block_text(&sourced.block) else {
-                    continue;
-                };
-                for (char_offset, match_end) in find_matches(text, query) {
-                    self.search_matches.push(SavedPosition {
-                        chapter_index,
-                        block_index,
-                        char_offset,
-                        ..SavedPosition::default()
-                    });
-                    self.search_snippets
-                        .push(snippet_around(text, char_offset, match_end));
-                    if self.search_matches.len() >= MATCH_CAP {
-                        break 'chapters;
-                    }
-                }
-            }
-        }
     }
     fn toc_visible_rows(&self) -> usize {
         usize::from(self.toc_area().height.saturating_sub(3)).max(1)
