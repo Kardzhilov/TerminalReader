@@ -622,6 +622,7 @@ struct SearchResults {
 }
 
 impl App {
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         mut config: Config,
         config_backup: Option<PathBuf>,
@@ -630,6 +631,7 @@ impl App {
     ) -> Result<Self> {
         cleanup_stale_temp_images(Duration::from_secs(24 * 60 * 60));
         let first_run = !Config::exists();
+        let key_warnings = config.keys.validate();
         let mut sync = SyncController::new(offline);
         if offline {
             // Leave the controller signed out so nothing touches the network.
@@ -712,7 +714,9 @@ impl App {
             #[cfg(feature = "inline-images")]
             inline_images: images::InlineImages::detect(),
         };
-        if !recovered.is_empty() {
+        if !key_warnings.is_empty() {
+            app.status = Some(format!("Key binding warning: {}", key_warnings.join("; ")));
+        } else if !recovered.is_empty() {
             app.status = Some(format!(
                 "State was corrupt and reset; backups: {}",
                 recovered.join(", ")

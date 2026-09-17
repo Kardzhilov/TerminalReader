@@ -260,6 +260,41 @@ pub struct KeyBindings {
     pub quit: Option<char>,
 }
 
+impl KeyBindings {
+    /// Validate configured reader keys against each other and modal-reserved keys.
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let bindings = [
+            ("contents", self.contents.unwrap_or('t')),
+            ("search", self.search.unwrap_or('/')),
+            ("next_match", self.next_match.unwrap_or('n')),
+            ("previous_match", self.previous_match.unwrap_or('N')),
+            ("bookmark_add", self.bookmark_add.unwrap_or('m')),
+            ("bookmarks", self.bookmarks.unwrap_or('M')),
+            ("sync_push", self.sync_push.unwrap_or('s')),
+            ("sync_pull", self.sync_pull.unwrap_or('p')),
+            ("sync_toggle", self.sync_toggle.unwrap_or('x')),
+            ("quit", self.quit.unwrap_or('q')),
+        ];
+        let mut errors = Vec::new();
+        for (index, (name, key)) in bindings.iter().enumerate() {
+            if bindings
+                .iter()
+                .skip(index + 1)
+                .any(|(_, other)| other == key)
+            {
+                errors.push(format!(
+                    "reader key '{key}' is assigned more than once ({name})"
+                ));
+            }
+            if matches!(key, '?' | 'v' | 'g' | 'i' | 'z' | '[' | ']' | 'B' | 'F') {
+                errors.push(format!("reader key '{key}' for {name} is reserved"));
+            }
+        }
+        errors
+    }
+}
+
 /// How documents are matched against the sync server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1202,6 +1237,23 @@ mod tests {
         assert!(parsed.sync.auto_sync);
         assert!(!parsed.logging.enabled);
         Ok(())
+    }
+
+    #[test]
+    fn key_bindings_report_duplicates_and_reserved_keys() {
+        let warnings = KeyBindings {
+            contents: Some('q'),
+            quit: Some('q'),
+            search: Some('g'),
+            ..KeyBindings::default()
+        }
+        .validate();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("assigned more than once"))
+        );
+        assert!(warnings.iter().any(|warning| warning.contains("reserved")));
     }
 
     #[test]
