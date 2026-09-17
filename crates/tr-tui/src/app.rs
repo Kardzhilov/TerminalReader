@@ -501,6 +501,8 @@ struct ReaderScreen {
     /// In-book navigation history, bounded to avoid unbounded memory growth.
     back_history: Vec<SavedPosition>,
     forward_history: Vec<SavedPosition>,
+    /// Source-character weights for content-based progress.
+    chapter_weights: Vec<usize>,
     /// Whether the current position has changed since the last checkpoint.
     position_dirty: bool,
     last_position_checkpoint: Instant,
@@ -4443,27 +4445,31 @@ impl App {
 
     /// Decide what to do with a pulled server position.
     fn apply_pull(&mut self, reader: &mut ReaderScreen, record: &ProgressRecord, manual: bool) {
-        let Some(remote_percent) = record.percentage else {
-            if manual {
-                self.sync.status = Some("Server has no position for this book.".to_owned());
-            }
-            return;
-        };
         let local_percent = reader.percentage();
-        let forward = remote_percent > local_percent + 1e-6;
-        let backward = remote_percent < local_percent - 1e-6;
+        let remote_percent = record.percentage.unwrap_or(local_percent);
+        let forward = record
+            .percentage
+            .is_some_and(|percent| percent > local_percent + 1e-6);
+        let backward = record
+            .percentage
+            .is_some_and(|percent| percent < local_percent - 1e-6);
         if !forward && !backward {
+            if record.progress.is_none() {
+                if manual {
+                    self.sync.status = Some("Server has no position for this book.".to_owned());
+                }
+                return;
+            }
             if manual {
                 self.sync.status = Some("Already in sync.".to_owned());
             }
-            return;
         }
         let Some(position) = reader.position_from_record(record) else {
             self.sync.status = Some("Could not map the synced position.".to_owned());
             return;
         };
         // Manual pulls always show the prompt so `p` never jumps unasked.
-        let strategy = if manual {
+        let strategy = if manual || record.percentage.is_none() {
             SyncStrategy::Prompt
         } else if forward {
             self.config.sync.sync_forward
@@ -5074,6 +5080,19 @@ fn default_library_suggestion() -> String {
 
 impl ReaderScreen {
     fn new(path: PathBuf, book: EpubBook, position: &SavedPosition) -> Self {
+        let mut book = book;
+        let chapter_weights = (0..book.spine.len())
+            .map(|chapter| {
+                book.chapter_blocks(chapter).map_or(1, |blocks| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| sync::block_text(&block.block))
+                        .map(|text| text.chars().count())
+                        .sum::<usize>()
+                        .max(1)
+                })
+            })
+            .collect();
         let chapter_index = position
             .chapter_index
             .min(book.spine.len().saturating_sub(1));
@@ -5115,6 +5134,7 @@ impl ReaderScreen {
             session_pages: 0,
             back_history: Vec::new(),
             forward_history: Vec::new(),
+            chapter_weights,
             position_dirty: false,
             last_position_checkpoint: Instant::now(),
         }
@@ -5434,13 +5454,33 @@ impl ReaderScreen {
     /// Fraction of the book read, rounded like `KOReader`.
     #[allow(clippy::cast_precision_loss)]
     fn percentage(&self) -> f64 {
-        let spine = self.book.spine.len().max(1);
-        let within = if self.lines.is_empty() {
-            0.0
-        } else {
-            (self.top_line as f64 / self.lines.len() as f64).clamp(0.0, 1.0)
-        };
-        sync::round_percent((self.chapter_index as f64 + within) / spine as f64)
+        let total: usize = self.chapter_weights.iter().sum();
+        if total == 0 {
+            return 0.0;
+        }
+        if self.chapter_index + 1 == self.book.spine.len()
+            && !self.lines.is_empty()
+            && self.top_line + self.content_height() >= self.lines.len()
+        {
+            return 1.0;
+        }
+        let completed: usize = self.chapter_weights.iter().take(self.chapter_index).sum();
+        let current = self
+            .blocks
+            .iter()
+            .take(self.anchor.0)
+            .filter_map(sync::block_text)
+            .map(|text| text.chars().count())
+            .sum::<usize>();
+        let offset = self
+            .blocks
+            .get(self.anchor.0)
+            .and_then(sync::block_text)
+            .map_or(0, |text| {
+                text.get(..self.anchor.1.min(text.len()))
+                    .map_or(0, |prefix| prefix.chars().count())
+            });
+        sync::round_percent((completed + current + offset).min(total) as f64 / total as f64)
     }
 
     /// Progress string (xpointer when possible) and percentage for a push.
@@ -5470,7 +5510,9 @@ impl ReaderScreen {
                     .saturating_sub(1)
                     .min(self.book.spine.len().saturating_sub(1));
                 if let Ok(blocks) = self.book.chapter_blocks(chapter) {
-                    if let Some((block, offset)) = sync::block_for_pointer(&blocks, &pointer) {
+                    if let Some((block, offset, _confidence)) =
+                        sync::block_for_pointer_confident(&blocks, &pointer)
+                    {
                         return Some(SavedPosition {
                             chapter_index: chapter,
                             block_index: block,
@@ -5479,12 +5521,6 @@ impl ReaderScreen {
                         });
                     }
                 }
-                return Some(SavedPosition {
-                    chapter_index: chapter,
-                    block_index: 0,
-                    char_offset: 0,
-                    ..SavedPosition::default()
-                });
             }
         }
         record
@@ -5497,14 +5533,52 @@ impl ReaderScreen {
         clippy::cast_sign_loss,
         clippy::cast_precision_loss
     )]
-    fn position_for_percentage(&self, percentage: f64) -> SavedPosition {
-        let spine = self.book.spine.len().max(1);
-        let scaled = percentage.clamp(0.0, 1.0) * spine as f64;
-        let chapter = (scaled.floor() as usize).min(spine.saturating_sub(1));
+    fn position_for_percentage(&mut self, percentage: f64) -> SavedPosition {
+        let total: usize = self.chapter_weights.iter().sum::<usize>().max(1);
+        let target = (percentage.clamp(0.0, 1.0) * total as f64) as usize;
+        let mut completed = 0_usize;
+        let mut chapter = self.chapter_weights.len().saturating_sub(1);
+        for (index, weight) in self.chapter_weights.iter().enumerate() {
+            if target < completed.saturating_add(*weight) {
+                chapter = index;
+                break;
+            }
+            completed = completed.saturating_add(*weight);
+        }
+        let within = target.saturating_sub(completed);
+        let Ok(blocks) = self.book.chapter_blocks(chapter) else {
+            return SavedPosition {
+                chapter_index: chapter,
+                ..SavedPosition::default()
+            };
+        };
+        let mut remaining = within;
+        for (block_index, sourced) in blocks.iter().enumerate() {
+            let Some(text) = sync::block_text(&sourced.block) else {
+                continue;
+            };
+            let weight = text.chars().count();
+            if remaining <= weight {
+                let char_offset = text
+                    .char_indices()
+                    .nth(remaining)
+                    .map_or(text.len(), |(offset, _)| offset);
+                return SavedPosition {
+                    chapter_index: chapter,
+                    block_index,
+                    char_offset,
+                    ..SavedPosition::default()
+                };
+            }
+            remaining = remaining.saturating_sub(weight);
+        }
         SavedPosition {
             chapter_index: chapter,
-            block_index: 0,
-            char_offset: 0,
+            block_index: blocks.len().saturating_sub(1),
+            char_offset: blocks
+                .last()
+                .and_then(|block| sync::block_text(&block.block))
+                .map_or(0, str::len),
             ..SavedPosition::default()
         }
     }

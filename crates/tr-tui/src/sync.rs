@@ -635,12 +635,29 @@ pub fn progress_string(
     .format()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerConfidence {
+    Exact,
+    UniqueFallback,
+}
+
 /// Locate the block a pulled xpointer refers to within its chapter.
 ///
 /// Returns `(block_index, byte_offset)`. Falls back from an exact path match
 /// to matching the final element step.
 #[must_use]
+#[cfg(test)]
 pub fn block_for_pointer(blocks: &[SourcedBlock], pointer: &XPointer) -> Option<(usize, usize)> {
+    block_for_pointer_confident(blocks, pointer).map(|(index, offset, _)| (index, offset))
+}
+
+/// Locate a pointer and report whether its source path was exact or uniquely
+/// recovered from the final element step.
+#[must_use]
+pub fn block_for_pointer_confident(
+    blocks: &[SourcedBlock],
+    pointer: &XPointer,
+) -> Option<(usize, usize, PointerConfidence)> {
     let mut wanted: &[XPointerStep] = &pointer.steps;
     while let Some(last) = wanted.last() {
         if last.name == "text()" {
@@ -655,20 +672,32 @@ pub fn block_for_pointer(blocks: &[SourcedBlock], pointer: &XPointer) -> Option<
     let exact = blocks
         .iter()
         .position(|block| xpointer_steps(&block.source_path) == wanted);
-    let index = exact.or_else(|| {
+    let (index, confidence) = if let Some(index) = exact {
+        (index, PointerConfidence::Exact)
+    } else {
         let target = wanted.last()?;
-        blocks.iter().position(|block| {
-            block
-                .source_path
-                .last()
-                .is_some_and(|step| step.name == target.name && step.ordinal == target.ordinal)
-        })
-    })?;
+        let matches: Vec<usize> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                block
+                    .source_path
+                    .last()
+                    .is_some_and(|step| step.name == target.name && step.ordinal == target.ordinal)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if matches.len() != 1 {
+            return None;
+        }
+        let index = matches.first().copied()?;
+        (index, PointerConfidence::UniqueFallback)
+    };
     let offset = blocks
         .get(index)
         .and_then(|block| block_text(&block.block))
         .map_or(0, |text| byte_offset(text, pointer.offset));
-    Some((index, offset))
+    Some((index, offset, confidence))
 }
 
 /// Plain text of a block, when it has any.
@@ -742,6 +771,16 @@ mod tests {
         let blocks = vec![sourced(&[("html", 1), ("body", 1), ("p", 5)], "text")];
         let pointer = XPointer::parse("/body/DocFragment[1]/body/section/p[5]/text().2").unwrap();
         assert_eq!(block_for_pointer(&blocks, &pointer), Some((0, 2)));
+    }
+
+    #[test]
+    fn ambiguous_pointer_fallback_is_rejected() {
+        let blocks = vec![
+            sourced(&[("html", 1), ("body", 1), ("p", 5)], "first"),
+            sourced(&[("html", 1), ("body", 1), ("p", 5)], "second"),
+        ];
+        let pointer = XPointer::parse("/body/DocFragment[1]/body/section/p[5].0").unwrap();
+        assert_eq!(block_for_pointer_confident(&blocks, &pointer), None);
     }
 
     #[test]
