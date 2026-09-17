@@ -569,7 +569,7 @@ impl App {
     ) -> Result<Self> {
         cleanup_stale_temp_images(Duration::from_secs(24 * 60 * 60));
         let first_run = !Config::exists();
-        let mut sync = SyncController::new();
+        let mut sync = SyncController::new(offline);
         if offline {
             // Leave the controller signed out so nothing touches the network.
         } else if let Some(username) = &config.sync.username {
@@ -1250,7 +1250,7 @@ impl App {
             match key {
                 KeyCode::Enter | KeyCode::Char('y') => {
                     if let Some(prompt) = reader.link_prompt.take() {
-                        self.status = Some(open_external_url(&prompt.url));
+                        self.status = Some(self.open_external_url(&prompt.url));
                     }
                 }
                 KeyCode::Esc | KeyCode::Char('n') => reader.link_prompt = None,
@@ -1834,7 +1834,7 @@ impl App {
                 return;
             }
             if reader.link_prompt.is_some() {
-                if let Some(message) = Self::handle_link_prompt_mouse(reader, mouse) {
+                if let Some(message) = Self::handle_link_prompt_mouse(reader, mouse, self.offline) {
                     self.status = Some(message);
                 }
                 return;
@@ -1946,7 +1946,11 @@ impl App {
         }
     }
 
-    fn handle_link_prompt_mouse(reader: &mut ReaderScreen, mouse: MouseEvent) -> Option<String> {
+    fn handle_link_prompt_mouse(
+        reader: &mut ReaderScreen,
+        mouse: MouseEvent,
+        offline: bool,
+    ) -> Option<String> {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return None;
         }
@@ -1963,10 +1967,13 @@ impl App {
         let open_start = area.x + 1;
         let open_end = open_start + u16::try_from(LINK_OPEN_LABEL.len()).unwrap_or(0);
         if (open_start..open_end).contains(&mouse.column) {
-            return reader
-                .link_prompt
-                .take()
-                .map(|prompt| open_external_url(&prompt.url));
+            return reader.link_prompt.take().map(|prompt| {
+                if offline {
+                    "Offline mode — external links are disabled.".to_owned()
+                } else {
+                    open_external_url(&prompt.url)
+                }
+            });
         }
         reader.link_prompt = None;
         None
@@ -2262,6 +2269,14 @@ impl App {
             reader.link_prompt = Some(LinkPrompt { url: href });
         } else {
             self.status = Some("In-book link navigation is not supported yet.".to_owned());
+        }
+    }
+
+    fn open_external_url(&self, url: &str) -> String {
+        if self.offline {
+            "Offline mode — external links are disabled.".to_owned()
+        } else {
+            open_external_url(url)
         }
     }
 

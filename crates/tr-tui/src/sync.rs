@@ -58,11 +58,12 @@ pub struct SyncController {
     in_flight: usize,
     pub status: Option<String>,
     push_notice: Option<PushNotice>,
+    offline: bool,
 }
 
 impl SyncController {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(offline: bool) -> Self {
         let (tx, rx) = channel();
         let queue_path = tr_core::state_file(QUEUE_FILE).ok();
         let queue = queue_path
@@ -80,6 +81,7 @@ impl SyncController {
             in_flight: 0,
             status: None,
             push_notice: None,
+            offline,
         }
     }
 
@@ -111,6 +113,10 @@ impl SyncController {
 
     /// Register (optionally) and authorize in the background.
     pub fn login(&mut self, config: &SyncConfig, username: String, password: &str, register: bool) {
+        if self.offline {
+            self.status = Some("Offline mode — sync is disabled.".to_owned());
+            return;
+        }
         let userkey = password_hash(password);
         logging::register_secret(&userkey);
         let server = config.server_url.clone();
@@ -149,6 +155,9 @@ impl SyncController {
     /// Push progress; automatic pushes within the debounce window are
     /// deferred and coalesced per document, manual pushes go out immediately.
     pub fn push(&mut self, config: &SyncConfig, update: ProgressUpdate, manual: bool) {
+        if !self.allowed(config, manual) {
+            return;
+        }
         let Some(credentials) = self.credentials.clone() else {
             if manual {
                 self.status = Some("Not signed in.".to_owned());
@@ -179,6 +188,9 @@ impl SyncController {
 
     /// Pull the server's progress record for `document` in the background.
     pub fn pull(&mut self, config: &SyncConfig, document: String, manual: bool) {
+        if !self.allowed(config, manual) {
+            return;
+        }
         let Some(credentials) = self.credentials.clone() else {
             if manual {
                 self.status = Some("Not signed in.".to_owned());
@@ -234,7 +246,7 @@ impl SyncController {
     /// push bookkeeping — status, offline queue, drain — is handled here.
     pub fn poll(&mut self, config: &SyncConfig) -> Vec<SyncEvent> {
         let expired = !should_defer(self.last_call, Instant::now());
-        if expired && !self.deferred.is_empty() {
+        if expired && config.auto_sync && !self.offline && !self.deferred.is_empty() {
             // One per window; the rest go out on later polls.
             let update = self.deferred.remove(0);
             self.push(config, update, false);
@@ -308,6 +320,9 @@ impl SyncController {
     /// Queue entries mirroring a still-deferred update are skipped so the
     /// debounce window keeps governing when those go out.
     pub fn drain_next(&mut self, config: &SyncConfig) {
+        if !self.allowed(config, false) {
+            return;
+        }
         if self.in_flight > 0 {
             return;
         }
@@ -349,9 +364,11 @@ impl SyncController {
     /// Send any deferred pushes immediately and wait briefly for in-flight
     /// calls, so push-on-quit completes before the process exits.
     pub fn flush(&mut self, config: &SyncConfig, timeout: Duration) {
-        if let Some(credentials) = self.credentials.clone() {
-            for update in std::mem::take(&mut self.deferred) {
-                self.spawn_push(&config.server_url, credentials.clone(), update, false);
+        if self.allowed(config, false) {
+            if let Some(credentials) = self.credentials.clone() {
+                for update in std::mem::take(&mut self.deferred) {
+                    self.spawn_push(&config.server_url, credentials.clone(), update, false);
+                }
             }
         }
         let deadline = Instant::now() + timeout;
@@ -375,12 +392,27 @@ impl SyncController {
             }
         }
     }
+
+    fn allowed(&mut self, config: &SyncConfig, manual: bool) -> bool {
+        if self.offline || (!manual && !config.auto_sync) {
+            if manual && self.offline {
+                self.status = Some("Offline mode — sync is disabled.".to_owned());
+            }
+            return false;
+        }
+        true
+    }
 }
 
 impl SyncController {
     /// A controller with an empty queue and no persistence, for unit tests.
     #[cfg(test)]
     fn for_tests() -> Self {
+        Self::for_tests_with(false)
+    }
+
+    #[cfg(test)]
+    fn for_tests_with(offline: bool) -> Self {
         let (tx, rx) = channel();
         Self {
             tx,
@@ -393,13 +425,14 @@ impl SyncController {
             in_flight: 0,
             status: None,
             push_notice: None,
+            offline,
         }
     }
 }
 
 impl Default for SyncController {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
@@ -696,6 +729,52 @@ mod tests {
         assert_eq!(controller.queue.len(), 1, "deferred push is persisted");
         assert_eq!(controller.status.as_deref(), Some("Sync queued…"));
         assert_eq!(controller.in_flight, 0, "nothing was sent yet");
+    }
+
+    #[test]
+    fn automatic_push_is_suppressed_when_auto_sync_is_disabled() {
+        let mut controller = signed_in_controller();
+        let config = SyncConfig {
+            auto_sync: false,
+            ..SyncConfig::default()
+        };
+        controller.push(&config, update("doc-a", 0.4), false);
+        assert_eq!(controller.in_flight, 0);
+        assert!(controller.deferred.is_empty());
+        assert!(controller.queue.is_empty());
+    }
+
+    #[test]
+    fn offline_mode_suppresses_manual_and_automatic_sync() {
+        let mut controller = SyncController::for_tests_with(true);
+        controller.set_credentials(Some(Credentials {
+            username: "user".to_owned(),
+            userkey: "key".to_owned(),
+        }));
+        let config = SyncConfig::default();
+        controller.push(&config, update("doc-a", 0.4), true);
+        controller.pull(&config, "doc-a".to_owned(), true);
+        controller.login(&config, "user".to_owned(), "password", false);
+        assert_eq!(controller.in_flight, 0);
+        assert!(controller.deferred.is_empty());
+        assert!(controller.queue.is_empty());
+        assert_eq!(
+            controller.status.as_deref(),
+            Some("Offline mode — sync is disabled.")
+        );
+    }
+
+    #[test]
+    fn disabled_auto_sync_keeps_deferred_updates_paused() {
+        let mut controller = signed_in_controller();
+        controller.deferred.push(update("doc-a", 0.4));
+        let config = SyncConfig {
+            auto_sync: false,
+            ..SyncConfig::default()
+        };
+        controller.poll(&config);
+        assert_eq!(controller.deferred.len(), 1);
+        assert_eq!(controller.deferred[0].document, "doc-a");
     }
 
     #[test]

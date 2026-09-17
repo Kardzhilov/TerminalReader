@@ -81,8 +81,8 @@ fn main() -> Result<()> {
         }
         Some(Command::AddLibrary { directory }) => add_library(&directory),
         Some(Command::Hash { book }) => hash(&book),
-        Some(Command::Doctor { book }) => doctor(book.as_deref()),
-        Some(Command::Update { check }) => self_update(check),
+        Some(Command::Doctor { book }) => doctor(book.as_deref(), cli.offline),
+        Some(Command::Update { check }) => self_update(check, cli.offline),
         Some(Command::Completions { shell }) => {
             completions(shell);
             Ok(())
@@ -103,7 +103,10 @@ fn completions(shell: clap_complete::Shell) {
     );
 }
 
-fn self_update(check_only: bool) -> Result<()> {
+fn self_update(check_only: bool, offline: bool) -> Result<()> {
+    if offline {
+        anyhow::bail!("offline mode — updates are disabled")
+    }
     update::clean_stale_backup();
     let status = update::check()?;
     println!("Current version: {}", status.current);
@@ -216,7 +219,7 @@ fn hash(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn doctor(book: Option<&Path>) -> Result<()> {
+fn doctor(book: Option<&Path>, offline: bool) -> Result<()> {
     let config = Config::load()?;
     let _ = PositionStore::load()?;
     let _ = RecentsStore::load()?;
@@ -229,7 +232,7 @@ fn doctor(book: Option<&Path>) -> Result<()> {
             println!("Library: {status} ({})", directory.display());
         }
     }
-    doctor_sync(&config);
+    doctor_sync(&config, offline);
     if let Some(book) = book {
         println!("Book: {}", if book.is_file() { "OK" } else { "missing" });
         if book.is_file() {
@@ -243,7 +246,7 @@ fn doctor(book: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn doctor_sync(config: &Config) {
+fn doctor_sync(config: &Config, offline: bool) {
     match url::Url::parse(&config.sync.server_url) {
         Ok(_) => println!("Sync server URL: OK ({})", config.sync.server_url),
         Err(error) => {
@@ -254,6 +257,10 @@ fn doctor_sync(config: &Config) {
     let queue_len =
         tr_core::state_file("sync_queue.json").map_or(0, |path| ProgressQueue::load(&path).len());
     println!("Sync queue: {queue_len} pending");
+    if offline {
+        println!("Sync network: skipped (--offline)");
+        return;
+    }
     let Some(username) = &config.sync.username else {
         println!("Sync account: not configured");
         return;
