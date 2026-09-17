@@ -44,6 +44,7 @@ const MIN_HEIGHT: u16 = 16;
 /// How long footer status messages stay on screen.
 const STATUS_TTL: Duration = Duration::from_secs(5);
 const POSITION_CHECKPOINT: Duration = Duration::from_secs(30);
+const READING_IDLE_LIMIT: Duration = Duration::from_secs(5 * 60);
 const PROMPT_GO_LABEL: &str = "[Go to position]";
 const PROMPT_STAY_LABEL: &str = "[Stay here]";
 const LINK_OPEN_LABEL: &str = "[Open]";
@@ -516,6 +517,8 @@ struct ReaderScreen {
     session_start: Instant,
     /// Pages turned this session, for statistics.
     session_pages: u64,
+    active_seconds: u64,
+    last_activity: Instant,
     /// In-book navigation history, bounded to avoid unbounded memory growth.
     back_history: Vec<SavedPosition>,
     forward_history: Vec<SavedPosition>,
@@ -774,6 +777,9 @@ impl App {
 
     fn handle_event(&mut self, event: &Event) {
         self.needs_redraw = true;
+        if let Screen::Reader(reader) = &mut self.screen {
+            reader.record_activity();
+        }
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key.code),
             Event::Mouse(mouse) => {
@@ -1415,12 +1421,14 @@ impl App {
                 }
             }
             KeyCode::Char(' ') | KeyCode::PageDown | KeyCode::Right => {
+                let before = reader.navigation_position();
                 reader.next_page();
-                Self::note_page_turn(&self.config, &mut self.sync, reader);
+                Self::note_page_turn(&self.config, &mut self.sync, reader, before);
             }
             KeyCode::PageUp | KeyCode::Left => {
+                let before = reader.navigation_position();
                 reader.previous_page();
-                Self::note_page_turn(&self.config, &mut self.sync, reader);
+                Self::note_page_turn(&self.config, &mut self.sync, reader, before);
             }
             KeyCode::Char('v') => reader.start_selection(),
             KeyCode::Up if self.config.navigation.line_scroll => reader.scroll_lines(-1),
@@ -2286,14 +2294,16 @@ impl App {
             }
             Action::ReaderPrevious => {
                 if let Screen::Reader(reader) = &mut self.screen {
+                    let before = reader.navigation_position();
                     reader.previous_page();
-                    Self::note_page_turn(&self.config, &mut self.sync, reader);
+                    Self::note_page_turn(&self.config, &mut self.sync, reader, before);
                 }
             }
             Action::ReaderNext => {
                 if let Screen::Reader(reader) = &mut self.screen {
+                    let before = reader.navigation_position();
                     reader.next_page();
-                    Self::note_page_turn(&self.config, &mut self.sync, reader);
+                    Self::note_page_turn(&self.config, &mut self.sync, reader, before);
                 }
             }
             Action::ReaderHome => {
@@ -3570,7 +3580,7 @@ impl App {
     #[allow(clippy::cast_precision_loss)]
     fn draw_reader_stats(&self, frame: &mut Frame, reader: &ReaderScreen) {
         let totals = self.stats.get(&reader.path);
-        let session_seconds = reader.session_start.elapsed().as_secs();
+        let session_seconds = reader.active_seconds_now();
         let seconds = totals.seconds + session_seconds;
         let pages = totals.pages + reader.session_pages;
         let percent = reader.percentage();
@@ -4294,7 +4304,15 @@ impl App {
     }
 
     /// Count a page turn and push when the configured interval is reached.
-    fn note_page_turn(config: &Config, sync: &mut SyncController, reader: &mut ReaderScreen) {
+    fn note_page_turn(
+        config: &Config,
+        sync: &mut SyncController,
+        reader: &mut ReaderScreen,
+        before: (usize, usize),
+    ) {
+        if reader.navigation_position() == before {
+            return;
+        }
         reader.page_turns += 1;
         reader.session_pages += 1;
         if let Some(pages) = config.sync.pages_before_update {
@@ -4311,9 +4329,11 @@ impl App {
         footer_status: &mut Option<String>,
         reader: &mut ReaderScreen,
     ) -> bool {
-        let seconds = reader.session_start.elapsed().as_secs();
+        reader.record_activity();
+        let seconds = std::mem::take(&mut reader.active_seconds);
         let pages = std::mem::take(&mut reader.session_pages);
         reader.session_start = Instant::now();
+        reader.last_activity = Instant::now();
         if pages == 0 && seconds < 30 {
             return false;
         }
@@ -5351,6 +5371,8 @@ impl ReaderScreen {
             bookmarks_open: None,
             session_start: Instant::now(),
             session_pages: 0,
+            active_seconds: 0,
+            last_activity: Instant::now(),
             back_history: Vec::new(),
             forward_history: Vec::new(),
             chapter_weights,
@@ -5358,6 +5380,28 @@ impl ReaderScreen {
             position_dirty: false,
             last_position_checkpoint: Instant::now(),
         }
+    }
+
+    fn navigation_position(&self) -> (usize, usize) {
+        (self.chapter_index, self.top_line)
+    }
+
+    fn record_activity(&mut self) {
+        let elapsed = self.last_activity.elapsed();
+        if elapsed <= READING_IDLE_LIMIT {
+            self.active_seconds = self.active_seconds.saturating_add(elapsed.as_secs());
+        }
+        self.last_activity = Instant::now();
+    }
+
+    fn active_seconds_now(&self) -> u64 {
+        let elapsed = self.last_activity.elapsed();
+        self.active_seconds
+            .saturating_add(if elapsed <= READING_IDLE_LIMIT {
+                elapsed.as_secs()
+            } else {
+                0
+            })
     }
 
     fn ensure_layout(&mut self, width: u16, height: u16, options: LayoutOptions) {
