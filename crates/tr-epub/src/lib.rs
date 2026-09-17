@@ -252,10 +252,8 @@ fn decode_text(bytes: Vec<u8>) -> Result<String, EpubError> {
 }
 
 fn decode_utf16(bytes: &[u8], combine: fn([u8; 2]) -> u16) -> String {
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .filter_map(|pair| pair.try_into().ok().map(combine))
-        .collect();
+    let (chunks, _) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = chunks.iter().map(|pair| combine(*pair)).collect();
     String::from_utf16_lossy(&units)
 }
 
