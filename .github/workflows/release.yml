@@ -49,6 +49,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - name: Install Linux keyring dependencies
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo fmt --all -- --check
@@ -74,7 +76,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-15-intel
+          - os: macos-13
             target: x86_64-apple-darwin
             archive: tar.gz
           - os: windows-latest
@@ -88,7 +90,7 @@ jobs:
       - name: Install Linux keyring dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-      - run: cargo build --release --target ${{ matrix.target }} -p terminalreader
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p terminalreader
         env:
           # Baked into the binary so self-update can compare against releases.
           TR_RELEASE_VERSION: ${{ env.VERSION }}
@@ -115,9 +117,33 @@ jobs:
           path: terminalreader-v${{ env.VERSION }}-${{ matrix.target }}.${{ matrix.archive }}
           if-no-files-found: error
 
+  verify-artifacts:
+    name: Verify packaged artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(dist/*)
+          test "${#archives[@]}" -eq 5
+          for archive in "${archives[@]}"; do
+            case "$archive" in
+              *.tar.gz) tar tzf "$archive" | grep -q '/terminalreader$' ;;
+              *.zip) unzip -l "$archive" | grep -q 'terminalreader.exe' ;;
+              *) echo "unexpected artifact: $archive" >&2; exit 1 ;;
+            esac
+          done
+
   release:
     name: Tag and publish v${{ needs.version.outputs.version }}
-    needs: [version, verify, build]
+    needs: [version, verify, build, verify-artifacts]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
