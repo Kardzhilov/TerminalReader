@@ -1114,13 +1114,12 @@ fn scan_directory(
                     mtime,
                 });
             } else {
-                match EpubBook::open(&path) {
-                    Ok(book) => {
-                        let spine_count = book.spine.len();
-                        cache.store(path.clone(), size, mtime, &book.metadata, spine_count);
+                match EpubBook::open_metadata(&path) {
+                    Ok((metadata, spine_count)) => {
+                        cache.store(path.clone(), size, mtime, &metadata, spine_count);
                         books.push(LibraryBook {
                             path,
-                            metadata: book.metadata,
+                            metadata,
                             spine_count,
                             mtime,
                         });

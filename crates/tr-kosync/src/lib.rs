@@ -98,7 +98,7 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KOSyncClient {
     base_url: Url,
     client: Client,

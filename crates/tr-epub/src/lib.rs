@@ -122,6 +122,18 @@ pub struct EpubBook {
 }
 
 impl EpubBook {
+    /// Read metadata and spine length without loading navigation documents or
+    /// retaining the archive for chapter/resource reads.
+    pub fn open_metadata(path: &Path) -> Result<(BookMetadata, usize), EpubError> {
+        let file = File::open(path)?;
+        let mut archive = ZipArchive::new(file)?;
+        let container = read_entry(&mut archive, "META-INF/container.xml")?;
+        let opf_path = parse_rootfile(&container)?.ok_or(EpubError::Missing("OPF rootfile"))?;
+        let opf = read_entry(&mut archive, &opf_path)?;
+        let parsed = parse_opf(&opf, &opf_path)?;
+        Ok((parsed.metadata, parsed.spine.len()))
+    }
+
     pub fn open(path: &Path) -> Result<Self, EpubError> {
         let file = File::open(path)?;
         let mut archive = ZipArchive::new(file)?;

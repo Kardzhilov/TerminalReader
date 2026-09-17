@@ -653,6 +653,14 @@ enum Action {
     InputClick,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ReaderCommand {
+    Contents,
+    Previous,
+    Next,
+    Search,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct App {
@@ -734,10 +742,15 @@ impl App {
         } else if let Some(username) = &config.sync.username {
             match credentials::load_userkey(&config.sync.server_url, username) {
                 Ok(Some(userkey)) => {
-                    sync.set_credentials(Some(Credentials {
-                        username: username.clone(),
-                        userkey,
-                    }));
+                    if let Err(error) = sync.set_credentials_for_server(
+                        &config.sync.server_url,
+                        Some(Credentials {
+                            username: username.clone(),
+                            userkey,
+                        }),
+                    ) {
+                        logging::warn(&format!("could not create sync transport: {error}"));
+                    }
                     // Retry pushes queued while offline in a previous session.
                     sync.drain_next(&config.sync);
                 }
@@ -1646,11 +1659,11 @@ impl App {
             self.leave_reader(reader);
             self.should_exit = true;
         } else if character == keys.contents {
-            reader.open_toc();
+            self.execute_reader_command(reader, ReaderCommand::Contents);
         } else if character == '?' {
             self.help = true;
         } else if character == keys.search {
-            reader.search = Some(TextInput::default());
+            self.execute_reader_command(reader, ReaderCommand::Search);
         } else if character == keys.next_match {
             self.goto_match(reader, true);
         } else if character == keys.previous_match {
@@ -1693,6 +1706,23 @@ impl App {
             reader.next_chapter();
         } else if character == '[' {
             reader.previous_chapter();
+        }
+    }
+
+    fn execute_reader_command(&mut self, reader: &mut ReaderScreen, command: ReaderCommand) {
+        match command {
+            ReaderCommand::Contents => reader.open_toc(),
+            ReaderCommand::Search => reader.search = Some(TextInput::default()),
+            ReaderCommand::Previous => {
+                let before = reader.navigation_position();
+                reader.previous_page();
+                Self::note_page_turn(&self.config, &mut self.sync, reader, before);
+            }
+            ReaderCommand::Next => {
+                let before = reader.navigation_position();
+                reader.next_page();
+                Self::note_page_turn(&self.config, &mut self.sync, reader, before);
+            }
         }
     }
 
@@ -2448,23 +2478,28 @@ impl App {
                 }
             }
             Action::ReaderContents => {
-                if let Screen::Reader(reader) = &mut self.screen {
-                    reader.open_toc();
+                let mut screen =
+                    std::mem::replace(&mut self.screen, Screen::Home(HomeScreen::default()));
+                if let Screen::Reader(reader) = &mut screen {
+                    self.execute_reader_command(reader, ReaderCommand::Contents);
                 }
+                self.screen = screen;
             }
             Action::ReaderPrevious => {
-                if let Screen::Reader(reader) = &mut self.screen {
-                    let before = reader.navigation_position();
-                    reader.previous_page();
-                    Self::note_page_turn(&self.config, &mut self.sync, reader, before);
+                let mut screen =
+                    std::mem::replace(&mut self.screen, Screen::Home(HomeScreen::default()));
+                if let Screen::Reader(reader) = &mut screen {
+                    self.execute_reader_command(reader, ReaderCommand::Previous);
                 }
+                self.screen = screen;
             }
             Action::ReaderNext => {
-                if let Screen::Reader(reader) = &mut self.screen {
-                    let before = reader.navigation_position();
-                    reader.next_page();
-                    Self::note_page_turn(&self.config, &mut self.sync, reader, before);
+                let mut screen =
+                    std::mem::replace(&mut self.screen, Screen::Home(HomeScreen::default()));
+                if let Screen::Reader(reader) = &mut screen {
+                    self.execute_reader_command(reader, ReaderCommand::Next);
                 }
+                self.screen = screen;
             }
             Action::ReaderHome => {
                 let mut screen =
@@ -4808,8 +4843,12 @@ impl App {
                         format!("Signed in, but storing credentials failed: {error}")
                     }
                 };
-                self.sync
-                    .set_credentials(Some(Credentials { username, userkey }));
+                if let Err(error) = self.sync.set_credentials_for_server(
+                    &self.config.sync.server_url,
+                    Some(Credentials { username, userkey }),
+                ) {
+                    logging::warn(&format!("could not create sync transport: {error}"));
+                }
                 self.sync.drain_next(&self.config.sync);
                 logging::info("sync sign-in succeeded");
                 message

@@ -63,6 +63,7 @@ pub struct SyncController {
     tx: Sender<SyncEvent>,
     rx: Receiver<SyncEvent>,
     credentials: Option<Credentials>,
+    client: Option<KOSyncClient>,
     queue: ProgressQueue,
     queue_path: Option<PathBuf>,
     last_call: Option<Instant>,
@@ -110,6 +111,7 @@ impl SyncController {
             tx,
             rx,
             credentials: None,
+            client: None,
             queue,
             queue_path,
             last_call: None,
@@ -129,6 +131,21 @@ impl SyncController {
             logging::register_secret(&credentials.userkey);
         }
         self.credentials = credentials;
+        self.client = None;
+    }
+
+    pub fn set_credentials_for_server(
+        &mut self,
+        server: &str,
+        credentials: Option<Credentials>,
+    ) -> Result<(), SyncError> {
+        let client = credentials
+            .as_ref()
+            .map(|credentials| KOSyncClient::new(server, credentials))
+            .transpose()?;
+        self.set_credentials(credentials);
+        self.client = client;
+        Ok(())
     }
 
     /// Invalidate background authentication started before logout or a server change.
@@ -253,7 +270,7 @@ impl SyncController {
         }
         self.spawn_push(
             &config.server_url,
-            credentials,
+            &credentials,
             update,
             manual,
             book_path,
@@ -299,10 +316,15 @@ impl SyncController {
         let server = config.server_url.clone();
         let tx = self.tx.clone();
         let generation = self.auth_generation;
+        let client = self
+            .client
+            .clone()
+            .or_else(|| KOSyncClient::new(&server, &credentials).ok());
         self.in_flight += 1;
         self.last_call = Some(Instant::now());
         std::thread::spawn(move || {
-            let result = KOSyncClient::new(&server, &credentials)
+            let result = client
+                .ok_or_else(|| SyncError::Protocol("could not create sync client".to_owned()))
                 .and_then(|client| client.pull(&document))
                 .map_err(|error| error.to_string());
             let _ = tx.send(SyncEvent::Pull {
@@ -317,7 +339,7 @@ impl SyncController {
     fn spawn_push(
         &mut self,
         server: &str,
-        credentials: Credentials,
+        credentials: &Credentials,
         update: ProgressUpdate,
         manual: bool,
         book_path: Option<PathBuf>,
@@ -326,12 +348,17 @@ impl SyncController {
         let server = server.to_owned();
         let tx = self.tx.clone();
         let auth_generation = self.auth_generation;
+        let client = self
+            .client
+            .clone()
+            .or_else(|| KOSyncClient::new(&server, credentials).ok());
         self.in_flight += 1;
         self.push_in_flight.insert(update.document.clone());
         self.last_call = Some(Instant::now());
         self.status = Some("Syncing…".to_owned());
         std::thread::spawn(move || {
-            let result = KOSyncClient::new(&server, &credentials)
+            let result = client
+                .ok_or_else(|| SyncError::Protocol("could not create sync client".to_owned()))
                 .and_then(|client| client.push(&update).map(|_| ()))
                 .map_err(|error| error.to_string());
             let _ = tx.send(SyncEvent::Push {
@@ -359,7 +386,7 @@ impl SyncController {
                 if let Some(credentials) = self.credentials.clone() {
                     self.spawn_push(
                         &config.server_url,
-                        credentials,
+                        &credentials,
                         deferred.update,
                         false,
                         deferred.book_path,
@@ -495,7 +522,7 @@ impl SyncController {
         };
         self.spawn_push(
             &config.server_url,
-            credentials,
+            &credentials,
             item.update,
             false,
             item.book_path,
@@ -535,7 +562,7 @@ impl SyncController {
                     }
                     self.spawn_push(
                         &config.server_url,
-                        credentials.clone(),
+                        &credentials,
                         deferred.update,
                         false,
                         deferred.book_path,
@@ -617,6 +644,7 @@ impl SyncController {
             tx,
             rx,
             credentials: None,
+            client: None,
             queue: ProgressQueue::default(),
             queue_path: None,
             last_call: None,
